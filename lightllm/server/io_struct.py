@@ -1,5 +1,7 @@
+import enum
+from lightllm.server.router.ending_predict import EndingPredictState, EndingPredictItem
 from .sampling_params import SamplingParams
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import asyncio
 import enum
 
@@ -9,7 +11,7 @@ class RunStatus(enum.Enum):
     OFFLOAD = 2
 
 class Req:
-    def __init__(self, request_id, prompt_ids, sample_params: SamplingParams):
+    def __init__(self, request_id, prompt_ids, sample_params: SamplingParams, ending_predict_state: Union[EndingPredictState, None] = None):
         self.request_id = request_id
         self.prompt_ids = prompt_ids
         self.input_len = len(prompt_ids)
@@ -20,10 +22,11 @@ class Req:
         self.has_generate_finished = False
         self.aborted = False
         self.runstatus = RunStatus.NORMAL
+        self.ending_predict = EndingPredictItem(global_state=ending_predict_state) if ending_predict_state else None
 
     def to_rpc_obj(self):
         return {"request_id": self.request_id,
-                "input_id": self.prompt_ids,
+                "input_id": self.prompt_ids[:],
                 "output_len": self.max_output_len,
                 "offload": True if self.runstatus == RunStatus.OFFLOAD else False,
                 "sampling_param": self.sample_params.to_dict() }
@@ -33,7 +36,7 @@ class Req:
         if self.output_metadata_list:
             out.gen_metadata.update(self.output_metadata_list[-1])
         return out
-    
+
     def stop_sequences_matched(self):
         for stop_token_ids in self.sample_params.stop_sequences:
             stop_len = len(stop_token_ids)
@@ -56,7 +59,7 @@ class Req:
     def __repr__(self):
         return (f"request_id(n={self.request_id}, "
                 f"prompt_ids={self.prompt_ids}, ")
-        
+
 
 class ReqDetokenizationState:
     def __init__(
@@ -100,7 +103,7 @@ class Batch:
         for req in self.reqs:
             tokens += req.input_len + req.max_output_len - 1
         return tokens
-    
+
     def calcu_used_tokens(self):
         tokens_num = 0
         for req in self.reqs:
@@ -169,7 +172,7 @@ class Batch:
     def __repr__(self):
         return (f"batch_id={self.batch_id}, "
                 f"reqs={self.reqs}, ")
-        
+
 class BatchTokenIdOut:
     def __init__(self):
         self.reqs_infs: List[Tuple[str, int, Dict, bool, bool]] = []  # [req_id, new_token_id, gen_metadata, finished_state, abort_state]
@@ -177,8 +180,13 @@ class BatchTokenIdOut:
 class BatchStrOut:
     def __init__(self):
         self.reqs_infs: List[Tuple[str, str, Dict, bool, bool]] = [] # [req_id, token_str, gen_metadata, finished_state, abort_state]
-        
+
 class AbortReq:
     def __init__(self, req_id):
         self.req_id = req_id
-        
+
+class InferState(enum.Enum):
+    IDLE = enum.auto()
+    PREFILL = enum.auto()
+    DECODE = enum.auto()
+    PARTIAL_DECODE = enum.auto()

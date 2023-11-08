@@ -211,7 +211,7 @@ async def chat_completions(
         final_output = []
         prompt_tokens = -1
         completion_tokens = 0
-        async for request_output, metadata in results_generator:
+        async for request_output, metadata, finished in results_generator:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
                 await httpserver_manager.abort(request_id)
@@ -239,7 +239,7 @@ async def chat_completions(
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
-        async for request_output, metadata in results_generator:
+        async for request_output, metadata, finished in results_generator:
             delta_message = DeltaMessage(role="assistant", content=request_output)
 
             stream_choice = ChatCompletionStreamResponseChoice(
@@ -274,7 +274,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None,
                         help="the model weight dir path, the app will load config, weights and tokenizer from this dir")
     parser.add_argument("--tokenizer_mode", type=str, default="slow",
-                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test, 
+                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test,
                         when you want to get best performance, try auto mode""")
     parser.add_argument("--max_total_token_num", type=int, default=6000,
                         help="the total token nums the gpu and model can support, equals = max_batch * (input_len + output_len)")
@@ -294,6 +294,8 @@ def main():
                         help="strategy to handle request if there are need to pending reuqest")
     parser.add_argument("--reserve_token_num", type=int, default=2048,
                         help="reserved token numbers to prevent out of memory")
+    parser.add_argument("--adaptive_batchsize_router", action='store_true',
+                        help="use alternative request router policy controlled by a adaptive batch size")
     parser.add_argument("--tp", type=int, default=1,
                         help="model tp parral size, the default is 1")
     parser.add_argument("--max_req_input_len", type=int, default=2048,
@@ -310,7 +312,7 @@ def main():
                         help="disable logging throughput stats.")
     parser.add_argument("--log_stats_interval", type=int, default=10,
                         help="log stats interval in second.")
-    
+
     args = parser.parse_args()
 
     assert args.max_req_input_len < args.max_req_total_len

@@ -12,7 +12,7 @@ import time
 
 import time
 from functools import wraps
-requests_mapping = {}
+requests_mapping: Dict[str, 'InferReq'] = {}
 
 # 装饰器函数
 def print_info(func):
@@ -24,7 +24,7 @@ def print_info(func):
         duration_time = end_time - start_time
         print("execute time running %s: %s seconds" % (func.__name__, duration_time))
         return result
- 
+
     return wrapper
 
 class InferSamplingParams:
@@ -79,10 +79,10 @@ class InferBatch:
     batch_id: int
     request_ids: List
     req_manager: ReqManager
-    
+
     @classmethod
     @torch.no_grad()
-    def init_batch(cls, batch_id, requests, dtype: torch.dtype, device: torch.device, req_manager:ReqManager, vocab_size: int):
+    def init_batch(cls, batch_id, requests, dtype: torch.dtype, device: torch.device, req_manager: ReqManager, vocab_size: int):
 
         request_ids = []
         nopad_b_req_idx = req_manager.alloc(len(requests))
@@ -105,7 +105,7 @@ class InferBatch:
             request_ids=request_ids,
             req_manager=req_manager,
         )
-    
+
     @torch.no_grad()
     def free_self(self):
         free_req_index = []
@@ -119,11 +119,31 @@ class InferBatch:
         if len(requests_mapping) == 0:
             requests_mapping.clear()
         return
-    
+
     @torch.no_grad()
     def filter(self, request_ids: List[str], finished_request_ids: List[str]):
         if len(requests_mapping) == 0:
-            raise ValueError("Batch must have at least one request")
+            # raise ValueError("Batch must have at least one request")
+            # workaround, this only occurrs when running batch all finished, but has stopped reqs
+            if finished_request_ids:
+                self.req_manager.free(self.nopad_b_loc_idx, self.nopad_b_seq_len - 1)
+            return InferBatch(
+                batch_id=self.batch_id,
+                requests=[],
+                requests_idx_mapping={},
+                input_ids=self.input_ids[:0],
+                input_lengths=[],
+                all_input_ids=[],
+                nopad_total_token_num=0,
+                nopad_max_len_in_batch=0,
+                nopad_b_loc_idx=self.nopad_b_loc_idx[:0],
+                nopad_b_start_loc=self.nopad_b_start_loc[:0],
+                nopad_b_seq_len=self.nopad_b_seq_len[:0],
+                out_token_id_counts=[],
+                sampling_param_list=[],
+                req_manager=self.req_manager,
+                stop_son_batch=self.stop_son_batch,
+            )
         if len(request_ids) == len(self):
             return self
         if len(request_ids) == 0:
@@ -141,7 +161,7 @@ class InferBatch:
             free_token_index.append(self.req_manager.req_to_token_indexs[req.b_req_idx][:req.b_seq_len - 1])
         free_token_index = torch.cat(free_token_index, dim=-1)
         self.req_manager.free(free_req_index, free_token_index)
-        
+
         return InferBatch(
             batch_id=self.batch_id,
             request_ids=request_ids,
@@ -168,7 +188,7 @@ class InferBatch:
     def merge(cls, batch1, batch2):
         start_time = time.time()
         request_ids = batch1.request_ids + batch2.request_ids
-        
+
         return InferBatch(
             batch_id=batch1.batch_id,
             request_ids=request_ids,
@@ -177,8 +197,8 @@ class InferBatch:
 
     def __len__(self):
         return len(self.request_ids)
-    
-    
+
+
     def get_post_sample_tensors(self):
         presence_penalties: List[float] = []
         frequency_penalties: List[float] = []
@@ -197,13 +217,13 @@ class InferBatch:
             temperatures.append(sample_param.temperature)
             top_ps.append(sample_param.top_p)
             top_ks.append(sample_param.top_k)
-            
+
             for token_id, count in id_to_count.items():
                 p_token_ids.append(token_id)
                 p_token_counts.append(count)
             p_seq_len.append(len(id_to_count))
             p_max_len_in_batch = max(p_max_len_in_batch, len(id_to_count))
-        
+
         presence_penalties = torch.tensor(presence_penalties, dtype=torch.float, device="cuda")
         frequency_penalties = torch.tensor(frequency_penalties, dtype=torch.float, device="cuda")
         temperatures = torch.tensor(temperatures, dtype=torch.float, device="cuda")

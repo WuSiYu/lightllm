@@ -45,7 +45,7 @@ class TpPartBaseModel:
         self._init_some_value()
         self._init_custom()
         return
-    
+
     def _init_config(self):
         with open(os.path.join(self.weight_dir_, "config.json"), 'r') as json_file:
             self.config = json.load(json_file)
@@ -55,12 +55,12 @@ class TpPartBaseModel:
         repair_config(self.config, same_names=["num_hidden_layers", "n_layer"])
 
         return
-    
+
     @final
     def _verify_must(self):
         assert self.config["num_attention_heads"] % self.world_size_ == 0
         return
-    
+
     def _verify_params(self):
         assert self.load_way == "HF", "only support HF format weights"
         return
@@ -78,23 +78,23 @@ class TpPartBaseModel:
             transformer_layer_list=self.trans_layers_weight)
         self.pre_post_weight.verify_load()
         [weight.verify_load() for weight in self.trans_layers_weight]
-        return 
-    
+        return
+
     def _init_mem_manager(self):
         assert self.config["num_attention_heads"] % self.world_size_ == 0
-        self.mem_manager = MemoryManager(self.max_total_token_num, 
+        self.mem_manager = MemoryManager(self.max_total_token_num,
                             dtype=torch.float16,
                             head_num=self.config["num_attention_heads"] // self.world_size_,
                             head_dim=self.config["n_embed"] // self.config["num_attention_heads"],
                             layer_num=self.config["n_layer"])
-        return 
+        return
 
     def _init_req_manager(self):
-        self.req_manager = ReqManager(self.max_request_num, 
+        self.req_manager = ReqManager(self.max_request_num,
                                       self.max_sequence_length,
                                       self.mem_manager)
-        return 
-    
+        return
+
     def _init_infer_layer(self):
         self.pre_infer = self.pre_layer_infer_class(tp_rank=self.tp_rank_, world_size=self.world_size_, network_config=self.config, mode=self.mode)
         self.post_infer = self.post_layer_infer_class(tp_rank=self.tp_rank_, world_size=self.world_size_, network_config=self.config, mode=self.mode)
@@ -107,7 +107,7 @@ class TpPartBaseModel:
                 mode=self.mode) for i in range(
                 self.config["n_layer"])]
         return
-    
+
     def _init_some_value(self):
         self.head_dim_ = self.config["n_embed"] // self.config["num_attention_heads"]
         self.tp_k_head_num_ = self.config["num_attention_heads"] // self.world_size_
@@ -115,7 +115,7 @@ class TpPartBaseModel:
         self.layers_num = self.config["n_layer"]
         self.vocab_size = self.config["vocab_size"]
         return
-    
+
     def _init_custom(self):
         pass
 
@@ -134,10 +134,10 @@ class TpPartBaseModel:
             is_prefill=True):
         if is_prefill:
             return self._prefill(batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_loc_idx, b_start_loc, b_seq_len)
-        else:   
+        else:
             return self._decode(batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_loc_idx, b_start_loc, b_seq_len)
 
-    
+
     def _prefill(self, batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_loc_idx, b_start_loc, b_seq_len):
         infer_state = self.infer_state_class()
         infer_state.is_prefill = True
@@ -160,7 +160,7 @@ class TpPartBaseModel:
         infer_state.init_some_extra_state(self, batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_start_loc, b_seq_len, True)
         predict_logics = self._context_forward(input_ids, infer_state)
         return predict_logics
-    
+
     def _decode(self, batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_loc_idx, b_start_loc, b_seq_len):
         infer_state = self.infer_state_class()
         infer_state.is_prefill = False
@@ -172,7 +172,7 @@ class TpPartBaseModel:
         infer_state.b_loc_idx = b_loc_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
-        
+
         infer_state.mem_manager = self.mem_manager
 
         alloc_mem = self.mem_manager.alloc_contiguous(batch_size)
@@ -198,7 +198,7 @@ class TpPartBaseModel:
         infer_state.init_some_extra_state(self, batch_size, total_token_num, max_len_in_batch, input_ids, b_loc, b_start_loc, b_seq_len, False)
         predict_logics = self._token_forward(input_ids, infer_state)
         return predict_logics
-    
+
     @final
     def _context_forward(self, input_ids, infer_state: InferStateInfo):
         cuda_input_ids = input_ids

@@ -1,4 +1,5 @@
 import asyncio
+from uuid import UUID
 import rpyc
 import torch
 import traceback
@@ -30,18 +31,19 @@ from .infer_batch import requests_mapping
 
 class ModelRpcServer(rpyc.Service):
 
-    def exposed_init_model(self, rank_id, world_size, weight_dir, max_total_token_num, load_way, mode):
+    def exposed_init_model(self, rank_id, world_size, weight_dir, max_total_token_num, load_way, eos_id, mode):
         import torch
         import torch.distributed as dist
         if world_size != 1:
-            trans_list = [obtain(e) for e in (rank_id, world_size, weight_dir, max_total_token_num, load_way, mode)]
-            rank_id, world_size, weight_dir, max_total_token_num, load_way, mode = trans_list
+            trans_list = [obtain(e) for e in (rank_id, world_size, weight_dir, max_total_token_num, load_way, eos_id, mode)]
+            rank_id, world_size, weight_dir, max_total_token_num, load_way, eos_id, mode = trans_list
 
         self.tp_rank = rank_id
         self.world_size = world_size
+        self.eos_id = eos_id
         self.load_way = load_way
         self.mode = mode
-        self.cache = {}
+        self.cache: Dict[UUID, InferBatch] = {}
 
         dist.init_process_group('nccl', init_method=f'tcp://127.0.0.1:{setting["nccl_port"]}', rank=rank_id, world_size=world_size)
         torch.cuda.set_device(rank_id)
@@ -92,7 +94,7 @@ class ModelRpcServer(rpyc.Service):
             print("#" * 16)
             print("load model error:", str(e), e, type(e))
             raise e
-        
+
         set_random_seed(2147483647)
         return
     # @calculate_time(show=True, min_cost_ms=0.1)
@@ -107,7 +109,7 @@ class ModelRpcServer(rpyc.Service):
         batch_data = InferBatch.init_batch(batch_id, reqs, dtype, torch.cuda.current_device(), self.model.req_manager, self.model.vocab_size)
         self.cache[batch_id] = batch_data
         return
-    
+
     @calculate_time(show=False, min_cost_ms=300)
     def exposed_prefill_batch(self, batch_id):
         return self.forward(batch_id, is_prefill=True)
@@ -162,7 +164,7 @@ class ModelRpcServer(rpyc.Service):
         del batch
         # torch.cuda.empty_cache()
         return
-    
+
     def prepare_inputs(self, batch, is_prefill):
         nopad_total_token_num = 0
         nopad_max_len_in_batch = 0
@@ -201,7 +203,7 @@ class ModelRpcServer(rpyc.Service):
             "b_loc_idx": nopad_b_req_idx,
             "b_start_loc": nopad_b_start_loc,
             "b_seq_len": nopad_b_seq_len,
-            "is_prefill": is_prefill            
+            "is_prefill": is_prefill
         }
         return kwargs
 
@@ -211,18 +213,21 @@ class ModelRpcServer(rpyc.Service):
         kwargs = self.prepare_inputs(batch, is_prefill)
 
         logits = self.model.forward(**kwargs)
-        next_token_ids, next_token_probs = sample(logits, batch)
+        next_token_ids, next_token_probs, probs = sample(logits, batch)
+        eos_token_logprobs = torch.log(probs[:, self.eos_id]).detach().cpu().numpy()
+        del probs
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
         output_dict = {}
         new_input_ids = []
-        for i, (r, next_token_id, next_token_logprob) in enumerate(zip(batch.request_ids, next_token_ids, next_token_logprobs)):
+        for i, (r, next_token_id, next_token_logprob, eos_token_logprob) in enumerate(zip(batch.request_ids, next_token_ids, next_token_logprobs, eos_token_logprobs)):
             new_input_ids.append(next_token_id)
             requests_mapping[r].out_token_id_count[next_token_id] += 1
             metadata = {
                 'id': int(next_token_id),
                 'offload': requests_mapping[r].offload,
                 'logprob': float(next_token_logprob),
+                '_eosprob': float(eos_token_logprob)  # TODO: internal use, pruned later
             }
             if not requests_mapping[r].offload:
                 requests_mapping[r].input_id = next_token_id
@@ -230,7 +235,7 @@ class ModelRpcServer(rpyc.Service):
             else:
                 requests_mapping[r].offload = False
             output_dict[r] = (int(next_token_id), metadata)
-        
+
         self.cache[batch.batch_id] = batch
         return output_dict
 
@@ -271,8 +276,8 @@ class ModelRpcClient:
             self._remove_batch = self.model.exposed_remove_batch
         return
 
-    async def init_model(self, rank_id, world_size, weight_dir, max_total_token_num, load_way, mode):
-        ans : rpyc.AsyncResult = self._init_model(rank_id, world_size, weight_dir, max_total_token_num, load_way, mode)
+    async def init_model(self, rank_id, world_size, weight_dir, max_total_token_num, load_way, eos_id, mode):
+        ans: rpyc.AsyncResult = self._init_model(rank_id, world_size, weight_dir, max_total_token_num, load_way, eos_id, mode)
         if self.use_rpc:
             await ans
             return
@@ -307,7 +312,7 @@ class ModelRpcClient:
             await ans
             return
         else:
-            return 
+            return
 
     async def pause_reqs(self, batch_id, reqs_list):
         ans = self._pause_reqs(batch_id, reqs_list)
@@ -353,7 +358,7 @@ async def start_model_process(port, world_size):
     # 单卡时不使用 rpc
     if world_size == 1:
         return ModelRpcClient(ModelRpcServer(), world_size)
-    
+
     import multiprocessing
     proc = multiprocessing.Process(target=_init_env, args=(port,))
     proc.start()

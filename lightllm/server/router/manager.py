@@ -226,7 +226,7 @@ class RouterManager:
             # pause strategy
             paused_reqs = select_paused_reqs(self.running_batch, self.pause_strategy, self.req_queue, self.max_total_token_num)
             await self._pause_reqs(self.running_batch, paused_reqs)
-            self._last_evicted_n = len(self.req_queue.pause_req_dict)
+            self._last_evicted_n += 1
             print("pasued req num:", len(self.req_queue.pause_req_dict))
             self.has_wait_tokens = 0
             return

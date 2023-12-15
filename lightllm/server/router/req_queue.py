@@ -1,6 +1,7 @@
 import bisect
 from collections import deque
 import json
+import math
 import uuid
 import asyncio
 import numpy as np
@@ -30,7 +31,7 @@ def EMA(initial: float, length: int, sliding_window=False):
     return f
 
 class AdaptiveBatchsizeRouter:
-    INITAL_TARGET_BS = 50
+    INITAL_TARGET_BS = 100
     HISTORY_LEN = 2048              # steps
     HISTORY_REQ_LEN_EMA_LEN = 100   # reqs
 
@@ -42,17 +43,25 @@ class AdaptiveBatchsizeRouter:
     BALANCE_MIN_COV = 0
     # BALANCE_MIN_COV = 0.5
     # BALANCE_MIN_COV = 0.8
-    DECODE_FULL_ONGOING_RATIO = 0.7
-    RE_BALANCE_PARTIAL_RATIO = 0.5
-    RE_BALANCE_MIN_INTERVAL = 1
+    # DECODE_FULL_ONGOING_RATIO = 0.7
+    # RE_BALANCE_PARTIAL_RATIO = 0.5
+    # RE_BALANCE_MIN_INTERVAL = 1
 
     HIGH_BS_TOKEN_RATIO = 1
     MINIMAL_BS_RATIO = 0.8
 
-    BS_INCREASE_PROB_RATIO = 0.5
+    # BS_INCREASE_PROB_RATIO = 0.5
 
     # RANDOM_SLOW_ADD_NEW_REQ = True
-    RANDOM_SLOW_ADD_NEW_REQ = False
+    # RANDOM_SLOW_ADD_NEW_REQ = False
+
+    _HISTORY_REQ_PROMPT_LEN_INITAL = 1024   # FIXME
+    _HISTORY_REQ_DECODE_LEN_INITAL = 1024
+
+    # START_RATE_LIMIT = True
+    START_RATE_LIMIT = False
+    START_RATE_LIMIT_WINDOW = 100     # steps
+    START_RATE_LIMIT_RATIO = 1.05
 
     # INITAL_TARGET_BS = 500
     # HISTORY_LEN = 200               # steps
@@ -75,8 +84,11 @@ class AdaptiveBatchsizeRouter:
         self._last_used_tokens = 0
         # self._free_alloc_ratio_ema = 0
 
-        self._history_req_prompt_len = deque([1024] * self.HISTORY_REQ_LEN_EMA_LEN, self.HISTORY_REQ_LEN_EMA_LEN)
-        self._history_req_decode_len = deque([1024] * self.HISTORY_REQ_LEN_EMA_LEN, self.HISTORY_REQ_LEN_EMA_LEN)
+        self._history_req_prompt_len = deque([self._HISTORY_REQ_PROMPT_LEN_INITAL] * (self.HISTORY_REQ_LEN_EMA_LEN // 3), maxlen=self.HISTORY_REQ_LEN_EMA_LEN)
+        self._history_req_decode_len = deque([self._HISTORY_REQ_DECODE_LEN_INITAL] * (self.HISTORY_REQ_LEN_EMA_LEN // 3), maxlen=self.HISTORY_REQ_LEN_EMA_LEN)
+
+        self._recent_starts_steps = deque([-1])
+
 
         self._step = 0
         # self._history_freed = deque()
@@ -84,7 +96,7 @@ class AdaptiveBatchsizeRouter:
         # self._history_finished = deque([self.INITAL_TARGET_BS])   # boostrap
         # self.recent_finished = self.INITAL_TARGET_BS
         # self._history_started = deque()
-        self.finished_req_prompt_len_ema = EMA(1024, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=False)
+        self.finished_req_prompt_len_ema = EMA(1024, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=False)    # TODO: old, update AUTO_RATE
         self.finished_req_decode_len_ema = EMA(2048, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=False)
         # self.new_req_prompt_len_ema = EMA(1024, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=True)
         # self.running_bs_ema = EMA(self.INITAL_TARGET_BS, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=True)
@@ -94,6 +106,10 @@ class AdaptiveBatchsizeRouter:
         # self._last_rebalance = 0
         # self.stopped_cause = None
         # self.can_prefill = True
+        if self.START_RATE_LIMIT:
+            self._last_target_bs = inital_target_bs
+            self.ideal_start_rate = 1
+            self.bs_change_floating_room = 0
 
         self.target_staged_bs = inital_target_bs    # controlled, decide by policy
         self.target_running_bs = inital_target_bs   # controlled, to make staged_bs ---> target_staged_bs, which also makes staged_bs == target_staged_bs
@@ -109,12 +125,13 @@ class AdaptiveBatchsizeRouter:
         # prompt_avg_len = np.average(self._history_req_prompt_len)
 
         decode_full_len = np.array(self._history_req_decode_len)
-        decode_full_len_weighted = decode_full_len * (decode_full_len / np.average(decode_full_len))
+        decode_full_len_avg = np.average(decode_full_len)
+        decode_full_len_weighted = decode_full_len * (decode_full_len / decode_full_len_avg)
         in_batch_decode_avg_full_len = np.average(decode_full_len_weighted)
         in_batch_decode_avg_len = in_batch_decode_avg_full_len / 2
 
         prompt_len = np.array(self._history_req_prompt_len)
-        prompt_len_weighted = prompt_len * (decode_full_len / np.average(decode_full_len))
+        prompt_len_weighted = prompt_len * (decode_full_len / decode_full_len_avg)
         prompt_avg_len = np.average(prompt_len_weighted)
 
         print(f"    _get_ideal_mem_req_len is {prompt_avg_len} + {in_batch_decode_avg_len}")
@@ -164,6 +181,10 @@ class AdaptiveBatchsizeRouter:
     #     print(f"        decoded len cov {cov}")
     #     return cov < 0.5
 
+    def recent_starts_num(self):
+        assert self.START_RATE_LIMIT
+        return len(self._recent_starts_steps)
+
     def update(self, state: InferState, staged_bs: int, running_bs: int,
                running_batch: Union[Batch, None],
                reqs_pending: int, staged_bs_delta: int,
@@ -183,7 +204,8 @@ class AdaptiveBatchsizeRouter:
 
 
         reqs = running_batch.reqs if running_batch else []
-        _is_balance = self._is_balance(reqs)
+        if reqs:
+            _is_balance = self._is_balance(reqs)
         # if not _is_balance and self._step - self._last_rebalance > self.RE_BALANCE_MIN_INTERVAL:
         #     self.is_balance = False
         #     self._last_rebalance = self._step
@@ -222,6 +244,14 @@ class AdaptiveBatchsizeRouter:
         n_started = staged_bs_delta if state == InferState.PREFILL else 0
 
         print(f"    n_finished {n_finished} - n_started {n_started}")
+
+        if self.START_RATE_LIMIT:
+            for _ in range(n_started):
+                self._recent_starts_steps.append(self._step)
+
+            while self._recent_starts_steps and self._recent_starts_steps[0] < self._step - self.START_RATE_LIMIT_WINDOW:
+                self._recent_starts_steps.popleft()
+
 
         # self._history_finished.append(n_finished)
         # self._history_started.append(n_started)
@@ -304,7 +334,8 @@ class AdaptiveBatchsizeRouter:
         if reqs:
             prompt_len = [x.input_len for x in reqs]
             decoded_len = [len(x.output_ids) - 1 for x in reqs]
-            # prompt_avg_len, in_batch_decode_avg_len = self._get_ideal_mem_req_len()
+            prompt_avg_len, in_batch_decode_avg_len = self._get_ideal_mem_req_len()
+            print(f"  inbatch balance factor {np.average(decoded_len) / in_batch_decode_avg_len}")
             # ideal_mem_req_len = prompt_avg_len + in_batch_decode_avg_len
             # high_bs = int(self.max_total_token_num * self.HIGH_BS_TOKEN_RATIO / ideal_mem_req_len)
             # print(f" -> high_bs {high_bs} (prompt_avg_len + in_batch_decode_avg_len)")
@@ -321,14 +352,19 @@ class AdaptiveBatchsizeRouter:
             # high_bs_mixed2 = int(self.max_total_token_num * self.HIGH_BS_TOKEN_RATIO / ideal_mem_req_len_mixed2)
             # print(f" -> high_bs_mixed2 {high_bs_mixed2} (np.average(prompt_len) + max(in_batch_decode_avg_len, np.average(decoded_len)))")
 
-            # high_bs_mixed3 = self.staged_bs + int((self.max_total_token_num - ideal_mem_req_len_mixed2 * self.staged_bs) / ideal_mem_req_len)
-            # print(f" -> high_bs_mixed3 {high_bs_mixed3} (staged_bs + (total - mixed2 * staged_bs) / ideal)")
+            predicted_req_mem_len = np.average(prompt_len) + in_batch_decode_avg_len
+            used_tokens_mixed = max(used_tokens, self.staged_bs * predicted_req_mem_len)
+            delta = math.floor((self.max_total_token_num * self.UPPER_MEM_RATE - used_tokens_mixed) / predicted_req_mem_len)
+            high_bs_mixed3 = self.staged_bs + delta
+            print(f" -> high_bs_mixed3 {high_bs_mixed3:4} (staged_bs + (capacity * UPPER_RATE - used_tokens_mixed) / ideal)")
+            print(f" ->                     ({self.staged_bs} + ({self.max_total_token_num * self.UPPER_MEM_RATE - used_tokens_mixed} / {predicted_req_mem_len})")
 
 
             # cur_len_bs = int(self.max_total_token_num * self.UPPER_MEM_RATE / (np.average(prompt_len) + np.average(decoded_len)))
             # print(f"cur {np.average(prompt_len)} + {np.average(decoded_len)}")
             # print(f" -> cur_len_bs {cur_len_bs}")
 
+            # 条件概率
             his_Lo = sorted(self._history_req_decode_len)
             his_Lo_postfix_sum = np.flip(np.flip(his_Lo, 0).cumsum(), 0)
             Lo_exps = []
@@ -398,10 +434,19 @@ class AdaptiveBatchsizeRouter:
         #     self.target_staged_bs = self.target_running_bs = 200
         # else:
         #     self.target_staged_bs = self.target_running_bs = self.staged_bs
-        self.target_staged_bs = self.target_running_bs = high_bs_exp
-        # self.target_staged_bs = self.target_running_bs = high_bs_mixed3
+        # self.target_staged_bs = self.target_running_bs = high_bs_exp
+        self.target_staged_bs = self.target_running_bs = high_bs_mixed3
         # self.target_staged_bs = self.target_running_bs = cur_len_bs
 
+        if self.START_RATE_LIMIT:
+            ideal_req_output_len = np.average(self._history_req_decode_len)
+            self.ideal_start_rate = self.target_running_bs / ideal_req_output_len
+
+            bs_delta = self.target_staged_bs - self._last_target_bs
+            self.bs_change_floating_room = max(0, self.bs_change_floating_room + bs_delta)
+
+        # # FIXME: test only: maxbs
+        # self.target_staged_bs = self.target_running_bs = 300
 
 
         # baseline_bs = int(self.max_total_token_num * self.UPPER_MEM_RATE / (np.average(self._history_req_prompt_len) + np.average(self._history_req_decode_len)))
@@ -465,15 +510,34 @@ class ReqQueue:
         self.cache_len_list.append(req.get_tuple_tokens(is_busy, self.router_max_new_token_len)) # hard to analysis
 
         if self.adaptive_batchsize_router:
-            max_total_tokens = self.adaptive_batchsize_router.max_total_token_num
-            if len(self.cache_len_list) <= self.adaptive_batchsize_router.target_running_bs:
+            absr = self.adaptive_batchsize_router
+            if absr.START_RATE_LIMIT \
+                and len(self.cache_len_list) > 1:   # make sure there are someting to run
+                to_start = len(self.cache_len_list) - absr.staged_bs
+                print('to_start', to_start)
+                total_start = absr.recent_starts_num() + to_start
+                print('total_start', total_start, f"({absr.recent_starts_num()} + {to_start})")
+                limit = absr.ideal_start_rate * absr.START_RATE_LIMIT_RATIO * absr.START_RATE_LIMIT_WINDOW
+                print('limit', round(limit), limit, f"({absr.ideal_start_rate} * {absr.START_RATE_LIMIT_RATIO} * {absr.START_RATE_LIMIT_WINDOW})")
+                limit = round(limit)
+                if to_start + absr.recent_starts_num() > limit:
+                    if absr.bs_change_floating_room > 0:
+                        absr.bs_change_floating_room -= 1
+                    else:
+                        print('reach start limit')
+                        return False
+
+            RESERVED_TOKEN_RATIO = 0.01
+            max_total_tokens = absr.max_total_token_num
+            if len(self.cache_len_list) <= absr.target_running_bs:
                 # if sum(e[0] for e in self.cache_len_list) <= max_total_tokens - len(self.cache_len_list):
-                if sum(e[0] for e in self.cache_len_list) <= max_total_tokens - 2048 - len(self.cache_len_list):
+                reserved_tokens = max_total_tokens * RESERVED_TOKEN_RATIO
+                if sum(e[0] for e in self.cache_len_list) <= max_total_tokens - reserved_tokens - len(self.cache_len_list):
                     # vram is enough for prefill and next decode
                     return True
                 else:
                     print(f' + prefill will limited by vram at bs {len(self.cache_len_list)}')
-                    print(f' + {sum(e[0] for e in self.cache_len_list)} > {max_total_tokens} - 2048 - {len(self.cache_len_list)}')
+                    print(f' + {sum(e[0] for e in self.cache_len_list)} > {max_total_tokens} - {reserved_tokens} - {len(self.cache_len_list)}')
                     # print(f' + {sum(e[0] for e in self.cache_len_list)} > {max_total_tokens} * {self.adaptive_batchsize_router.UPPER_MEM_RATE} - {len(self.cache_len_list)}')
                     # may reduce target_staged_bs if memory not enough for new refill
                     # self.adaptive_batchsize_router.target_staged_bs = min(len(self.cache_len_list), self.adaptive_batchsize_router.target_staged_bs)

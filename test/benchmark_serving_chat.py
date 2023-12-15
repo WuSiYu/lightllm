@@ -20,6 +20,7 @@ import argparse
 import asyncio
 from collections import namedtuple
 import dataclasses
+import datetime
 import json
 import random
 import sys
@@ -118,7 +119,7 @@ def sample_requests(
     num_requests: int,
     max_round: int,
     tokenizer: PreTrainedTokenizerBase,
-    allow_long: bool = False
+    force_long: bool = False
 ) -> List[Request]:   # (prompt, prompt_len, output_len, chat_rounds)
     # Load the dataset.
     with open(dataset_path) as f:
@@ -136,8 +137,8 @@ def sample_requests(
         conversations = data["conversations"]
         rounds = len(conversations) // 2    # 1 round = 1 ask + 1 answer
         minimal_round = 1
-        if allow_long:
-            minimal_round = min(2, rounds)    # FIXME
+        if force_long:
+            minimal_round = rounds    # FIXME
         rounds_used = random.randint(minimal_round, min(max_round, rounds))
         prompt_list: List[Dict[str, str]] = []
         prompt_list.append(dict(
@@ -156,7 +157,7 @@ def sample_requests(
     print("done reading dataset")
     # Tokenize the prompts and completions.
     selnum = num_requests * 3
-    if allow_long: selnum *= 2
+    if force_long: selnum *= 2
     dataset = random.sample(dataset, selnum)
     prompts = [prompt for prompt, _, _ in dataset]
     prompts_str = [gen_prompt_from_conversation(prompt) for prompt, _, _ in dataset]    # approximate, may not same with the real concat method on server side
@@ -178,7 +179,7 @@ def sample_requests(
         if prompt_len < 4 or dataset_output_len < 4:
             # Prune too short sequences.
             continue
-        if allow_long:
+        if force_long:
             if prompt_len > 2048 or dataset_output_len < 512:
                 # Prune too short/long sequences.
                 continue
@@ -430,26 +431,56 @@ async def benchmark(
 def main(args: argparse.Namespace):
     global RESULTS
     print(args)
-    mode = args.mode
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    tokenizer = get_tokenizer(args.tokenizer, "slow")
-    input_requests = sample_requests(args.dataset, args.num_prompts, args.max_round, tokenizer, args.long)
 
-    if args.use_output_length_record:
-        print(f"loading output_length from {args.use_output_length_record}")
-        with open(args.use_output_length_record) as f:
-            lens = json.load(f)
-        assert len(lens) == len(input_requests)
-        for i in range(len(lens)):
-            input_requests[i] = input_requests[i]._replace(output_len=lens[i])
+    if not args.use_existing_dump:
+        mode = args.mode
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        tokenizer = get_tokenizer(args.tokenizer, "slow")
+        input_requests = sample_requests(args.dataset, args.num_prompts, args.max_round, tokenizer, args.long)
 
-    benchmark_start_time = time.time()
-    _mid_end_times.append(benchmark_start_time)
-    print(f"\nrunning (mode={mode})...")
-    asyncio.run(benchmark(input_requests, args.request_rate, mode=mode))
-    benchmark_end_time = time.time()
-    benchmark_time = benchmark_end_time - benchmark_start_time
+        if args.use_output_length_record:
+            print(f"loading output_length from {args.use_output_length_record}")
+            with open(args.use_output_length_record) as f:
+                lens = json.load(f)
+            assert len(lens) == len(input_requests)
+            for i in range(len(lens)):
+                input_requests[i] = input_requests[i]._replace(output_len=lens[i])
+
+        benchmark_start_time = time.time()
+        _mid_end_times.append(benchmark_start_time)
+        print(f"\nrunning (mode={mode})...")
+        asyncio.run(benchmark(input_requests, args.request_rate, mode=mode))
+        benchmark_end_time = time.time()
+        benchmark_time = benchmark_end_time - benchmark_start_time
+
+        # save results
+        is_trim = "_trim" if args.trim_bootstrap_and_trailing else ""
+        date = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        result_dump_filename = f"bench_{date}__n{args.num_prompts}_rate{args.request_rate}{is_trim}.json"
+        data = dict(args=vars(args), results=[dataclasses.asdict(r) for r in RESULTS])
+        with open(result_dump_filename, 'w') as f:
+            json.dump(data, f)
+            print("benchmark results saved to", result_dump_filename)
+
+        if args.record_output_length:
+            print(f"writing output length to {args.record_output_length}")
+            lens = [x.output_len for x in RESULTS]
+            with open(args.record_output_length, 'w') as f:
+                json.dump(lens, f)
+            print(f"writing prompt length to {args.record_output_length}.prompt.json")
+            lens = [x.prompt_len for x in RESULTS]
+            with open(args.record_output_length+'.prompt.json', 'w') as f:
+                json.dump(lens, f)
+
+    else:
+        # use-existing-dump
+        with open(args.use_existing_dump) as f:
+            previous_data = json.load(f)
+            print(f"use previous dump {args.use_existing_dump}")
+            print(f"args {previous_data['args']}")
+            RESULTS = [Results(**x) for x in previous_data['results']]
+
 
     if args.trim_bootstrap_and_trailing:
         print("ignore first 200 and last 200 completed requests (--trim-bootstrap-and-trailing)")
@@ -492,24 +523,18 @@ def main(args: argparse.Namespace):
 
     all_per_token_latencies = np.concatenate([x.token_latencys[1:] for x in RESULTS])
     avg_per_token_latency = np.mean(all_per_token_latencies)
-    print(f"Average per-token latency (decode): {avg_per_token_latency*1000:.2f} ms")
+    print(f"Average per-token latency (decode): {avg_per_token_latency*1000:.2f} ms", "(old)")
     print(f"    p50: {np.percentile(all_per_token_latencies, 50)*1000:.2f} ms, p90: {np.percentile(all_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_per_token_latencies)*1000:.2f} ms")
+
+    all_reqmax_per_token_latencies = np.array([max(x.token_latencys[1:]) for x in RESULTS])
+    avg_reqmax_per_token_latency = np.mean(all_reqmax_per_token_latencies)
+    print(f"Average req-max per-token latency (decode): {avg_reqmax_per_token_latency*1000:.2f} ms")
+    print(f"    p50: {np.percentile(all_reqmax_per_token_latencies, 50)*1000:.2f} ms, p75: {np.percentile(all_reqmax_per_token_latencies, 75)*1000:.2f} ms, p90: {np.percentile(all_reqmax_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_reqmax_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_reqmax_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_reqmax_per_token_latencies)*1000:.2f} ms")
     # req_avg_per_token_latencies = [np.mean(x.token_latencys[1:]) for x in RESULTS]
     # avg_req_avg_per_token_latency = np.mean(req_avg_per_token_latencies)
     # print(f"Average of request's average per-token latency (decode): {avg_req_avg_per_token_latency*1000:.2f} ms")
     # print(f"    percentile(avg(X)) p50: {np.percentile(req_avg_per_token_latencies, 50)*1000:.2f} ms, p90: {np.percentile(req_avg_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(req_avg_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(req_avg_per_token_latencies, 99)*1000:.2f} ms")
     # print(f"    avg(percentile(X)) p50: {np.mean([np.percentile(x.token_latencys[1:], 50) for x in RESULTS])*1000:.2f} ms, p90: {np.mean([np.percentile(x.token_latencys[1:], 90) for x in RESULTS])*1000:.2f} ms, p95: {np.mean([np.percentile(x.token_latencys[1:], 95) for x in RESULTS])*1000:.2f} ms, p99: {np.mean([np.percentile(x.token_latencys[1:], 99) for x in RESULTS])*1000:.2f} ms")
-
-
-    if args.record_output_length:
-        print(f"writing output length to {args.record_output_length}")
-        lens = [x.output_len for x in RESULTS]
-        with open(args.record_output_length, 'w') as f:
-            json.dump(lens, f)
-        print(f"writing prompt length to {args.record_output_length}.prompt.json")
-        lens = [x.prompt_len for x in RESULTS]
-        with open(args.record_output_length+'.prompt.json', 'w') as f:
-            json.dump(lens, f)
 
 
 if __name__ == "__main__":
@@ -537,6 +562,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-output-length-record", help="use request output length from the record file, for known_output_len mode only, the --num-prompts and --seed must same with the record runs")
     parser.add_argument("--trim-bootstrap-and-trailing", action='store_true', help="ignore first 200 and last 200 completed requests")
     parser.add_argument("--long", action='store_true', help="do not filter long output req in dataset")
+    parser.add_argument("--use-existing-dump", default=None, help="don't run the benchmark, use the existed benckmark dump from previous runs")
     args = parser.parse_args()
     if args.record_output_length:
         assert args.mode == 'unknown_output_len', "see help"

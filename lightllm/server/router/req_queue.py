@@ -1,11 +1,13 @@
+from ast import NotIn
 import bisect
 from collections import deque
 import json
 import math
+import random
 import uuid
 import asyncio
 import numpy as np
-from typing import List, Union
+from typing import List, Tuple, Union
 from ..io_struct import Batch, InferState, Req
 from lightllm.utils.infer_utils import calculate_time
 from lightllm.server.io_struct import Req
@@ -63,6 +65,8 @@ class AdaptiveBatchsizeRouter:
     START_RATE_LIMIT_WINDOW = 100     # steps
     START_RATE_LIMIT_RATIO = 1.05
 
+    PREFILL_RESERVED_TOKEN_RATIO = 0.01
+
     # INITAL_TARGET_BS = 500
     # HISTORY_LEN = 200               # steps
     # HISTORY_REQ_LEN_EMA_LEN = 50    # reqs
@@ -96,6 +100,8 @@ class AdaptiveBatchsizeRouter:
         # self._history_finished = deque([self.INITAL_TARGET_BS])   # boostrap
         # self.recent_finished = self.INITAL_TARGET_BS
         # self._history_started = deque()
+        # self.predicted_output_len_dict = {}
+        # self.predicted_output_len = 1024
         self.finished_req_prompt_len_ema = EMA(1024, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=False)    # TODO: old, update AUTO_RATE
         self.finished_req_decode_len_ema = EMA(2048, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=False)
         # self.new_req_prompt_len_ema = EMA(1024, self.HISTORY_REQ_LEN_EMA_LEN, sliding_window=True)
@@ -365,24 +371,31 @@ class AdaptiveBatchsizeRouter:
             # print(f" -> cur_len_bs {cur_len_bs}")
 
             # 条件概率
-            his_Lo = sorted(self._history_req_decode_len)
-            his_Lo_postfix_sum = np.flip(np.flip(his_Lo, 0).cumsum(), 0)
-            Lo_exps = []
-            for dl in decoded_len:
-                pos = bisect.bisect(his_Lo, dl)
-                if pos == len(his_Lo):
-                    exp = dl
-                else:
-                    exp = his_Lo_postfix_sum[pos] / (len(his_Lo) - pos)
-                Lo_exps.append(exp)
-            Ld_exp = np.average(Lo_exps) * 0.5
-            print(f"Ld_exp {Ld_exp}")
-            ideal_mem_req_len_exp = np.average(prompt_len) + Ld_exp
-            # _upper_mem_rate = 1
-            _upper_mem_rate = self.UPPER_MEM_RATE
-            # _upper_mem_rate = min(0.95, self.UPPER_MEM_RATE)
-            high_bs_exp = int(self.max_total_token_num * _upper_mem_rate / ideal_mem_req_len_exp)
-            print(f" -> high_bs_exp {high_bs_exp}")
+            # his_Lo = sorted(self._history_req_decode_len)
+            # his_Lo_postfix_sum = np.flip(np.flip(his_Lo, 0).cumsum(), 0)
+            # Lo_exps_dict = {}
+            # for req in reqs:
+            #     dl = len(req.output_ids)
+            #     pos = bisect.bisect(his_Lo, dl)
+            #     if pos == len(his_Lo):
+            #         exp = dl
+            #     else:
+            #         if pos > 0:     # TODO: 换成插值
+            #             pos -= 1
+            #         exp = his_Lo_postfix_sum[pos] / (len(his_Lo) - pos)
+            #     Lo_exps_dict[req.request_id] = exp
+            # Lo_exp = np.average(list(Lo_exps_dict.values()))
+            # # self.predicted_output_len = Lo_exp
+            # # self.predicted_output_len_dict = Lo_exps_dict
+
+            # Ld_exp = Lo_exp * 0.5
+            # print(f"Ld_exp {Ld_exp}")
+            # ideal_mem_req_len_exp = np.average(prompt_len) + Ld_exp
+            # # _upper_mem_rate = 1
+            # _upper_mem_rate = self.UPPER_MEM_RATE
+            # # _upper_mem_rate = min(0.95, self.UPPER_MEM_RATE)
+            # high_bs_exp = int(self.max_total_token_num * _upper_mem_rate / ideal_mem_req_len_exp)
+            # print(f" -> high_bs_exp {high_bs_exp}")
 
 
         else:
@@ -497,67 +510,99 @@ class ReqQueue:
         self.recalcu_pause_req_used_tokens()
         return
 
+    def _sample_cache_list(self, reqs: List[Req]) -> List[Tuple[int, int]]:
+        cache_len_list = []
+        his_Lo = sorted(self.adaptive_batchsize_router._history_req_decode_len)
+        for req in reqs:
+            dl = len(req.output_ids)
+            pos = bisect.bisect(his_Lo, dl)
+            points = 1 + len(his_Lo) - pos
+            if points == 1:
+                sampled = dl
+            else:
+                rand_p = random.random() * (points - 1)
+
+                # (伪) 线性差值
+                if rand_p < 1:
+                    sampled = dl + (his_Lo[pos] - dl) * rand_p
+                else:
+                    l = his_Lo[pos + int(rand_p) - 1]
+                    u = his_Lo[pos + int(rand_p)]
+                    sampled = l + (u - l) * (rand_p - int(rand_p))
+
+            cache_len_list.append(req.get_tuple_tokens(False, sampled))
+        return cache_len_list
+
+    def _calc_max_token_num_needed(self, cache_len_list: List[Tuple[int, int]]) -> int:
+        cache_len_list.sort(key=lambda x: -x[1])
+
+        left_out_len_array = np.array([e[1] for e in cache_len_list])
+        # assert left_out_len_array.min() >= 0
+        has_run_len_array = np.array([e[0] for e in cache_len_list])
+        cum_run_len_array = np.cumsum(has_run_len_array)
+        size_array = np.arange(1, len(cache_len_list) + 1, 1)
+
+        need_max_token_num = (left_out_len_array * size_array + cum_run_len_array).max()
+        return need_max_token_num
+
     def _init_cache_list(self, current_batch:Batch, is_busy):
         self.cache_pause_reqs_used_tokens = self.pause_req_used_tokens
         self.cache_pause_reqs_num = len(self.pause_req_dict)
         if current_batch is not None:
-            self.cache_len_list = [req.get_tuple_tokens(is_busy, self.router_max_new_token_len) for req in current_batch.reqs]
+            if self.adaptive_batchsize_router:
+                MINIMUM_SAMPLES = 200
+                MAXIMUM_LISTS = 5
+                n_lists = int(MINIMUM_SAMPLES / len(current_batch.reqs)) + 1
+                n_lists = min(MAXIMUM_LISTS, n_lists)
+
+                self._cache_len_lists = [self._sample_cache_list(current_batch.reqs) for _ in range(n_lists)]
+                # p_dict = self.adaptive_batchsize_router.predicted_output_len_dict
+                # print(" * p_dict", p_dict)
+                # self.cache_len_list = [req.get_tuple_tokens(is_busy, p_dict[req.request_id]) for req in current_batch.reqs]
+
+                self.cache_len_list = self._cache_len_lists[0]   # keep compatibility
+                if random.random() < 0.1:  # debug
+                    for i, li in enumerate(self._cache_len_lists):
+                        print(" * cache_len_list", i, li)
+                    # print(" * sum cache_len_list[1]", sum(x[1] for x in self.cache_len_list))
+                    # print(" * len cache_len_list", len(self.cache_len_list))
+                    # print(" * avg", sum(x[1] for x in self.cache_len_list) / len(self.cache_len_list))
+            else:
+                self.cache_len_list = [req.get_tuple_tokens(is_busy, self.router_max_new_token_len) for req in current_batch.reqs]
         else:
-            self.cache_len_list = []
+            if self.adaptive_batchsize_router:
+                self._cache_len_lists = [[]]
+                self.cache_len_list = self._cache_len_lists[0]   # keep compatibility
+            else:
+                self.cache_len_list = []
 
-    # @calculate_time(show=True, min_cost_ms=0.1)
+    @calculate_time(show=True, min_cost_ms=0)
     def _can_add_new_req(self, req:Req, is_busy):
-        self.cache_len_list.append(req.get_tuple_tokens(is_busy, self.router_max_new_token_len)) # hard to analysis
-
         if self.adaptive_batchsize_router:
-            absr = self.adaptive_batchsize_router
-            if absr.START_RATE_LIMIT \
-                and len(self.cache_len_list) > 1:   # make sure there are someting to run
-                to_start = len(self.cache_len_list) - absr.staged_bs
-                print('to_start', to_start)
-                total_start = absr.recent_starts_num() + to_start
-                print('total_start', total_start, f"({absr.recent_starts_num()} + {to_start})")
-                limit = absr.ideal_start_rate * absr.START_RATE_LIMIT_RATIO * absr.START_RATE_LIMIT_WINDOW
-                print('limit', round(limit), limit, f"({absr.ideal_start_rate} * {absr.START_RATE_LIMIT_RATIO} * {absr.START_RATE_LIMIT_WINDOW})")
-                limit = round(limit)
-                if to_start + absr.recent_starts_num() > limit:
-                    if absr.bs_change_floating_room > 0:
-                        absr.bs_change_floating_room -= 1
-                    else:
-                        print('reach start limit')
-                        return False
+            need_max_token_nums = []
+            for li in self._cache_len_lists:     # TODO: parallel?
+                newreq_output_len_sample = random.choice(self.adaptive_batchsize_router._history_req_decode_len)
+                print('newreq_output_len_sample', newreq_output_len_sample)
+                li.append(req.get_tuple_tokens(is_busy, newreq_output_len_sample))
+                need_max_token_num_sample = self._calc_max_token_num_needed(li)
+                print(" * need_max_token_num_sample", need_max_token_num_sample)
+                need_max_token_nums.append(need_max_token_num_sample)
+            print('max(need_max_token_nums)', max(need_max_token_nums))
+            print('average(need_max_token_nums)', np.average(need_max_token_nums))
+            # need_max_token_num = max(need_max_token_nums)
+            need_max_token_num = np.average(need_max_token_nums)
 
-            RESERVED_TOKEN_RATIO = 0.01
-            max_total_tokens = absr.max_total_token_num
-            if len(self.cache_len_list) <= absr.target_running_bs:
-                # if sum(e[0] for e in self.cache_len_list) <= max_total_tokens - len(self.cache_len_list):
-                reserved_tokens = max_total_tokens * RESERVED_TOKEN_RATIO
-                if sum(e[0] for e in self.cache_len_list) <= max_total_tokens - reserved_tokens - len(self.cache_len_list):
-                    # vram is enough for prefill and next decode
-                    return True
-                else:
-                    print(f' + prefill will limited by vram at bs {len(self.cache_len_list)}')
-                    print(f' + {sum(e[0] for e in self.cache_len_list)} > {max_total_tokens} - {reserved_tokens} - {len(self.cache_len_list)}')
-                    # print(f' + {sum(e[0] for e in self.cache_len_list)} > {max_total_tokens} * {self.adaptive_batchsize_router.UPPER_MEM_RATE} - {len(self.cache_len_list)}')
-                    # may reduce target_staged_bs if memory not enough for new refill
-                    # self.adaptive_batchsize_router.target_staged_bs = min(len(self.cache_len_list), self.adaptive_batchsize_router.target_staged_bs)
-                    pass
-            return False
+        else:
+            self.cache_len_list.append(req.get_tuple_tokens(is_busy, self.router_max_new_token_len)) # hard to analysis
+            need_max_token_num = self._calc_max_token_num_needed(self.cache_len_list)
 
-        self.cache_len_list.sort(key=lambda x: -x[1])
-
-        left_out_len_array = np.array([e[1] for e in self.cache_len_list])
-        # assert left_out_len_array.min() >= 0
-        has_run_len_array = np.array([e[0] for e in self.cache_len_list])
-        cum_run_len_array = np.cumsum(has_run_len_array)
-        size_array = np.arange(1, len(self.cache_len_list) + 1, 1)
-
-        need_max_token_num = (left_out_len_array * size_array + cum_run_len_array).max()
+        print(" * need_max_token_num", need_max_token_num)
         if req.req_status in [ReqRunStatus.PAUSED_AND_KVKEEP, ReqRunStatus.PAUSED_AND_OFFLOAD]:
             self.cache_pause_reqs_used_tokens -= req.get_used_tokens()
             self.cache_pause_reqs_num -= 1
 
-        ok_token_num = need_max_token_num < self.max_total_tokens - self.cache_pause_reqs_used_tokens - self.prompt_cache_used_tokens
+        REVERSED = 0.05
+        ok_token_num = need_max_token_num < self.max_total_tokens * (1 - REVERSED) - self.cache_pause_reqs_used_tokens - self.prompt_cache_used_tokens
         ok_req_num = len(self.cache_len_list) + self.cache_pause_reqs_num + self.prompt_cache_req_num <= self.running_max_req_size
 
         if ok_token_num and ok_req_num:
@@ -565,8 +610,11 @@ class ReqQueue:
         else:
             return False
 
-    #@calculate_time(show=True, min_cost_ms=10)
+    @calculate_time(show=True, min_cost_ms=0.03)
     def generate_new_batch(self, current_batch:Batch):
+
+        if not self.waiting_req_list:
+            return None
 
         # 如果当前已经被调度的请求数量超过了上限，直接不调度新的请求了。
         exist_req_num = self.prompt_cache_req_num
@@ -603,7 +651,10 @@ class ReqQueue:
                 aborted_count += 1
                 continue
             req_first_router_need_tokens = req.get_first_router_need_tokens()
-            if self._can_add_new_req(req, is_busy) and cur_batch_decode_need_tokens + new_batch_first_router_need_tokens + req_first_router_need_tokens <= self.batch_max_tokens:
+            if cur_batch_decode_need_tokens + new_batch_first_router_need_tokens + req_first_router_need_tokens <= self.batch_max_tokens \
+                and self._can_add_new_req(req, is_busy):
+                # and cur_token_ratio < 0.99 and (self._can_add_new_req(req, is_busy) or True) and sum(x[0] for x in self.cache_len_list) < self.max_total_tokens:
+
                 can_run_list.append(req)
                 new_batch_first_router_need_tokens += req_first_router_need_tokens
                 if req.req_status in [ReqRunStatus.PAUSED_AND_KVKEEP, ReqRunStatus.PAUSED_AND_OFFLOAD]:
@@ -626,3 +677,16 @@ class ReqQueue:
             used_tokens += req_obj.get_used_tokens()
         self.pause_req_used_tokens = used_tokens
         return self.pause_req_used_tokens
+
+    def get_max_prefill_token(self, current_batch:Batch):
+        used_tokens = self.pause_req_used_tokens
+        if current_batch is not None:
+            used_tokens += sum(req.get_tuple_tokens(False, self.router_max_new_token_len)[0] for req in current_batch.reqs)
+        if self.adaptive_batchsize_router:
+            absr = self.adaptive_batchsize_router
+            max_prefill_token = absr.max_total_token_num * (1 - absr.PREFILL_RESERVED_TOKEN_RATIO) - used_tokens
+            max_prefill_token -= absr.target_running_bs     # lower bond
+            max_prefill_token = max(0, max_prefill_token)
+            return max_prefill_token
+        else:
+            raise NotImplementedError

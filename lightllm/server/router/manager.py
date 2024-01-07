@@ -32,7 +32,7 @@ class RouterManager:
         self.running_batch: Batch = None
         self.eos_id = args.eos_id
         self.has_wait_tokens = 0
-        self.max_wait_tokens = 10
+        self.max_wait_tokens = args.max_wait_token
 
         context = zmq.asyncio.Context(2)
         self.recv_from_httpserver = context.socket(zmq.PULL)
@@ -44,6 +44,8 @@ class RouterManager:
 
         self.is_splitfuse_mode = args.splitfuse_mode
         self.splitfuse_block_size = args.splitfuse_block_size
+        if self.is_splitfuse_mode:
+            self.max_wait_tokens = 1
 
         if self.is_splitfuse_mode and len(args.prompt_cache_strs) != 0:
             self.tokenizer = get_tokenizer(self.model_weightdir, args.tokenizer_mode, args.trust_remote_code)
@@ -54,6 +56,7 @@ class RouterManager:
             self._last_running_bs = 0
             self._last_evicted_n = 0
             self._last_evicted_size = 0
+            self._last_update_time = 0
             self.adaptive_batchsize_router = AdaptiveBatchsizeRouter(self.max_total_token_num)
         else:
             self.adaptive_batchsize_router = None
@@ -163,8 +166,10 @@ class RouterManager:
 
     def _update_adaptive_batchsize_router(self, state: InferState, **kargs):
         if self.adaptive_batchsize_router:
-            print(state)
-            print(time.time())
+            cur_time = time.time()
+            print(cur_time)
+            step_time = cur_time - self._last_update_time
+            print(state, step_time)
             staged_bs = len(self.running_batch.reqs) if self.running_batch else 0
             staged_bs_delta = staged_bs - self._last_staged_bs
             self._last_staged_bs = staged_bs
@@ -180,7 +185,43 @@ class RouterManager:
             )
             # reset step-wise counters
             self._last_evicted_n = 0
+            self._last_update_time = time.time()
             print(time.time())
+
+    # def _should_prefill(self):
+    #     print("  _should_prefill()")
+    #     last_step_is_decode = (self.has_wait_tokens > 0)
+
+    #     waiting_req_list = self.req_queue.waiting_req_list
+    #     print("  len(waiting_req_list)", len(waiting_req_list))
+    #     if not waiting_req_list:
+    #         self.has_wait_tokens = 0
+    #         return False
+
+    #     print("  has_wait_tokens", self.has_wait_tokens, '/', self.max_wait_tokens)
+    #     if self.has_wait_tokens >= self.max_wait_tokens:
+    #         return True
+
+    #     vram_max_prefill_token = self.req_queue.get_max_prefill_token(self.running_batch)
+    #     print("  vram_max_prefill_token", vram_max_prefill_token)
+    #     could_prefill_token = 0
+    #     if self.adaptive_batchsize_router:
+    #         max_prefill_bs = self.adaptive_batchsize_router.target_running_bs - self.adaptive_batchsize_router.staged_bs
+    #         max_prefill_bs = max(0, max_prefill_bs)
+    #         waiting_req_list = waiting_req_list[:max_prefill_bs]
+    #     for req in self.req_queue.waiting_req_list:
+    #         could_prefill_token += req.get_first_router_need_tokens()
+    #         if could_prefill_token >= vram_max_prefill_token:
+    #             could_prefill_token = vram_max_prefill_token
+    #             break
+    #     print("  could_prefill_token", could_prefill_token)
+
+    #     _min_prefill_token = self.req_queue.batch_max_tokens * 0.5
+    #     print("  _min_prefill_token", _min_prefill_token, 'batch_max_tokens', self.req_queue.batch_max_tokens)
+    #     if last_step_is_decode and could_prefill_token > _min_prefill_token:
+    #         return True
+    #     return False
+
 
     async def _step(self):
         """
@@ -191,6 +232,7 @@ class RouterManager:
         if self.running_batch is None:
             new_batch = self.req_queue.generate_new_batch(self.running_batch)
             if new_batch is not None:
+                self._last_update_time = time.time()    # after idel, reset timestamp
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
                 await self._prefill_batch(self.running_batch)
@@ -200,7 +242,15 @@ class RouterManager:
             return
 
         # 有运行请求，但是已经到了可以调度新的请求合并推理的时机
-        if self.has_wait_tokens >= self.max_wait_tokens:
+        prefill_nowait = (
+            self.has_wait_tokens >= 1
+            and self.running_batch.batch_used_tokens < self.max_total_token_num * 0.9
+            and len(self.req_queue.waiting_req_list) > 50
+            and False
+        )
+        if self.has_wait_tokens >= self.max_wait_tokens \
+            or prefill_nowait :
+        # if self._should_prefill():
             new_mini_batch = self.req_queue.generate_new_batch(self.running_batch)
             self.has_wait_tokens = 0
             if new_mini_batch is not None:

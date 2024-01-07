@@ -10,14 +10,15 @@ class Stats:
         self.output_tokens = 0
         self.prompt_tokens = 0
         return
-    
+
     def count_prompt_tokens(self, run_batch):
         if self.log_stats:
             tokens = run_batch.input_tokens()
+            print("prefill tokens", tokens)
             self.prompt_tokens += tokens
             self.all_tokens += tokens
         return
-    
+
     def count_output_tokens(self, run_batch):
         if self.log_stats:
             tokens = len(run_batch.reqs)
@@ -40,4 +41,3 @@ class Stats:
             self.last_log_time = now
         return
 
-    

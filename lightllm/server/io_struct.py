@@ -67,7 +67,7 @@ class Req:
     def get_used_tokens(self):
         return max(0, self.cur_kv_len - self.prompt_cache_len)
 
-    def get_tuple_tokens(self, is_busy, router_max_new_token_len):
+    def get_tuple_tokens(self, is_busy, router_max_new_token_len) -> Tuple[int, int]:
         raise Exception("need to impl")
 
     def get_decode_need_tokens(self):
@@ -93,7 +93,8 @@ class NormalReq(Req):
         else:
             # 用当前输出长度的 1.1 倍作为预估输出长度的另一个参考量，用于更新估计的最大输出长度量
             # 后续会更新为更合理的统计条件概率估计方式 to do
-            cur_max_new_token_len = min(self.max_output_len, max(int(1.1 * has_out_len), router_max_new_token_len))
+            # cur_max_new_token_len = min(self.max_output_len, max(int(1.1 * has_out_len), router_max_new_token_len))
+            cur_max_new_token_len = min(self.max_output_len, router_max_new_token_len)
 
         if self.req_status == ReqRunStatus.RUNNING:
             return (self.input_len + has_out_len - self.prompt_cache_len, max(0, cur_max_new_token_len - has_out_len - 1))

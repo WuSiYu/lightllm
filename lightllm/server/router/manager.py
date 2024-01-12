@@ -246,7 +246,6 @@ class RouterManager:
             self.has_wait_tokens >= 1
             and self.running_batch.batch_used_tokens < self.max_total_token_num * 0.9
             and len(self.req_queue.waiting_req_list) > 50
-            and False
         )
         if self.has_wait_tokens >= self.max_wait_tokens \
             or prefill_nowait :

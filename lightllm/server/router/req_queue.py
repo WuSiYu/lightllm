@@ -577,7 +577,7 @@ class ReqQueue:
                 self.cache_len_list = []
 
     @calculate_time(show=True, min_cost_ms=0)
-    def _can_add_new_req(self, req:Req, is_busy):
+    def _can_add_new_req(self, req: Req, is_busy: bool, bs: int):
         if self.adaptive_batchsize_router:
             need_max_token_nums = []
             for li in self._cache_len_lists:     # TODO: parallel?
@@ -601,7 +601,20 @@ class ReqQueue:
             self.cache_pause_reqs_used_tokens -= req.get_used_tokens()
             self.cache_pause_reqs_num -= 1
 
-        REVERSED = 0.05
+
+        # req:    float_ratio =    sqrt(cov) / avg_size
+        # batch:  float_ratio =    sqrt(cov * bs) / (bs * avg_size)  = (sqrt(cov) / avg_size) / sqrt(bs)
+        if bs:
+            avg_size = need_max_token_num / bs
+            float_ratio = avg_size / bs
+            print(" * float_ratio", float_ratio)
+
+            # REVERSED = min(self.max_total_tokens // 3, round(float_ratio * 1000))
+            REVERSED = 0.75 * (1 / math.sqrt(bs))
+        else:
+            REVERSED = 0.75
+        # REVERSED = 0.05
+        print(" * REVERSED", REVERSED)
         ok_token_num = need_max_token_num < self.max_total_tokens * (1 - REVERSED) - self.cache_pause_reqs_used_tokens - self.prompt_cache_used_tokens
         ok_req_num = len(self.cache_len_list) + self.cache_pause_reqs_num + self.prompt_cache_req_num <= self.running_max_req_size
 
@@ -611,7 +624,7 @@ class ReqQueue:
             return False
 
     @calculate_time(show=True, min_cost_ms=0.03)
-    def generate_new_batch(self, current_batch:Batch):
+    def generate_new_batch(self, current_batch: Batch):
 
         if not self.waiting_req_list:
             return None
@@ -641,6 +654,7 @@ class ReqQueue:
             cur_batch_decode_need_tokens = 0 if current_batch is None else current_batch.batch_decode_need_tokens
 
         self._init_cache_list(current_batch, is_busy)
+        n_current_reqs = len(current_batch.reqs) if current_batch else 0
         can_run_list = []
         new_batch_first_router_need_tokens = 0 # 主要是对 prefill 或者 splitfuse 大块计算时候的限制
         aborted_count = 0
@@ -652,8 +666,8 @@ class ReqQueue:
                 continue
             req_first_router_need_tokens = req.get_first_router_need_tokens()
             if cur_batch_decode_need_tokens + new_batch_first_router_need_tokens + req_first_router_need_tokens <= self.batch_max_tokens \
-                and self._can_add_new_req(req, is_busy):
-                # and cur_token_ratio < 0.99 and (self._can_add_new_req(req, is_busy) or True) and sum(x[0] for x in self.cache_len_list) < self.max_total_tokens:
+                and self._can_add_new_req(req, is_busy, bs=n_current_reqs):
+                # and (self._can_add_new_req(req, is_busy) or True) and sum(x[0] for x in self.cache_len_list) < self.max_total_tokens * 0.99:    # waterlevel test
 
                 can_run_list.append(req)
                 new_batch_first_router_need_tokens += req_first_router_need_tokens

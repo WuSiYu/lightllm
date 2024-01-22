@@ -137,7 +137,7 @@ def test_correct_int8(M=512, K=4096, N=4096):
     cos = torch.nn.CosineSimilarity(0)
     triton_output = matmul_dequantize_int8(a, int_b, b_scale)
     torch_output = torch.matmul(a, b)
-    print(f"triton_output={triton_output}")        
+    print(f"triton_output={triton_output}")
     print(f"torch_output={torch_output}")
     print("Output cos ", cos(triton_output.flatten().to(torch.float32), torch_output.flatten().to(torch.float32)))
 

@@ -55,7 +55,7 @@ class MistralTpPartModel(TpPartBaseModel):
                                         head_num=self.config["num_key_value_heads"] // self.world_size_,
                                         head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
                                         layer_num=self.config["num_hidden_layers"],
-                                        always_copy=False)       
+                                        always_copy=False)
         return
 
     def _init_to_get_rotary(self, default_base=10000):
@@ -82,4 +82,3 @@ class MistralTpPartModel(TpPartBaseModel):
         self._cos_cached = torch.cos(freqs).to(torch.float16).cuda()
         self._sin_cached = torch.sin(freqs).to(torch.float16).cuda()
         return
-    

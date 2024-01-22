@@ -9,10 +9,10 @@ class Internlm2TransformerLayerWeight(LlamaTransformerLayerWeight):
     def __init__(self, layer_num, tp_rank, world_size, data_type, network_config, mode=[]):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
-         
+
         # handle internlm 20b, which has no bias, so set q k v o bias to zero
         if not self.network_config_.get("bias", True):
             for layer_type in ("q", "k", "v", "o"):
@@ -37,8 +37,8 @@ class Internlm2TransformerLayerWeight(LlamaTransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
-    
+        return
+
     def _load_qkvo_weights(self, weights):
         # input layernorm params
         if f"model.layers.{self.layer_num_}.attention_norm.weight" in weights:
@@ -53,7 +53,7 @@ class Internlm2TransformerLayerWeight(LlamaTransformerLayerWeight):
             qkv_weight_ = weights[f"model.layers.{self.layer_num_}.attention.wqkv.weight"]
             q_groups = self.network_config_["num_attention_heads"] // self.network_config_["num_key_value_heads"]
             qkv_weight_ = qkv_weight_.reshape(self.network_config_["num_key_value_heads"], q_groups + 2, head_dim, -1)
-            q_weight_ = qkv_weight_[:, :q_groups, :, :].reshape(-1, qkv_weight_.shape[-1]) 
+            q_weight_ = qkv_weight_[:, :q_groups, :, :].reshape(-1, qkv_weight_.shape[-1])
             self.q_weight_ = self._cuda(q_weight_[q_split_n_embed * self.tp_rank_: q_split_n_embed * (self.tp_rank_ + 1):].transpose(0, 1))
             k_weight_ = qkv_weight_[:, -2, :, :].reshape(-1, qkv_weight_.shape[-1])
             self.k_weight_ = self._cuda(k_weight_[kv_split_n_embed * self.tp_rank_: kv_split_n_embed * (self.tp_rank_ + 1):].transpose(0, 1))
@@ -66,7 +66,7 @@ class Internlm2TransformerLayerWeight(LlamaTransformerLayerWeight):
             self.o_weight_ = self._cuda(self.o_weight_.transpose(0, 1))
         if f"model.layers.{self.layer_num_}.attention.wo.bias" in weights:
             self.o_bias_ = weights[f"model.layers.{self.layer_num_}.attention.wo.bias"]
-            self.o_bias_ = self._cuda(self.o_bias_)   
+            self.o_bias_ = self._cuda(self.o_bias_)
         return
 
     def _load_ffn_weights(self, weights):
@@ -91,4 +91,4 @@ class Internlm2TransformerLayerWeight(LlamaTransformerLayerWeight):
                                                                                              split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1)]
             self.down_proj = self._cuda(self.down_proj.transpose(0, 1))
         return
-                      
+

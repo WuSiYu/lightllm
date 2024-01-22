@@ -31,14 +31,14 @@ class VisualManager:
         self.recv_from_httpserver = context.socket(zmq.PULL)
         self.recv_from_httpserver.bind(f"tcp://127.0.0.1:{visual_port}")
         self.cache_client = rpyc.connect("localhost", client_port)
-        self.waiting_reqs = [] 
+        self.waiting_reqs = []
         self.model_weightdir = args.model_dir
         self.tp_world_size = args.tp
         self.world_size = 1
         self.infer_batch_size = infer_batch_size
         self.trust_remote_code=args.trust_remote_code
         self.args = args
-        
+
     async def wait_to_model_ready(self):
 
         self.model_rpcs: List[VisualModelRpcClient] = []
@@ -133,7 +133,7 @@ class VisualManager:
         return
 
 def start_visual_process(args, router_port, visual_port, client_port, pipe_writer):
-    try: 
+    try:
         visualserver = VisualManager(
             args,
             router_port,

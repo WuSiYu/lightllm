@@ -134,7 +134,7 @@ def token_attention_fwd(q, k, v, o, alibi, req_to_tokens, b_req_idx, b_start_loc
                   k,
                   att_m_tensor,
                   alibi,
-                  req_to_tokens, 
+                  req_to_tokens,
                   b_req_idx,
                   b_start_loc,
                   b_seq_len,
@@ -145,7 +145,7 @@ def token_attention_fwd(q, k, v, o, alibi, req_to_tokens, b_req_idx, b_start_loc
     token_att_fwd2(prob,
                    v,
                    o.view(calcu_shape1),
-                   req_to_tokens, 
+                   req_to_tokens,
                    b_req_idx,
                    b_start_loc,
                    b_seq_len)

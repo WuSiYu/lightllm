@@ -34,14 +34,14 @@ class LlamaTpPartModel(TpPartBaseModel):
     def __init__(self, kvargs):
         super().__init__(kvargs)
         return
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
         # repair_config()
         self._reset_num_key_value_heads()
-        return 
-    
+        return
+
     def _reset_num_key_value_heads(self):
         if "num_key_value_heads" not in self.config:
             self.config["num_key_value_heads"] = self.config["num_attention_heads"]
@@ -52,9 +52,9 @@ class LlamaTpPartModel(TpPartBaseModel):
         assert self.config["num_key_value_heads"] % self.world_size_ == 0
         assert self.config["num_attention_heads"] % self.world_size_ == 0
         return
-    
+
     def _init_mem_manager(self):
-        self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num, 
+        self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num,
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_key_value_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
@@ -96,8 +96,8 @@ class LlamaTpPartModel(TpPartBaseModel):
                 prefix='model.layers.',
                 num_layer=self.config["n_layer"])
         self.pre_post_weight.verify_load()
-        [weight.verify_load() for weight in self.trans_layers_weight]            
-        return 
+        [weight.verify_load() for weight in self.trans_layers_weight]
+        return
 
     def _init_to_get_rotary(self, default_base=10000):
         if self.config.get("rope_scaling", {}) is None:
@@ -142,7 +142,7 @@ class LlamaTpPartModel(TpPartBaseModel):
         max_seq_len = 32 * max_position_embeddings # 64k
         self._cos_cached = torch.zeros((max_seq_len, self.head_dim_ // 2), dtype=torch.float16, device="cuda")
         self._sin_cached = torch.zeros((max_seq_len, self.head_dim_ // 2), dtype=torch.float16, device="cuda")
-        
+
         inv_freq = 1.0 / (base ** (torch.arange(0, self.head_dim_, 2, device="cpu", dtype=torch.float32) / self.head_dim_))
         t = torch.arange(max_position_embeddings, device="cpu", dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)

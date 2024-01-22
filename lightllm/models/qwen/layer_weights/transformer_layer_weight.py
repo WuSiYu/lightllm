@@ -27,7 +27,7 @@ class QwenTransformerLayerWeight(TransformerLayerWeight):
             self.k_weight_ = self._cuda(self.k_weight_.transpose(0, 1))
             self.v_weight_ = v_weights[split_n_embed * self.tp_rank_: split_n_embed * (self.tp_rank_ + 1), :]
             self.v_weight_ = self._cuda(self.v_weight_.transpose(0, 1))
-        
+
         if f"transformer.h.{self.layer_num_}.attn.c_attn.bias" in weights:
             qkv_bias = weights[f"transformer.h.{self.layer_num_}.attn.c_attn.bias"]
             split_size = qkv_bias.shape[0] // 3
@@ -62,9 +62,9 @@ class QwenTransformerLayerWeight(TransformerLayerWeight):
             self.down_proj = weights[f"transformer.h.{self.layer_num_}.mlp.c_proj.weight"][:,
                                                                                              split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1)]
             self.down_proj = self._cuda(self.down_proj.transpose(0, 1))
-            
+
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
         weights = [self.att_norm_weight_,
@@ -82,4 +82,4 @@ class QwenTransformerLayerWeight(TransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return

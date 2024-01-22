@@ -72,7 +72,7 @@ class InferBatch:
     batch_id: int
     request_ids: List
     req_manager: ReqManager
-    
+
     @classmethod
     @torch.no_grad()
     def init_batch(cls, batch_id, requests, dtype: torch.dtype, device: torch.device, req_manager:ReqManager, vocab_size: int):
@@ -81,7 +81,7 @@ class InferBatch:
         need_alloc_size = len([r for r in requests if r['request_id'] not in requests_mapping])
         nopad_b_req_idx = req_manager.alloc(need_alloc_size)
         nopad_b_req_idx = nopad_b_req_idx.cpu().numpy()
-        
+
         index = 0
         for r in requests:
             # request id -> idx in list mapping
@@ -95,12 +95,12 @@ class InferBatch:
                 multimodal_params = r["multimodal_params"]
                 sampling_param["vocab_size"] = vocab_size
                 assert r['req_status'] == ReqRunStatus.WAIT_IN_QUEUE
-                r_obj = InferReq(r_id, 
+                r_obj = InferReq(r_id,
                                 input_token_ids=tokenized_input,
-                                out_token_id_count=collections.defaultdict(int), 
-                                sampling_param=InferSamplingParams(**sampling_param), 
+                                out_token_id_count=collections.defaultdict(int),
+                                sampling_param=InferSamplingParams(**sampling_param),
                                 multimodal_params=multimodal_params,
-                                req_idx=nopad_b_req_idx[index], 
+                                req_idx=nopad_b_req_idx[index],
                                 prompt_len=input_length,
                                 req_status=r['req_status'],
                                 prompt_cache_len=r['prompt_cache_len'],
@@ -116,7 +116,7 @@ class InferBatch:
                     r_obj.req_status = ReqRunStatus.RERUNNING_FROM_KVKEEP
                 else:
                     assert False, f"should not exist {requests_mapping[r_id].req_status}"
-            
+
             request_ids.append(r_id)
 
             # 如果是具有 prompt_cache 的使用特性则需要进行提前的填充和恢复操作。
@@ -128,7 +128,7 @@ class InferBatch:
                     mem_manager.add_refs(prompt_kv_tokens.long()) # 加 refs
                     req_manager.req_to_token_indexs[r_obj.req_idx, 0:r_obj.prompt_cache_len] = prompt_kv_tokens
                     r_obj.cur_kv_len = r_obj.prompt_cache_len
-            
+
             # 初始化之后 所有请求状态置换为 RUNNING 状态
             r_obj.req_status = ReqRunStatus.RUNNING
 
@@ -137,7 +137,7 @@ class InferBatch:
             request_ids=request_ids,
             req_manager=req_manager,
         )
-    
+
     @torch.no_grad()
     def free_self(self):
         free_req_index = []
@@ -146,13 +146,13 @@ class InferBatch:
             req : InferReq = requests_mapping.pop(request_id)
             free_req_index.append(req.req_idx)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
-            
+
         free_token_index = torch.cat(free_token_index, dim=-1)
         self.req_manager.free(free_req_index, free_token_index)
         if len(requests_mapping) == 0:
             requests_mapping.clear()
         return
-    
+
     @torch.no_grad()
     def filter(self, request_ids: List[str], finished_request_ids: List[str]):
         if len(requests_mapping) == 0:
@@ -174,7 +174,7 @@ class InferBatch:
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
         free_token_index = torch.cat(free_token_index, dim=-1)
         self.req_manager.free(free_req_index, free_token_index)
-        
+
         return InferBatch(
             batch_id=self.batch_id,
             request_ids=request_ids,
@@ -197,7 +197,7 @@ class InferBatch:
     @torch.no_grad()
     def merge(cls, batch1, batch2):
         request_ids = batch1.request_ids + batch2.request_ids
-        
+
         return InferBatch(
             batch_id=batch1.batch_id,
             request_ids=request_ids,
@@ -206,4 +206,4 @@ class InferBatch:
 
     def __len__(self):
         return len(self.request_ids)
-    
+

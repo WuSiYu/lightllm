@@ -16,7 +16,7 @@ def start_submodule_processes(start_funcs=[], start_args=[]):
         process.start()
         pipe_readers.append(pipe_reader)
         processes.append(process)
-    
+
     # wait to ready
     for index, pipe_reader in enumerate(pipe_readers):
         init_state = pipe_reader.recv()
@@ -27,6 +27,6 @@ def start_submodule_processes(start_funcs=[], start_args=[]):
             sys.exit(1)
         else:
             logger.info(f"init func {start_funcs[index].__name__} : {str(init_state)}")
-    
+
     assert all([proc.is_alive() for proc in processes])
     return

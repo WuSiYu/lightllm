@@ -17,13 +17,13 @@ class BloomTransformerLayerWeight(TransformerLayerWeight):
         assert head_num % self.world_size_ == 0
         self.tp_alibi = tmp_alibi[self.tp_rank_ * tp_head_num: (self.tp_rank_ + 1) * tp_head_num].contiguous().cuda()
         return
-    
+
     def load_hf_weights(self, weights):
 
         self._load_qkvo_weights(weights)
         self._load_ffn_weights(weights)
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
         weights = [self.att_norm_weight_,
@@ -46,7 +46,7 @@ class BloomTransformerLayerWeight(TransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return
 
     def _load_qkvo_weights(self, weights):
         # input layernorm params
@@ -101,7 +101,7 @@ class BloomTransformerLayerWeight(TransformerLayerWeight):
                                                                                                      split_n_embed * self.tp_rank_: split_n_embed * (self.tp_rank_ + 1)].transpose(0, 1))
         if f"h.{self.layer_num_}.self_attention.dense.bias" in weights:
             self.o_bias_ = self._cuda(weights[f"h.{self.layer_num_}.self_attention.dense.bias"])
-        return 
+        return
 
     def _load_ffn_weights(self, weights):
         if f"h.{self.layer_num_}.post_attention_layernorm.weight" in weights:
@@ -131,7 +131,7 @@ class BloomTransformerLayerWeight(TransformerLayerWeight):
 
         if f"h.{self.layer_num_}.mlp.dense_4h_to_h.bias" in weights:
             self.ffn_2_bias_ = self._cuda(weights[f"h.{self.layer_num_}.mlp.dense_4h_to_h.bias"])
-        return 
+        return
 
     def _generate_alibi(self, n_head, dtype=torch.float16):
         """
@@ -172,4 +172,3 @@ class BloomTransformerLayerWeight(TransformerLayerWeight):
         slopes = torch.Tensor(get_slopes(n_head))
         head_alibi = slopes.to(dtype)
         return head_alibi
-    

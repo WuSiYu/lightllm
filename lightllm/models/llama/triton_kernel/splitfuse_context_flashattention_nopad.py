@@ -9,9 +9,9 @@ import torch.nn.functional as F
 @triton.jit
 def _fwd_kernel(
     Q, K, V, sm_scale, Req_to_tokens, B_req_idx,
-    B_split_start_loc, 
+    B_split_start_loc,
     B_split_seq_len,
-    B_seqlen, 
+    B_seqlen,
     Out,
     stride_qbs, stride_qh, stride_qd,
     stride_kbs, stride_kh, stride_kd,
@@ -25,16 +25,16 @@ def _fwd_kernel(
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
-    
+
     cur_kv_head = cur_head // kv_group_num
-    
+
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
     cur_batch_q_split_start_loc =  tl.load(B_split_start_loc + cur_batch)
     cur_batch_q_split_seq_len = tl.load(B_split_seq_len + cur_batch)
 
     cur_batch_seq_len = tl.load(B_seqlen + cur_batch)
     cur_batch_seq_start = cur_batch_seq_len - cur_batch_q_split_seq_len
-    
+
     # initialize offsets
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -100,12 +100,12 @@ def _fwd_kernel(
 
 @torch.no_grad()
 def splitfuse_context_attention_fwd(q, k, v, o,
-                                    prefill_req_num, 
-                                    req_to_tokens, 
-                                    prefill_b_req_idx, 
+                                    prefill_req_num,
+                                    req_to_tokens,
+                                    prefill_b_req_idx,
                                     prefill_b_split_start_loc,
                                     prefill_b_split_seq_len,
-                                    prefill_b_seq_len, 
+                                    prefill_b_seq_len,
                                     prefill_max_split_seq_len_in_batch):
     if triton.__version__ == "2.0.0":
         raise Exception("triton version is not right")
@@ -119,13 +119,13 @@ def splitfuse_context_attention_fwd(q, k, v, o,
     sm_scale = 1.0 / (Lq**0.5)  # 计算scale系数
     batch, head = prefill_b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
-    
+
     grid = (prefill_req_num, head, triton.cdiv(prefill_max_split_seq_len_in_batch, BLOCK))
 
     num_warps = 4 if Lk <= 64 else 8
     _fwd_kernel[grid](
-        q, k, v, sm_scale, 
-        req_to_tokens, 
+        q, k, v, sm_scale,
+        req_to_tokens,
         prefill_b_req_idx,
         prefill_b_split_start_loc,
         prefill_b_split_seq_len,
@@ -148,9 +148,9 @@ def splitfuse_context_attention_fwd(q, k, v, o,
 @triton.jit
 def _fwd_kernel_int8(
     Q, K, K_scale, V, V_scale, sm_scale, Req_to_tokens, B_req_idx,
-    B_split_start_loc, 
+    B_split_start_loc,
     B_split_seq_len,
-    B_seqlen, 
+    B_seqlen,
     Out,
     stride_qbs, stride_qh, stride_qd,
     stride_kbs, stride_kh, stride_kd,
@@ -246,12 +246,12 @@ def _fwd_kernel_int8(
 
 @torch.no_grad()
 def splitfuse_context_attention_fwd_int8kv(q, k, k_scale, v, v_scale, o,
-                                    prefill_req_num, 
-                                    req_to_tokens, 
-                                    prefill_b_req_idx, 
+                                    prefill_req_num,
+                                    req_to_tokens,
+                                    prefill_b_req_idx,
                                     prefill_b_split_start_loc,
                                     prefill_b_split_seq_len,
-                                    prefill_b_seq_len, 
+                                    prefill_b_seq_len,
                                     prefill_max_split_seq_len_in_batch):
     if triton.__version__ == "2.0.0":
         raise Exception("triton version is not right")
@@ -265,13 +265,13 @@ def splitfuse_context_attention_fwd_int8kv(q, k, k_scale, v, v_scale, o,
     sm_scale = 1.0 / (Lq**0.5)  # 计算scale系数
     batch, head = prefill_b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
-    
+
     grid = (prefill_req_num, head, triton.cdiv(prefill_max_split_seq_len_in_batch, BLOCK))
 
     num_warps = 4 if Lk <= 64 else 8
     _fwd_kernel_int8[grid](
-        q, k, k_scale, v, v_scale, sm_scale, 
-        req_to_tokens, 
+        q, k, k_scale, v, v_scale, sm_scale,
+        req_to_tokens,
         prefill_b_req_idx,
         prefill_b_split_start_loc,
         prefill_b_split_seq_len,

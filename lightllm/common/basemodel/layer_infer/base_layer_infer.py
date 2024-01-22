@@ -14,6 +14,6 @@ class BaseLayerInfer:
 
     def token_forward(self, input_ids, infer_state: InferStateInfo, layer_weight: BaseLayerWeight):
         raise Exception("need to impl")
-    
+
     def splitfuse_forward(self, input_ids, infer_state: SplitFuseInferStateInfo, layer_weight: BaseLayerWeight):
         raise Exception("need to impl")

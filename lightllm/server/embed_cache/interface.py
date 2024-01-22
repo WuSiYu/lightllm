@@ -42,7 +42,7 @@ class CacheManagerFactory(object):
             return add_register_item(target.__name__, target)
         else:                           # 如果不可调用，说明额外说明了注册的可调用对象的名字
             return lambda x : add_register_item(target, x)
-    
+
     @classmethod
     def get_impl(cls, name: str):
         return cls._impls[name]

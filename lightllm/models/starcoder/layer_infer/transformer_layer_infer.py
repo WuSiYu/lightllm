@@ -19,7 +19,7 @@ class StarcoderTransformerLayerInfer(BloomTransformerLayerInfer):
         self.tp_v_head_num_ = 1
         self._bind_func()
         return
-    
+
     def _bind_func(self):
         LlamaTransformerLayerInfer._bind_attention(self)
         return

@@ -27,14 +27,14 @@ class StarcoderPreAndPostLayerWeight(PreAndPostLayerWeight):
         if "transformer.ln_f.bias" in weights:
             self.final_norm_bias_ = weights["transformer.ln_f.bias"].contiguous().to(self.data_type_).cuda()
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
-        weights = [self.final_norm_weight_, 
+        weights = [self.final_norm_weight_,
                    self.final_norm_bias_,
                    self.wte_weight_,
                    self.wpe_weight_,
                    self.lm_head_weight_]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return

@@ -66,7 +66,7 @@ def _fwd_kernel_destindex_copy_quantize_kv(
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
     dest_index = tl.load(Dest_loc + cur_index)
-    src_data = tl.load(K + cur_index * stride_k_bs + offs_h[:, None] * stride_k_h + stride_k_d * offs_d[None, :], 
+    src_data = tl.load(K + cur_index * stride_k_bs + offs_h[:, None] * stride_k_h + stride_k_d * offs_d[None, :],
                        mask=offs_h[:, None] < head_num, other=0.0)
     abs_data = tl.abs(src_data)
     data_scale = (tl.max(abs_data, axis=1) / 127.).to(tl.float16)[:, None]

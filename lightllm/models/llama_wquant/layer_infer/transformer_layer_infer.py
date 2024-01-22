@@ -21,7 +21,7 @@ from lightllm.utils.infer_utils import mark_cost_time
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
- 
+
 class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
     """
     """
@@ -35,17 +35,17 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         self.tp_o_head_num_ = self.tp_q_head_num_
         self.head_dim_ = network_config["hidden_size"] // network_config["num_attention_heads"]
         self.embed_dim_ = network_config["hidden_size"]
-        
+
         self.inter_dim_ = network_config['intermediate_size']
         self._bind_func()
         return
-    
+
     def _bind_func(self):
         self._bind_matmul()
         LlamaTransformerLayerInfer._bind_norm(self)
         LlamaTransformerLayerInfer._bind_attention(self)
         return
-    
+
     def _bind_matmul(self):
         if "triton_int8weight" in self.mode:
             func = partial(LlamaTransformerLayerInferWquant._wquant_matmul_triton_int8weight_only_quant, self)
@@ -84,10 +84,10 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         return
 
     def _get_qkv(self, input, cache_k, cache_v, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeightQuantized):
-        qkv_output = self._wquant_matmul_for_qkv(input.view(-1, self.embed_dim_), 
+        qkv_output = self._wquant_matmul_for_qkv(input.view(-1, self.embed_dim_),
                                                     quant_weight_params=layer_weight.qkv_weight_,
                                                     infer_state=infer_state)
-        
+
         tp_k_head_dim = self.tp_k_head_num_ * self.head_dim_
         q = qkv_output[:, : -2 * tp_k_head_dim]
         k = qkv_output[:, -2 * tp_k_head_dim: -tp_k_head_dim]
@@ -100,7 +100,7 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         return q, cache_k_, cache_v_
 
     def _get_o(self, input, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerWeightQuantized) -> torch.Tensor:
-        o_tensor = self._wquant_matmul_for_o(input, 
+        o_tensor = self._wquant_matmul_for_o(input,
                                              quant_weight_params=layer_weight.o_weight_,
                                              infer_state=infer_state)
         return o_tensor
@@ -115,12 +115,12 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         torch.nn.functional.silu(gate_up_output[:, 0], inplace=True)
         ffn1_out = gate_up_output[:, 0] * gate_up_output[:, 1]
         gate_up_output = None
-        ffn2_out = self._wquant_matmul_for_ffn_down(ffn1_out, 
+        ffn2_out = self._wquant_matmul_for_ffn_down(ffn1_out,
                                                     quant_weight_params=layer_weight.down_proj,
                                                     infer_state=infer_state)
         ffn1_out = None
         return ffn2_out
-    
+
     def _wquant_matmul_triton_int8weight_only_quant(self, input, quant_weight_params, infer_state: LlamaInferStateInfo, out=None, bias=None, has_act=False):
         assert has_act == False
         if not infer_state.is_splitfuse and infer_state.is_prefill:
@@ -134,7 +134,7 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         else:
             out.add_(bias)
             return out
-        
+
     def _wquant_matmul_triton_int4weight_only_quant(self, input, quant_weight_params, infer_state: LlamaInferStateInfo, out=None, bias=None, has_act=False):
         assert has_act == False
         if not infer_state.is_splitfuse and infer_state.is_prefill:
@@ -148,7 +148,7 @@ class LlamaTransformerLayerInferWquant(TransformerLayerInferWeightQuantTpl):
         else:
             out.add_(bias)
             return out
-    
+
     def _wquant_matmul_lmdeploy_int4weight_only_quant(self, input, quant_weight_params, infer_state: LlamaInferStateInfo, out=None, bias=None, has_act=False):
         assert has_act == False
         qweight, scale_zeros, int4_q_group_size = quant_weight_params

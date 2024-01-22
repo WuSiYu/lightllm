@@ -9,10 +9,10 @@ class InternlmTransformerLayerWeight(LlamaTransformerLayerWeight):
     def __init__(self, layer_num, tp_rank, world_size, data_type, network_config, mode=[]):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
-         
+
         # handle internlm 20b, which has no bias, so set q k v o bias to zero
         if not self.network_config_.get("bias", True):
             for layer_type in ("q", "k", "v", "o"):
@@ -37,8 +37,8 @@ class InternlmTransformerLayerWeight(LlamaTransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
-    
+        return
+
     def _load_qkvo_weights(self, weights):
         # input layernorm params
         if f"model.layers.{self.layer_num_}.input_layernorm.weight" in weights:
@@ -71,7 +71,7 @@ class InternlmTransformerLayerWeight(LlamaTransformerLayerWeight):
         if f"model.layers.{self.layer_num_}.self_attn.v_proj.bias" in weights:
             self.v_bias_ = weights[f"model.layers.{self.layer_num_}.self_attn.v_proj.bias"][kv_split_n_embed *
                                                                                                 self.tp_rank_: kv_split_n_embed * (self.tp_rank_ + 1)]
-            self.v_bias_ = self._cuda(self.v_bias_)        
+            self.v_bias_ = self._cuda(self.v_bias_)
         # attention output dense params
         if f"model.layers.{self.layer_num_}.self_attn.o_proj.weight" in weights:
             self.o_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.weight"]
@@ -79,5 +79,5 @@ class InternlmTransformerLayerWeight(LlamaTransformerLayerWeight):
             self.o_weight_ = self._cuda(self.o_weight_.transpose(0, 1))
         if f"model.layers.{self.layer_num_}.self_attn.o_proj.bias" in weights:
             self.o_bias_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.bias"]
-            self.o_bias_ = self._cuda(self.o_bias_)   
+            self.o_bias_ = self._cuda(self.o_bias_)
         return

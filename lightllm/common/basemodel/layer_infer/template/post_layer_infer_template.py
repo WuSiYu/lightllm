@@ -11,10 +11,10 @@ class PostLayerInferTpl(PostLayerInfer):
         self.vocab_size_ = network_config["vocab_size"]
         self.embed_dim_ = network_config["n_embed"]
         return
-    
+
     def _norm(self, input, infer_state, layer_weight)->torch.Tensor:
         raise Exception("need to impl")
-    
+
 
     def _slice_get_last_input(self, input, infer_state)->Tuple[torch.Tensor, int]:
         raise Exception("need to impl")

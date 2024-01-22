@@ -124,7 +124,7 @@ class Resampler(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim, num_heads)
         self.ln_q = norm_layer(embed_dim)
         self.ln_kv = norm_layer(embed_dim)
-        
+
         # self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -413,7 +413,7 @@ class QWenVisionTransformer(nn.Module):
         x = x.to(dtype=torch.float16)
 
         return x
-          
+
     def encode(self, image_items: List[Union[str, Image.Image]]):
         images = []
         for item in image_items:
@@ -427,7 +427,7 @@ class QWenVisionTransformer(nn.Module):
             images.append(self.image_transform(image))
         images = torch.stack(images, dim=0)
         return self(images)
-    
+
     def load_model(self, weight_dir):
         import os
         weight_files = [file_ for file_ in os.listdir(weight_dir) if file_.endswith(".bin") ]
@@ -436,5 +436,5 @@ class QWenVisionTransformer(nn.Module):
             f_weight_dict = torch.load(os.path.join(weight_dir, file_), "cpu")
             for k, v in f_weight_dict.items():
                 if "visual" in k:
-                    weight_dict[k[len("transformer.visual."):]] = v 
+                    weight_dict[k[len("transformer.visual."):]] = v
         self.load_state_dict(weight_dict)

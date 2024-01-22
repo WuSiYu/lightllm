@@ -5,7 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def _fwd_kernel_token_att2(
-    Prob, V, Out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+    Prob, V, Out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
     B_Start_Loc_Window, B_Att_Start_Loc, B_Att_Seqlen,
     stride_req_to_tokens_b, stride_req_to_tokens_s,
     stride_ph, stride_pbs,
@@ -17,7 +17,7 @@ def _fwd_kernel_token_att2(
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    
+
     cur_kv_head = cur_head // kv_group_num
 
     offs_n = tl.arange(0, BLOCK_N) # [64]
@@ -59,11 +59,11 @@ def token_att_fwd2(
     grid = (batch, head)
     num_warps = 4
     dim = v.shape[-1]
-    
+
     kv_group_num = prob.shape[0] // v.shape[1]
 
     _fwd_kernel_token_att2[grid](
-        prob, v, out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+        prob, v, out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
         B_Start_Loc_Window, B_Att_Start_Loc, B_Att_Seqlen,
         Req_to_tokens.stride(0), Req_to_tokens.stride(1),
         prob.stride(0), prob.stride(1),

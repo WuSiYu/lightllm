@@ -15,9 +15,9 @@ class QwenInferStateInfo(LlamaInferStateInfo):
         if not use_dynamic_ntk:
             super().init_some_extra_state(model, input_ids)
             return
-        
+
         if self.is_prefill:
-            b_start_loc_numpy = self.b_start_loc.cpu().numpy() 
+            b_start_loc_numpy = self.b_start_loc.cpu().numpy()
             b_seq_len_numpy = self.b_seq_len.cpu().numpy()
             position_ids = torch.from_numpy(np.concatenate([np.arange(0, b_seq_len_numpy[i])
                                             for i in range(len(b_seq_len_numpy))], axis=0)).cuda()

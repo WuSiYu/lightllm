@@ -46,18 +46,18 @@ class MixtralTpPartModel(TpPartBaseModel):
         assert self.config["num_key_value_heads"] % self.world_size_ == 0
         assert self.config["num_attention_heads"] % self.world_size_ == 0
         return
-    
+
     def _init_custom(self):
         self._init_to_get_rotary()
         return
-    
+
     def _init_mem_manager(self):
         self.mem_manager = MemoryManager(self.max_total_token_num,
                                         dtype=torch.float16,
                                         head_num=self.config["num_key_value_heads"] // self.world_size_,
                                         head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
                                         layer_num=self.config["num_hidden_layers"],
-                                        always_copy=False)       
+                                        always_copy=False)
         return
 
 
@@ -85,4 +85,3 @@ class MixtralTpPartModel(TpPartBaseModel):
         self._cos_cached = torch.cos(freqs).to(torch.float16).cuda()
         self._sin_cached = torch.sin(freqs).to(torch.float16).cuda()
         return
-    

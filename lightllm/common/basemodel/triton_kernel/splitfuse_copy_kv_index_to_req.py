@@ -18,11 +18,11 @@ def _fwd_kernel_copy_kv_index_to_req(
 
     store_end = tl.load(b_seq_len + cur_index)
     store_start = store_end - q_split_len
-    
+
     off_m = tl.arange(0, BLOCK_M)
     for block_start in range(0, q_split_len, BLOCK_M):
         read_index = tl.load(memindex + q_mem_start + block_start + off_m, mask = q_mem_start + block_start + off_m < q_mem_end, other=0)
-        tl.store(req_to_token_indexs + cur_req_idx * stride_req_to_token_b + (block_start + store_start + off_m), read_index, 
+        tl.store(req_to_token_indexs + cur_req_idx * stride_req_to_token_b + (block_start + store_start + off_m), read_index,
                  mask =  block_start + store_start + off_m < store_end)
     return
 

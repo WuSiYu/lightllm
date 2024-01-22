@@ -7,7 +7,7 @@ import math
 
 @triton.jit
 def _fwd_kernel_token_att1(
-    Q, K, sm_scale, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+    Q, K, sm_scale, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
     B_Start_Loc_Window, B_Att_Start_Loc, B_Att_Seqlen,
     Att_Out,
     stride_req_to_tokens_b, stride_req_to_tokens_s,
@@ -21,7 +21,7 @@ def _fwd_kernel_token_att1(
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_n = tl.program_id(2)
-    
+
     cur_kv_head = cur_head // kv_group_num
 
     offs_d = tl.arange(0, BLOCK_DMODEL) # [D]
@@ -45,7 +45,7 @@ def _fwd_kernel_token_att1(
     for start_mark in range(0, block_mask, 1):
         q = tl.load(Q + off_q + start_mark) # [SYM] why here add start_mark
         offs_n_new = cur_batch_start_index + offs_n # the latest window of token
-        k_loc = tl.load(Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * offs_n_new, 
+        k_loc = tl.load(Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * offs_n_new,
                         mask=offs_n_new < cur_batch_end_index, other=0)
         off_k = k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :] * stride_kd # [32, D], find token index
         k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
@@ -58,7 +58,7 @@ def _fwd_kernel_token_att1(
 
 @torch.no_grad()
 def token_att_fwd(
-    q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+    q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
     B_Start_Loc_Window, B_Att_Start_Loc, B_Att_Seqlen, sliding_window):
     BLOCK = 32
     # shape constraints
@@ -71,14 +71,14 @@ def token_att_fwd(
 
     grid = (batch, head_num, triton.cdiv(sliding_window, BLOCK))
     kv_group_num = q.shape[1] // k.shape[1]
-    
+
     if kv_group_num == 1:
         num_warps = 4
     else:
         num_warps = 2
 
     _fwd_kernel_token_att1[grid](
-        q, k, sm_scale, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+        q, k, sm_scale, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
         B_Start_Loc_Window, B_Att_Start_Loc, B_Att_Seqlen,
         att_out,
         Req_to_tokens.stride(0), Req_to_tokens.stride(1),

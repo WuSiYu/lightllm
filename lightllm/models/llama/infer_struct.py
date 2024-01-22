@@ -9,7 +9,7 @@ class LlamaInferStateInfo(InferStateInfo):
         self.position_cos = None
         self.position_sin = None
         self.other_kv_index = None
-    
+
     def init_some_extra_state(self, model, input_ids : torch.Tensor):
         if self.is_prefill:
             b_seq_len_numpy = self.b_seq_len.cpu().numpy()

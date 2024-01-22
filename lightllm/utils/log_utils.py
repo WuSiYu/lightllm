@@ -44,7 +44,7 @@ def _setup_logger():
         _default_handler.flush = sys.stdout.flush  # type: ignore
         _default_handler.setLevel(_LOG_LEVEL)
         _root_logger.addHandler(_default_handler)
-    
+
     if _default_file_handler is None and _LOG_DIR is not None:
         if not os.path.exists(_LOG_DIR):
             try:

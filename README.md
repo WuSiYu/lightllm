@@ -37,14 +37,14 @@ LightLLM is a Python-based LLM (Large Language Model) inference and serving fram
 - [ChatGLM2-6b](https://github.com/THUDM/ChatGLM2-6B)
 - [Baichuan-7b](https://github.com/baichuan-inc/Baichuan-7B)
 - [Baichuan2-7b](https://github.com/baichuan-inc/Baichuan2)
-- [Baichuan2-13b](https://github.com/baichuan-inc/Baichuan2)    
+- [Baichuan2-13b](https://github.com/baichuan-inc/Baichuan2)
 - [Baichuan-13b](https://github.com/baichuan-inc/Baichuan-13B)
 - [InternLM-7b](https://github.com/InternLM/InternLM)
-- [Yi-34b](https://huggingface.co/01-ai/Yi-34B)  
+- [Yi-34b](https://huggingface.co/01-ai/Yi-34B)
 - [Qwen-VL](https://huggingface.co/Qwen/Qwen-VL)
 - [Qwen-VL-Chat](https://huggingface.co/Qwen/Qwen-VL-Chat)
 - [Llava-7b](https://huggingface.co/liuhaotian/llava-v1.5-7b)
-- [Llava-13b](https://huggingface.co/liuhaotian/llava-v1.5-13b)  
+- [Llava-13b](https://huggingface.co/liuhaotian/llava-v1.5-13b)
 - [Mixtral]()
 
 > When you start Qwen-7b, you need to set the parameter '--eos_id 151643 --trust_remote_code'.

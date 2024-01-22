@@ -110,7 +110,7 @@ async def send_request(
     request_start_time = time.time()
     headers = {'Content-Type': 'application/json'}
     headers = {"User-Agent": "Benchmark Client"}
-    file_name, question_id, inputs, answer = request 
+    file_name, question_id, inputs, answer = request
     prompt = f"<系统> <对话历史> <知识> <最新问题> 用户：给出以下问题的答案:\n{inputs} SenseChat："
     print(prompt)
     # prompt=  "[Round {}]\n\n问：{}\n\n答：".format(1, inputs)
@@ -121,7 +121,7 @@ async def send_request(
             'do_sample': False,
             'ignore_eos': True,
             'max_new_tokens': output_len,
-            # 'do_sample':True, 
+            # 'do_sample':True,
             # 'top_p':0.8,
             # 'temperature':0.8
              # 'temperature': 0.1,

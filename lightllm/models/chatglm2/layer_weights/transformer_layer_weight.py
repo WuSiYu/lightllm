@@ -25,7 +25,7 @@ class ChatGLM2TransformerLayerWeight(LlamaTransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return
 
     def _load_qkvo_weights(self, weights):
         # input layernorm params
@@ -78,13 +78,13 @@ class ChatGLM2TransformerLayerWeight(LlamaTransformerLayerWeight):
             tweights = weights[f"transformer.encoder.layers.{self.layer_num_}.mlp.dense_h_to_4h.weight"].to(self.data_type_)
             gate_proj = tweights[:ffn_hidden_size, :]
             gate_proj = gate_proj[split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1), :]
-            
+
             up_proj = tweights[ffn_hidden_size : 2 * ffn_hidden_size, :]
             up_proj = up_proj[split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1), :]
 
             gate_up_proj = torch.cat([gate_proj, up_proj], dim=0).transpose(0, 1)
             self.gate_up_proj = self._cuda(gate_up_proj)
-        
+
         if f"transformer.encoder.layers.{self.layer_num_}.mlp.dense_4h_to_h.weight" in weights:
             self.down_proj = weights[f"transformer.encoder.layers.{self.layer_num_}.mlp.dense_4h_to_h.weight"].to(self.data_type_)
             self.down_proj = self.down_proj[:, split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1)].transpose(0, 1)

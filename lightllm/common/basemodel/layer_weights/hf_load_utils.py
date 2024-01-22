@@ -7,7 +7,7 @@ import lightllm.utils.petrel_helper as utils
 
 def load_func(file_, use_safetensors=False, pre_post_layer=None, transformer_layer_list=None, weight_dir=None):
     # fix bug for 多线程加载的时候，每个线程内部的cuda device 会切回 0， 修改后来保证不会出现bug
-    import torch.distributed as dist    
+    import torch.distributed as dist
     tp_rank = dist.get_rank()
     torch.cuda.set_device(tp_rank)
 

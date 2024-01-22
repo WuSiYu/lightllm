@@ -68,7 +68,7 @@ def token_att_fwd(q, k, att_out, alibi, Req_to_tokens, B_req_idx, B_Start_Loc, B
     num_warps = 2
 
     _fwd_kernel_token_att1[grid](
-        q, k, sm_scale, alibi, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, 
+        q, k, sm_scale, alibi, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen,
         att_out,
         Req_to_tokens.stride(0), Req_to_tokens.stride(1),
         q.stride(0), q.stride(1), q.stride(2),

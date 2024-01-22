@@ -31,17 +31,17 @@ class RouterManager:
         self.load_way = args.load_way
         self.mode = args.mode
         self.max_total_token_num = args.max_total_token_num
-        
+
         self.pause_strategy = Fcfs()
         self.running_batch: Batch = None
         self.eos_id = args.eos_id
         self.has_wait_tokens = 0
         self.max_wait_tokens = 10
-        
+
         context = zmq.asyncio.Context(2)
         self.recv_from_httpserver = context.socket(zmq.PULL)
         self.recv_from_httpserver.bind(f"tcp://127.0.0.1:{router_port}")
-        
+
         self.send_to_detokenization = context.socket(zmq.PUSH)
         self.send_to_detokenization.connect(f"tcp://127.0.0.1:{detokenization_port}")
         self.model_rpc_ports = model_rpc_ports
@@ -83,12 +83,12 @@ class RouterManager:
         await asyncio.gather(*init_model_ret)
 
         await self._init_prompt_cache()
-        
-        self.req_queue = ReqQueue(self.args, 
-                                  self.prompt_cache_used_tokens, 
-                                  self.prompt_cache_req_num)   
+
+        self.req_queue = ReqQueue(self.args,
+                                  self.prompt_cache_used_tokens,
+                                  self.prompt_cache_req_num)
         return
-    
+
     async def _init_prompt_cache(self):
         """
         初始化 prompt cache 特性, 这个地方的id 分配要于 httpserver 中的id 分配对齐
@@ -116,14 +116,14 @@ class RouterManager:
         sampling_params: SamplingParams,
         multimodal_params: MultimodalParams,
         request_id: str,
-        prompt_cache_len, 
+        prompt_cache_len,
         prompt_cache_req_id
-    ):  
+    ):
         if self.is_splitfuse_mode:
-            req = SplitFuseReq(request_id, prompt_ids, sampling_params, multimodal_params, 
+            req = SplitFuseReq(request_id, prompt_ids, sampling_params, multimodal_params,
                                prompt_cache_len, prompt_cache_req_id, self.splitfuse_block_size)
         else:
-            req = NormalReq(request_id, prompt_ids, sampling_params, multimodal_params, 
+            req = NormalReq(request_id, prompt_ids, sampling_params, multimodal_params,
                             prompt_cache_len, prompt_cache_req_id)
         self.req_queue.append(req)
         self.send_to_detokenization.send_pyobj(req.to_req_detokenization_state())
@@ -149,13 +149,13 @@ class RouterManager:
                     total_used_tokens = self.prompt_cache_used_tokens + self.running_batch.batch_used_tokens + self.req_queue.pause_req_used_tokens
                     token_ratio = total_used_tokens / self.max_total_token_num
                     logger.debug(
-                        f"current batch size: {len(self.running_batch.reqs)} " 
+                        f"current batch size: {len(self.running_batch.reqs)} "
                         f"paused req num: {len(self.req_queue.pause_req_dict)} "
                         f"token used ratio: {token_ratio} "
                     )
                     pass
                 self.stats_tool.print_stats()
-                
+
             if self.running_batch is None:
                 await asyncio.sleep(0.01)  # 10ms
 
@@ -212,7 +212,7 @@ class RouterManager:
             req_to_req_status = obtain(ans[0])
         else:
             req_to_req_status = ans[0]
-        
+
         self._update_init_status_to_batch(batch, req_to_req_status)
         return
 
@@ -233,7 +233,7 @@ class RouterManager:
             batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
             await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
         return
-    
+
     async def _prefill_to_init_prompt_cache(self, batch:Batch):
         """
         专用于初始化prompt cahce 请求的接口, 只在 splitfuse + prompt cache 模式下调用
@@ -279,7 +279,7 @@ class RouterManager:
         rets = [self.model_rpcs[tp_rank].remove_batch(batch.batch_id) for tp_rank in range(self.world_size)]
         await asyncio.gather(*rets)
         return
-    
+
     async def _pause_reqs(self, batch: Batch, pasue_reqs):
         pasue_reqs_info = [(r.request_id, r.req_status) for r in pasue_reqs]
         rets = [self.model_rpcs[tp_rank].pause_reqs(batch.batch_id, pasue_reqs_info) for tp_rank in range(self.world_size)]
@@ -298,7 +298,7 @@ class RouterManager:
         if self.running_batch is not None and self.running_batch.is_clear():
             self.running_batch = None
             return
-    
+
     def _update_init_status_to_batch(self, batch: Batch, req_to_req_status):
         # 更新请求状态
         new_batch_used_tokens = 0
@@ -309,11 +309,11 @@ class RouterManager:
             r_obj.cur_kv_len = cur_kv_len
             new_batch_used_tokens += r_obj.get_used_tokens()
             new_batch_decode_need_tokens += r_obj.get_decode_need_tokens()
-        
+
         batch.batch_used_tokens = new_batch_used_tokens
         batch.batch_decode_need_tokens = new_batch_decode_need_tokens
         return
-    
+
     def _update_out_status_to_batch(self, batch: Batch, req_to_out_status):
         new_batch_used_tokens = 0
         new_batch_decode_need_tokens = 0 # 只有在 splitfuse 模式下有意义
@@ -326,16 +326,16 @@ class RouterManager:
                 req.output_metadata_list.append(new_gen_metadata)
             new_batch_used_tokens += req.get_used_tokens()
             new_batch_decode_need_tokens += req.get_decode_need_tokens()
-        
+
         batch.batch_used_tokens = new_batch_used_tokens
         batch.batch_decode_need_tokens = new_batch_decode_need_tokens
         return
-        
+
     def _can_decode(self, batch: Batch):
         total_used_tokens = self.prompt_cache_used_tokens + batch.batch_used_tokens + self.req_queue.pause_req_used_tokens
         remaining_tokens = self.max_total_token_num - total_used_tokens
         return batch.batch_decode_need_tokens <= remaining_tokens
-        
+
     def _send_to_detokenization_proc(self, batch: Batch, req_ans):
         batch_out = BatchTokenIdOut()
         for req_id, (_, _, new_token_id, new_gen_metadata) in req_ans.items():
@@ -343,7 +343,7 @@ class RouterManager:
             if new_token_id is not None:
                 # req.finish_status 传输 value值 不传送对象，可以减少序列化对象的大小。
                 batch_out.reqs_infs.append((req_id, new_token_id, new_gen_metadata, req.finish_status.value))
-    
+
         self.send_to_detokenization.send_pyobj(batch_out)
         return
 
@@ -375,7 +375,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
             router_port=router_port,
             detokenization_port=detokenization_port,
             model_rpc_ports=model_rpc_ports)
-    
+
         asyncio.run(router.wait_to_model_ready())
     except Exception as e:
         import traceback
@@ -387,7 +387,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
         raise
 
     pipe_writer.send('init ok')
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.create_task(router.loop_for_fwd())

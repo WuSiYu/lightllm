@@ -14,7 +14,7 @@ class SamplingParams:
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
         top_p: float = 1.0,
-        top_k: int = -1,  # -1 is for all 
+        top_k: int = -1,  # -1 is for all
         ignore_eos: bool = False,
         max_new_tokens: int = 16,
         stop_sequences: Optional[Union[str, List[str]]] = None  # 停止句子条件
@@ -37,7 +37,7 @@ class SamplingParams:
             self.temperature = 1.0
             self.top_k = 1
         return
-    
+
     def verify(self):
         if self.presence_penalty < 0.0:
             raise ValueError(f"presence_penalty must >= 0.0, got {self.presence_penalty}")
@@ -70,7 +70,7 @@ class SamplingParams:
                     new_stop_sequences.append(stop_str_ids)
             self.stop_sequences = new_stop_sequences
         return
-    
+
     def to_dict(self):
         ret = {}
         ret["do_sample"] = self.do_sample

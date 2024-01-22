@@ -12,7 +12,7 @@ class InternlmTransformerLayerWeightQuantized(LlamaTransformerLayerWeightQuantiz
 
     def verify_load(self):
         errors = "weights load not ok"
-         
+
         # handle internlm 20b, which has no bias, so set q k v o bias to zero
         if not self.network_config_.get("bias", True):
             for layer_type in ("q", "k", "v", "o"):
@@ -34,8 +34,8 @@ class InternlmTransformerLayerWeightQuantized(LlamaTransformerLayerWeightQuantiz
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
-    
+        return
+
     def _load_qkvo_weights(self, weights):
         # input layernorm params
         if f"model.layers.{self.layer_num_}.input_layernorm.weight" in weights:
@@ -45,7 +45,7 @@ class InternlmTransformerLayerWeightQuantized(LlamaTransformerLayerWeightQuantiz
 
         q_split_n_embed = n_embed // self.world_size_
         kv_split_n_embed = n_embed // self.network_config_["num_attention_heads"] * self.network_config_["num_key_value_heads"] // self.world_size_
-        
+
         if getattr(self, "qkv_weight_", None) is None:
             self.qkv_weight_ = torch.empty(n_embed, q_split_n_embed + 2 * kv_split_n_embed, dtype=self.data_type_, device='cpu')
             self.qkv_step_ = 0
@@ -85,7 +85,7 @@ class InternlmTransformerLayerWeightQuantized(LlamaTransformerLayerWeightQuantiz
         if f"model.layers.{self.layer_num_}.self_attn.v_proj.bias" in weights:
             self.v_bias_ = weights[f"model.layers.{self.layer_num_}.self_attn.v_proj.bias"][kv_split_n_embed *
                                                                                                 self.tp_rank_: kv_split_n_embed * (self.tp_rank_ + 1)]
-            self.v_bias_ = self._cuda(self.v_bias_)   
+            self.v_bias_ = self._cuda(self.v_bias_)
 
         if self.qkv_step_ == 3:
             self.qkv_step_ = 0
@@ -98,5 +98,5 @@ class InternlmTransformerLayerWeightQuantized(LlamaTransformerLayerWeightQuantiz
             self.o_weight_ = self.quantize_weight(self.o_weight_.transpose(0, 1))
         if f"model.layers.{self.layer_num_}.self_attn.o_proj.bias" in weights:
             self.o_bias_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.bias"]
-            self.o_bias_ = self._cuda(self.o_bias_)   
+            self.o_bias_ = self._cuda(self.o_bias_)
         return

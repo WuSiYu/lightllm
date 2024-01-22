@@ -16,7 +16,7 @@ def _fwd_kernel_flash_decode_stage1(
     stride_mid_o_eb, stride_mid_o_eh, stride_mid_o_es,
     gqa_group_size,
     Q_HEAD_NUM: tl.constexpr,
-    BLOCK_SEQ: tl.constexpr, 
+    BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr
 ):
@@ -28,7 +28,7 @@ def _fwd_kernel_flash_decode_stage1(
 
     cur_q_head_offs = tl.arange(0, Q_HEAD_NUM)
     cur_q_head_range = cur_kv_head * gqa_group_size + cur_q_head_offs
-    
+
     offs_d = tl.arange(0, BLOCK_DMODEL)
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
@@ -36,11 +36,11 @@ def _fwd_kernel_flash_decode_stage1(
     cur_batch_end_index = tl.minimum(cur_batch_seq_len, cur_batch_start_index + BLOCK_SEQ)
 
     off_q = cur_batch * stride_qbs + cur_q_head_range[:, None] * stride_qh + offs_d[None, :]
-    
+
     block_n_size = tl.where(cur_batch_end_index - cur_batch_start_index <= 0, 0, cur_batch_end_index - cur_batch_start_index + BLOCK_N - 1) // BLOCK_N
-    
+
     offs_n = cur_batch_start_index + tl.arange(0, BLOCK_N)
-    
+
     q = tl.load(Q + off_q, mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size, other=0.0)
 
     sum_exp = tl.zeros([Q_HEAD_NUM], dtype=tl.float32)
@@ -56,7 +56,7 @@ def _fwd_kernel_flash_decode_stage1(
         att_value *= sm_scale
         att_value = tl.where(offs_n_new[None, :] < cur_batch_end_index, att_value, float("-inf"))
         v = tl.load(V + k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :], mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
-        
+
         cur_max_logic = tl.max(att_value, axis=1)
         new_max_logic = tl.maximum(cur_max_logic, max_logic)
 
@@ -67,7 +67,7 @@ def _fwd_kernel_flash_decode_stage1(
 
         sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=1)
         max_logic = new_max_logic
-    
+
     need_store = tl.where(block_n_size == 0, 0, 1)
     for _ in range(0, need_store, 1):
         seq_block_index = cur_batch_start_index // BLOCK_SEQ
@@ -92,7 +92,7 @@ def flash_decode_stage1(block_batch_ids, block_start_indexes, q, k, v, Req_to_to
     block_nums = len(block_batch_ids)
     grid = (block_nums, kv_head_num)
     gqa_group_size = q.shape[1] // k.shape[1]
-    
+
     _fwd_kernel_flash_decode_stage1[grid](
         block_batch_ids, block_start_indexes,
         q, k, v, sm_scale, Req_to_tokens, B_req_idx, B_seq_len,

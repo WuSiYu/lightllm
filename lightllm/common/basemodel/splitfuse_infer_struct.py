@@ -12,7 +12,7 @@ class SplitFuseInferStateInfo:
 
     def __init__(self):
         self.batch_size = None
-        
+
         self.decode_req_num = None
         self.decode_total_token_num = None
         self.decode_b_req_idx : torch.Tensor = None
@@ -31,10 +31,10 @@ class SplitFuseInferStateInfo:
         self.req_manager: ReqManager = None
 
         self.mem_is_contiguous = None
-        self.mem_start = None 
+        self.mem_start = None
         self.mem_end = None
         self.mem_index = None
-        self.key_buffer = None 
+        self.key_buffer = None
         self.value_buffer = None
 
         self.parrall_stream = torch.cuda.Stream()
@@ -60,6 +60,6 @@ class SplitFuseInferStateInfo:
 
         self.inner_decode_infer_status = infer_status
         return infer_status
-        
+
     def init_some_extra_state(self, model, input_ids : torch.Tensor):
         pass

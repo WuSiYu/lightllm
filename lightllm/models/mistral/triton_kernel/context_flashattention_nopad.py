@@ -22,7 +22,7 @@ if triton.__version__ >= "2.1.0":
         cur_batch = tl.program_id(0)
         cur_head = tl.program_id(1)
         start_m = tl.program_id(2)
-        
+
         cur_kv_head = cur_head // kv_group_num
 
         cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
@@ -106,7 +106,7 @@ if triton.__version__ >= "2.1.0":
         sm_scale = 1.0 / (Lq**0.5)  # 计算scale系数
         batch, head = b_seq_len.shape[0], q.shape[1]
         kv_group_num = q.shape[1] // k.shape[1]
-        
+
         grid = (batch, head, triton.cdiv(max_input_len, BLOCK))  # batch, head,
 
         num_warps = 4 if Lk <= 64 else 8
@@ -145,7 +145,7 @@ elif triton.__version__ == "2.0.0":
         cur_batch = tl.program_id(0)
         cur_head = tl.program_id(1)
         start_m = tl.program_id(2)
-        
+
         cur_kv_head = cur_head // kv_group_num
 
         cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
@@ -230,7 +230,7 @@ elif triton.__version__ == "2.0.0":
         sm_scale = 1.0 / (Lq**0.5)
         batch, head = b_seq_len.shape[0], q.shape[1]
         kv_group_num = q.shape[1] // k.shape[1]
-        
+
         grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
 
         tmp = torch.empty((batch, head, max_input_len + 256), device=q.device, dtype=torch.float32)

@@ -11,4 +11,3 @@ class Baichuan7bTpPartModel(LlamaTpPartModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    

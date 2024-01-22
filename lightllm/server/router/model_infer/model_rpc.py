@@ -147,10 +147,10 @@ class ModelRpcServer(rpyc.Service):
             import traceback
             traceback.print_exc()
             raise e
-        
+
         set_random_seed(2147483647)
         return
-    
+
     # @calculate_time(show=True, min_cost_ms=0.1)
     def exposed_add_batch(self, batch_id, reqs, dtype):
         if self.world_size != 1:
@@ -169,7 +169,7 @@ class ModelRpcServer(rpyc.Service):
             req_obj : InferReq  = requests_mapping[req_id]
             ans[req_id] = (req_obj.req_status, req_obj.cur_kv_len)
         return ans
-    
+
     @calculate_time(show=False, min_cost_ms=300)
     def exposed_prefill_batch(self, batch_id):
         return self.forward(batch_id, is_prefill=True)
@@ -218,20 +218,20 @@ class ModelRpcServer(rpyc.Service):
         del batch
         # torch.cuda.empty_cache()
         return
-    
+
     # @calculate_time(show=True, min_cost_ms=150)
     def forward(self, batch_id, is_prefill):
         # special code for return all prompt_logprobs
         if self.return_all_prompt_logprobs and is_prefill:
             return self._prefill_to_return_all_prompt_logprobs(batch_id)
-        
+
         output_dict = {}
         batch: InferBatch = self.cache.pop(batch_id)
         if is_prefill:
             kwargs, run_reqs, not_run_reqs = prepare_prefill_inputs(batch, self.is_multimodal)
         else:
             kwargs, run_reqs, not_run_reqs = prepare_decode_inputs(batch)
-        
+
         if len(run_reqs) >= 1:
             logits = self.model.forward(**kwargs)
             next_token_ids, next_token_probs = sample(logits, run_reqs)
@@ -254,25 +254,25 @@ class ModelRpcServer(rpyc.Service):
 
         self.cache[batch.batch_id] = batch
         return output_dict
-    
+
     @torch.no_grad()
     def _prefill_to_return_all_prompt_logprobs(self, batch_id):
         output_dict = {}
         batch: InferBatch = self.cache.pop(batch_id)
         kwargs, run_reqs, not_run_reqs = prepare_prefill_inputs(batch)
-        
+
         if len(run_reqs) >= 1:
             prompt_all_logits = self.model.forward(**kwargs)
             input_ids = kwargs["input_ids"]
             b_start_loc = kwargs["b_start_loc"]
-            b_seq_len = kwargs["b_seq_len"]            
+            b_seq_len = kwargs["b_seq_len"]
             last_index = torch.cumsum(b_seq_len, dim=0, dtype=torch.long) - 1
             logits = prompt_all_logits[last_index, :]
 
             next_token_ids, next_token_probs = sample(logits, run_reqs)
             next_token_ids = next_token_ids.detach().cpu().numpy()
             next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
-            
+
             b_start_loc = b_start_loc.cpu().numpy()
             b_seq_len = b_seq_len.cpu().numpy()
             for req_obj, next_token_id, next_token_logprob, start_loc, seq_len in zip(run_reqs, next_token_ids, next_token_logprobs, b_start_loc, b_seq_len):
@@ -321,7 +321,7 @@ class ModelRpcServer(rpyc.Service):
         next_token_ids, next_token_probs = sample(logits, all_reqs)
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
-        
+
         index = 0
         for req_obj, next_token_id, next_token_logprob in zip(all_reqs, next_token_ids, next_token_logprobs):
             if index < decode_req_num:
@@ -352,7 +352,7 @@ class ModelRpcServer(rpyc.Service):
                     output_dict[req_obj.r_id] = (req_obj.req_status, req_obj.cur_kv_len, None, None)
                 else:
                     assert False, "error state"
-            index += 1    
+            index += 1
 
         self.cache[batch.batch_id] = batch
         return output_dict
@@ -426,7 +426,7 @@ class ModelRpcClient:
             await ans
             return
         else:
-            return 
+            return
 
     async def pause_reqs(self, batch_id, reqs_list):
         ans = self._pause_reqs(batch_id, reqs_list)
@@ -464,7 +464,7 @@ async def start_model_process(port, world_size):
     # 单卡时不使用 rpc
     if world_size == 1:
         return ModelRpcClient(ModelRpcServer(), world_size)
-    
+
     import multiprocessing
     proc = multiprocessing.Process(target=_init_env, args=(port,))
     proc.start()

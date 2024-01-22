@@ -16,15 +16,15 @@ class Baichuan13bTransformerLayerInfer(LlamaTransformerLayerInfer):
         super().__init__(layer_num, tp_rank, world_size, network_config, mode)
         self._bind_func()
         return
-    
+
     def _bind_func(self):
         """
-        baichuan13b only support normal mode.  
+        baichuan13b only support normal mode.
         """
         self._context_attention_kernel = partial(BloomTransformerLayerInfer._context_attention_kernel, self)
         self._token_attention_kernel = partial(BloomTransformerLayerInfer._token_attention_kernel, self)
         return
-    
+
     def _get_qkv(self, input, cache_k, cache_v, infer_state, layer_weight: BaiChuan13bTransformerLayerWeight) -> torch.Tensor:
         q = torch.mm(input.view(-1, self.embed_dim_), layer_weight.q_weight_)
         torch.mm(input.view(-1, self.embed_dim_), layer_weight.k_weight_,
@@ -32,4 +32,3 @@ class Baichuan13bTransformerLayerInfer(LlamaTransformerLayerInfer):
         torch.mm(input.view(-1, self.embed_dim_), layer_weight.v_weight_,
                     out=cache_v.view(-1, self.tp_v_head_num_ * self.head_dim_))
         return q, cache_k, cache_v
-    

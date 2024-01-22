@@ -26,15 +26,15 @@ class QWenTpPartModel(LlamaTpPartModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
         # repair_config()
         repair_config(self.config, same_names=["ffn_hidden_size", "intermediate_size"])
         repair_config(self.config, same_names=["rms_norm_eps", "layer_norm_epsilon"])
-        return 
-    
+        return
+
     def _init_custom(self):
         """
         init qwen dynamic_ntk and logn_attn
@@ -84,7 +84,7 @@ class QWenTpPartModel(LlamaTpPartModel):
         self._cos_cached = torch.stack(self._cos_cached, dim=0).contiguous()
         self._sin_cached = torch.stack(self._sin_cached, dim=0).contiguous()
         return
-    
+
     def _init_qwen_logn_attn(self):
         total_seq_len_supported = self.config.get("max_position_embeddings", 8 * 1024)
         seq_len = self.config.get("seq_length", 2048)

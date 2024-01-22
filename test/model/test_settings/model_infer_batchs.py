@@ -17,7 +17,7 @@ def test_model_inference(world_size, model_dir, model_class, batch_sizes, input_
             "max_req_num": max(batch_sizes),
             "max_seq_length": (input_len + output_len)
         }
-        
+
         proc = multiprocessing.Process(target=tppart_model_infer, args=(model_class, model_kvargs, batch_sizes, input_len, output_len, ans_queue, log_path))
         proc.start()
         workers.append(proc)
@@ -32,8 +32,8 @@ def test_model_inference(world_size, model_dir, model_class, batch_sizes, input_
                 return -1
             else:
                 break
-        time.sleep(1)            
-        
+        time.sleep(1)
+
     while not ans_queue.empty():
         if not ans_queue.get():
             return -1
@@ -54,7 +54,7 @@ def tppart_model_infer(model_class, model_kvargs, batch_sizes, input_len, output
                     need_run_batch_sizes.append(batch_size)
         else:
             need_run_batch_sizes.append(batch_size)
-    
+
     if len(need_run_batch_sizes) == 0:
         return
 
@@ -89,9 +89,9 @@ def tppart_model_infer(model_class, model_kvargs, batch_sizes, input_len, output
             b_seq_len[i] = input_len
 
         total_token_num = input_len * batch_size
-        logics = model_part.forward(batch_size, 
-                                    total_token_num, 
-                                    input_len, 
+        logics = model_part.forward(batch_size,
+                                    total_token_num,
+                                    input_len,
                                     test_data,
                                     b_req_idx,
                                     b_start_loc,
@@ -113,20 +113,20 @@ def tppart_model_infer(model_class, model_kvargs, batch_sizes, input_len, output
 
         model_part.mem_manager.free_all()
         model_part.req_manager.free_all()
-        
+
         if rank_id == 0:
             print("can use mem size:", model_part.mem_manager.can_use_mem_size)
             print("can use req size:", model_part.req_manager.can_use_req_size)
-            
+
         b_req_idx = None
         b_start_loc = None
         b_seq_len = None
-        
+
         dist.barrier()
         if rank_id == 0:
             new_log_path = log_path.replace("batch_size", str(batch_size))
             fp_file = open(new_log_path, "w+")
-        
+
         import time
         torch.cuda.synchronize()
         start_time = time.time()
@@ -179,7 +179,7 @@ def tppart_model_infer(model_class, model_kvargs, batch_sizes, input_len, output
                 fp_file.close()
                 while not fp_file.closed:
                     fp_file.close()
-        
+
         b_req_idx = None
         b_start_loc = None
         b_seq_len = None

@@ -110,7 +110,7 @@ async def generate(request: Request) -> Response:
             # Abort the request if the client disconnects.
             await httpserver_manager.abort(request_id)
             return Response(status_code=499)
-        
+
         # when set "--return_all_prompt_logprobs", the first token metadata will contains
         # prompt_logprobs and prompt_token_ids
         if is_first_metadata:
@@ -308,7 +308,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None,
                         help="the model weight dir path, the app will load config, weights and tokenizer from this dir")
     parser.add_argument("--tokenizer_mode", type=str, default="slow",
-                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test, 
+                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test,
                         when you want to get best performance, try auto mode""")
     parser.add_argument("--load_way", type=str, default="HF",
                         help="the way of loading model weights, the default is HF(Huggingface format), llama also supports DS(Deepspeed)")
@@ -329,9 +329,9 @@ def main():
     parser.add_argument("--nccl_port", type=int, default=28765,
                         help="the nccl_port to build a distributed environment for PyTorch")
     parser.add_argument("--mode", type=str, default=[], nargs='+',
-                        help="""Model mode: [triton_int8kv | ppl_int8kv | ppl_fp16 | triton_flashdecoding 
-                        | triton_gqa_attention | triton_gqa_flashdecoding] 
-                        [triton_int8weight | triton_int4weight | lmdeploy_int4weight | ppl_int4weight], 
+                        help="""Model mode: [triton_int8kv | ppl_int8kv | ppl_fp16 | triton_flashdecoding
+                        | triton_gqa_attention | triton_gqa_flashdecoding]
+                        [triton_int8weight | triton_int4weight | lmdeploy_int4weight | ppl_int4weight],
                         triton_flashdecoding mode is for long context, current support llama llama2 qwen;
                         triton_gqa_attention and triton_gqa_flashdecoding is fast kernel for model which use GQA;
                         triton_int8kv mode use int8 to store kv cache, can increase token capacity, use triton kernel;
@@ -345,21 +345,21 @@ def main():
                         help="disable logging throughput stats.")
     parser.add_argument("--log_stats_interval", type=int, default=10,
                         help="log stats interval in second.")
-    
+
     parser.add_argument("--router_token_ratio", type=float, default=0.0,
                         help="token ratio to control router dispatch")
     parser.add_argument("--router_max_new_token_len", type=int, default=1024,
                         help="the request max new token len for router")
-    
+
     parser.add_argument("--no_skipping_special_tokens", action="store_true",
                         help="whether to skip special tokens when decoding")
     parser.add_argument("--no_spaces_between_special_tokens", action="store_true",
                         help="whether to add spaces between special tokens when decoding")
-    
+
     parser.add_argument("--splitfuse_mode", action='store_true',
                     help="use splitfuse mode")
     parser.add_argument("--splitfuse_block_size", type=int, default=256,
-                    help="splitfuse block size")    
+                    help="splitfuse block size")
     parser.add_argument("--prompt_cache_strs", type=str, default=[], nargs='+',
                         help="""prompt cache strs""")
     parser.add_argument("--enable_multimodal", action='store_true',
@@ -372,10 +372,10 @@ def main():
                         help="return all prompt tokens logprobs")
     parser.add_argument("--long_truncation_mode", type=str, choices=[None, 'head', 'center'], default=None,
                         help="""use to select the handle way when input token len > max_req_input_len.
-                        None : raise Exception 
+                        None : raise Exception
                         head : remove some head tokens to make input token len <= max_req_input_len
                         center : remove some tokens in center loc to make input token len <= max_req_input_len""")
-    
+
     args = parser.parse_args()
 
     # 非splitfuse 模式，不支持 prompt cache 特性
@@ -384,7 +384,7 @@ def main():
 
     assert args.max_req_input_len < args.max_req_total_len
     assert args.max_req_total_len <= args.max_total_token_num
-    
+
     if not args.splitfuse_mode:
         # 普通模式下
         if args.batch_max_tokens is None:
@@ -428,7 +428,7 @@ def main():
         httpserver_port=httpserver_port,
         enable_multimodal=args.enable_multimodal,
     )
-    
+
     from .detokenization.manager import start_detokenization_process
     start_submodule_processes(start_funcs=[start_router_process, start_detokenization_process],
                             start_args=[(args, router_port, detokenization_port, model_rpc_ports),

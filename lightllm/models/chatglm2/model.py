@@ -24,7 +24,7 @@ class ChatGlm2TpPartModel(LlamaTpPartModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
@@ -34,11 +34,11 @@ class ChatGlm2TpPartModel(LlamaTpPartModel):
         repair_config(self.config, same_names=["rms_norm_eps", "layernorm_epsilon"])
         repair_config(self.config, same_names=["seq_length", "max_sequence_length"])
         return
-    
+
     def _reset_num_key_value_heads(self):
         self.config["num_key_value_heads"] = self.config["multi_query_group_num"]
         return
-    
+
     def _verify_params(self):
         assert self.load_way == "HF", "ChatGLM only support HF format for now"
         assert self.world_size_ in [1, 2], "ChatGLM can only run in tp=1 or tp=2 for now"

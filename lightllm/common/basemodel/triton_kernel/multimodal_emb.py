@@ -5,7 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def _fwd_kernel(
-    Prompt_ids, 
+    Prompt_ids,
     Text_weight_embs,
     Img_embs,
     Out,
@@ -26,12 +26,12 @@ def _fwd_kernel(
 
     token_id = tl.load(Prompt_ids + seq_index)
     off_d = tl.arange(0, BLOCK_HIDDEN_DIM)
-    
+
     # load store text emb
     for _ in range(0, tl.where((img_handle_id == 0) & (token_id < tp_text_end_token_id) & (token_id >= tp_text_start_token_id), 1, 0), 1):
         load_emb = tl.load(Text_weight_embs + stride_text_emb_s * (token_id - tp_text_start_token_id) + off_d * stride_text_emb_d, mask=off_d < hidden_size, other=0)
         tl.store(Out + stride_out_s * seq_index + stride_out_d * off_d, load_emb, mask=off_d < hidden_size)
-    
+
     img_start_token_id = tl.load(Img_start_token_ids + img_handle_id - 1, mask=img_handle_id >= 1, other=0)
     img_start_loc = tl.load(Img_start_locs + img_handle_id - 1, mask=img_handle_id >= 1, other=0)
     img_token_len = tl.load(Img_token_lens + img_handle_id - 1, mask=img_handle_id >= 1, other=0)
@@ -43,8 +43,8 @@ def _fwd_kernel(
 
 
 @torch.no_grad()
-def multimodal_emb(out: torch.Tensor, prompt_ids: torch.Tensor, text_weight_embs: torch.Tensor, img_embs: torch.Tensor, 
-                         img_token_lens: torch.Tensor, img_start_token_ids: torch.Tensor, img_start_locs: torch.Tensor, 
+def multimodal_emb(out: torch.Tensor, prompt_ids: torch.Tensor, text_weight_embs: torch.Tensor, img_embs: torch.Tensor,
+                         img_token_lens: torch.Tensor, img_start_token_ids: torch.Tensor, img_start_locs: torch.Tensor,
                          tp_text_start_token_id,
                          tp_text_end_token_id):
     total_len = prompt_ids.shape[0]
@@ -93,7 +93,7 @@ def test():
     print(out.shape)
 
     import time
-    
+
     triton_output = multimodal_emb(out, prompt_ids, text_weight, img_weight, img_token_lens, img_start_token_ids, img_start_locs, 0, vob_size)
 
     torch.cuda.synchronize()

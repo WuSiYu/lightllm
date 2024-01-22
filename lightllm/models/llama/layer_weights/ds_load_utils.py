@@ -28,7 +28,7 @@ def load_ds_weights(data_type, weight_dir, pre_post_layer=None, transformer_laye
                 if layer_num == 1:
                     k = 'model.embed_tokens.weight'
                 if k not in weights_all:
-                    weights_all[k] = v 
+                    weights_all[k] = v
                 else:
                     if 'q_proj' in k or 'k_proj' in k or 'v_proj' in k or 'gate_proj' in k or 'up_proj' in k:
                         weights_all[k] = torch.cat([weights_all[k], v], dim=0)

@@ -25,7 +25,7 @@ class StarcoderTpPartModel(TpPartBaseModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
@@ -33,15 +33,15 @@ class StarcoderTpPartModel(TpPartBaseModel):
         repair_config(self.config, same_names=["rms_norm_eps", "layer_norm_epsilon"])
         self._reset_num_key_value_heads()
         return
-    
+
     def _reset_num_key_value_heads(self):
         self.config["num_key_value_heads"] = 1
-        return 
-    
+        return
+
     def _verify_params(self):
         assert self.load_way == "HF", "StarCoder only support HF format to load Now!"
 
-    def _init_mem_manager(self):    
+    def _init_mem_manager(self):
         self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num,
                                          dtype=torch.float16,
                                          head_num=self.config["num_key_value_heads"],
@@ -53,4 +53,4 @@ class StarcoderTpPartModel(TpPartBaseModel):
         super()._init_some_value()
         self.tp_k_head_num_ = self.config["num_key_value_heads"]
         self.tp_v_head_num_ = self.config["num_key_value_heads"]
-        return 
+        return

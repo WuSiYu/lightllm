@@ -41,14 +41,14 @@ def _fwd_kernel(
 
     for start_n in range(0, cur_att_seq_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N) # check
-        v_index = tl.load(Req_to_tokens + cur_batch_req_idx * stride_req_to_token_b + 
-                          (cur_cache_start_loc + start_n + offs_n) * stride_req_to_token_s, 
+        v_index = tl.load(Req_to_tokens + cur_batch_req_idx * stride_req_to_token_b +
+                          (cur_cache_start_loc + start_n + offs_n) * stride_req_to_token_s,
                           mask=(cur_cache_start_loc + start_n + offs_n) < cur_batch_seq_len, other=other_kv_index) # [64]
 
-        qk = tl.load(Logics + cur_head * stride_logic_h + (cur_batch_start_loc + start_n + offs_n) * stride_logic_bs, 
+        qk = tl.load(Logics + cur_head * stride_logic_h + (cur_batch_start_loc + start_n + offs_n) * stride_logic_bs,
                      mask=start_n + offs_n < cur_batch_seq_len, other=float("-inf")) # [64]
-    
-        n_e_max = tl.maximum(tl.max(qk, 0), e_max) 
+
+        n_e_max = tl.maximum(tl.max(qk, 0), e_max)
         old_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max)
         e_sum = e_sum * old_scale + tl.sum(p, 0)
@@ -65,7 +65,7 @@ def _fwd_kernel(
 
 @torch.no_grad()
 def token_softmax_reducev_fwd(
-    logics, v, o, req_to_tokens, b_req_idx, b_start_loc, b_seq_len, 
+    logics, v, o, req_to_tokens, b_req_idx, b_start_loc, b_seq_len,
     b_start_loc_window, b_att_start_loc, b_att_seq_len, other_kv_index):
     BLOCK = 64
     batch, head = b_seq_len.shape[0], logics.shape[0]

@@ -8,10 +8,10 @@ import torch.nn.functional as F
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, sm_scale, 
+    Q, K, V, sm_scale,
     Req_to_tokens,
     B_req_idx,
-    B_seqlen, 
+    B_seqlen,
     Out,
     stride_qbs, stride_qh, stride_qd,
     stride_kbs, stride_kh, stride_kd,
@@ -19,7 +19,7 @@ def _fwd_kernel(
     stride_obs, stride_oh, stride_od,
     stride_req_to_tokens_b, stride_req_to_tokens_s,
     kv_group_num,
-    Q_HEAD_NUM: tl.constexpr, 
+    Q_HEAD_NUM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -27,10 +27,10 @@ def _fwd_kernel(
     cur_kv_head = tl.program_id(1)
 
     cur_q_head_offs = tl.arange(0, Q_HEAD_NUM)
-    
+
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
     cur_batch_seq_len = tl.load(B_seqlen + cur_batch)
-    
+
     # initialize offsets
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -109,15 +109,15 @@ def gqa_decode_attention_fwd(q, k, v, o, req_to_tokens, b_req_idx, b_seq_len):
     batch = b_req_idx.shape[0]
     kv_group_num = q.shape[1] // k.shape[1]
     kv_head_num = k.shape[1]
-    
+
     grid = (batch, kv_head_num)
 
     num_warps = 4 # if Lk <= 64 else 8
     _fwd_kernel[grid](
-        q, k, v, sm_scale, 
+        q, k, v, sm_scale,
         req_to_tokens,
         b_req_idx,
-        b_seq_len, 
+        b_seq_len,
         o,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),

@@ -24,7 +24,7 @@ import triton.language as tl
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8), 
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
     ],
 	key=['M', 'N', 'K', 'NO_GROUPS'],
 )
@@ -67,7 +67,7 @@ def matmul4_kernel(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m    
+    pid_n = (pid % num_pid_in_group) // group_size_m
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -85,7 +85,7 @@ def matmul4_kernel(
     if NO_GROUPS:
         # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
         scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_N,)
-        zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32	
+        zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
         # Unpack zeros
         zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
         # zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
@@ -103,18 +103,18 @@ def matmul4_kernel(
             ptr = scales_ptrs + g_id * stride_scales_g
             scales = tl.load(ptr)  # (BLOCK_SIZE_N,)
             ptr = zeros_ptrs + g_id * stride_zeros_g   # (BLOCK_SIZE_N,)
-            zeros = tl.load(ptr)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32	
+            zeros = tl.load(ptr)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
             # Unpack zeros
             zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
-            zeros = (zeros) * scales  # (BLOCK_SIZE_N,) float16	
+            zeros = (zeros) * scales  # (BLOCK_SIZE_N,) float16
         # Now we need to unpack b (which is 4-bit values) into 32-bit values
         b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
         b = b * scales[None, :] - zeros[None, :]  # Scale and shift
         # print("data type", a, b)
         accumulator += tl.dot(a, b.to(tl.float16))
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk  
-    c = accumulator.to(tl.float16)  
+        b_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk
+    c = accumulator.to(tl.float16)
     # Store the result
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -197,7 +197,7 @@ def matmul_dequantize_int4_gptq(x: torch.FloatTensor, qweight: torch.IntTensor, 
 		triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
         triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 16}, num_stages=2, num_warps=4),
         triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 512, 'GROUP_SIZE_M': 16}, num_stages=2, num_warps=4),
-	    
+
         triton.Config({'SPLIT_K': 1, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'SPLIT_K': 1, 'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'SPLIT_K': 1, 'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
@@ -216,7 +216,7 @@ def matmul_dequantize_int4_gptq(x: torch.FloatTensor, qweight: torch.IntTensor, 
 		triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
         triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 16}, num_stages=2, num_warps=4),
         triton.Config({'SPLIT_K': 2, 'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 512, 'GROUP_SIZE_M': 16}, num_stages=2, num_warps=4),
-		
+
  ],
 	key=['M', 'N', 'K'],
     reset_to_zero=['c_ptr']
@@ -248,7 +248,7 @@ def matmul_kernel(
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m    
+    pid_n = (pid % num_pid_in_group) // group_size_m
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = pid_sp_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -266,7 +266,7 @@ def matmul_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
         # Load the next block of A and B.
-        # [BLOCK_K, BLOCK_N] but repeated group_size times in K 
+        # [BLOCK_K, BLOCK_N] but repeated group_size times in K
         bs_ptrs = bs_ptr + ((offs_k[:, None] + k * BLOCK_SIZE_K * SPLIT_K) // group_size) * stride_bsk \
             + offs_bn[None, :] * stride_bsn
         # [BLOCK_K, BLOCK_N] but repeated in K and N
@@ -305,11 +305,11 @@ def matmul_dequantize_int4_s2(x: torch.FloatTensor, qweight: torch.IntTensor, sc
     """
     """
     assert x.is_contiguous(), "A must be contiguous"
-    assert qweight.is_contiguous(), "B must be contiguous"  
+    assert qweight.is_contiguous(), "B must be contiguous"
     M, K = x.shape
     N = scales.shape[1]
     if output is None:
-        output = torch.zeros((M, N), device=x.device, dtype=torch.float16)  
+        output = torch.zeros((M, N), device=x.device, dtype=torch.float16)
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
         META['SPLIT_K'],
@@ -384,7 +384,7 @@ def dequantize_int4(b, b_scale, b_zero_point, device, dtype, group_size):
     fp_b = torch.ones((K, N), device=device, dtype=dtype)
     grid = lambda META: (
         triton.cdiv(K, META['BLOCK_SIZE_K']),
-        triton.cdiv(N, META['BLOCK_SIZE_N']), 
+        triton.cdiv(N, META['BLOCK_SIZE_N']),
     )
     dequantize_kernel[grid](
         b, b_scale, b_zero_point, fp_b,
@@ -430,7 +430,7 @@ def quantize_int4(weight, group_size=128, tp_rank=0):
     weight_max = torch.where(weight_max < 0, 0, weight_max)
     weight_min = weight.amin(-1, keepdim=True)
     weight_min = torch.where(weight_min > 0, 0, weight_min)
-    weight_range = weight_max - weight_min 
+    weight_range = weight_max - weight_min
     scale = weight_range / (2 ** 4 - 1)
     zero_point = (-weight_min / scale).round().clamp(0, 15).to(torch.int32)
     weight = (weight / scale + zero_point).round().clamp(0, 15).to(torch.int32).view(h1, h2)
@@ -606,7 +606,7 @@ def benchmark(M, provider):
         perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     if provider == 'dequantize':
         intb, b_scale, bzp, _ = quantize_int4(b, group_size=64)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: dequantize_int4(intb, b_scale, bzp, 'cuda', torch.float16, 64), quantiles=quantiles)        
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: dequantize_int4(intb, b_scale, bzp, 'cuda', torch.float16, 64), quantiles=quantiles)
         perf = lambda ms: 2 * M * K * 1e-9 / (ms * 1e-3)
     if provider == 'triton-gptq':
         intb, b_scale, bzp, _ = quantize_int4(b, group_size=64)

@@ -41,19 +41,19 @@ def test_all_setting(gpu_name, model_name, mode, log_dir, world_sizes, in_out_le
     model_class, model_path = model_to_class_and_path[model_name]
     kill_gpu_processes()
     for world_size in world_sizes:
-        for in_len, out_len in in_out_lens: 
+        for in_len, out_len in in_out_lens:
             kill_gpu_processes()
             mode_str = "_".join(mode)
             log_file_name = f"{model_name}##{mode_str}##{world_size}##{in_len}##{out_len}##batch_size##.log"
             log_path = os.path.join(log_dir, log_file_name)
             print(log_path)
-            test_model_inference(world_size, 
-                                 model_path, 
-                                 model_class, 
-                                 batch_sizes, 
-                                 in_len, 
+            test_model_inference(world_size,
+                                 model_path,
+                                 model_class,
+                                 batch_sizes,
+                                 in_len,
                                  out_len,
-                                 mode, 
+                                 mode,
                                  log_path)
     log_md_file = log_dir + ".md"
     md_file = open(log_md_file, "w")
@@ -72,7 +72,7 @@ def test_all_setting(gpu_name, model_name, mode, log_dir, world_sizes, in_out_le
     sorted(log_files, key=lambda x: tuple(map(int, x.split("##")[2:6])))
     for log_file in log_files:
         _, _, world_size, input_len, output_len, batch_size, _ = log_file.split("##")
-        fp_file = open(os.path.join(log_dir, log_file), "r") 
+        fp_file = open(os.path.join(log_dir, log_file), "r")
         all_lines = fp_file.readlines()
         fp_file.close()
         prefill_cost = float(all_lines[0].split(":")[1].strip())
@@ -96,9 +96,9 @@ batch_sizes = [1, 2] # batch_sizes 中的数字也必须从小到大排列。
 
 
 test_all_setting(gpu_name,
-                 "llama-7b", 
+                 "llama-7b",
                  mode=["triton_int8weight", "ppl_int8kv"], # mode 为 【】 为普通 fp16 的格式。
-                 log_dir="./", 
-                 world_sizes=[1], 
-                 in_out_lens=in_out_lens, 
+                 log_dir="./",
+                 world_sizes=[1],
+                 in_out_lens=in_out_lens,
                  batch_sizes=batch_sizes)

@@ -50,7 +50,7 @@ class PetrelHelper(object):
         for line in response.iter_lines():
             cur_line = line.decode('utf-8')
             yield cur_line
-    
+
     def load_data(self, path, ceph_read=True, fs_read=False, mode='r'):
         if 's3://' not in path:
             if not fs_read:
@@ -87,10 +87,10 @@ class PetrelHelper(object):
             js = json.load(open(path, mode))
         else:
             js = json.loads(PetrelHelper._petrel_helper.load_data(path, ceph_read=False))
-        
+
         with open(local_path, 'w') as f:
             json.dump(js, f)
-   
+
     @staticmethod
     def download_file(path, local_path, mode='r'):
         data = PetrelHelper._petrel_helper.load_data(path, ceph_read=False)
@@ -193,7 +193,7 @@ def s3_model_prepare(ceph_file_path: str):
     """
     assert 's3://' in ceph_file_path
     if not os.path.exists(ceph_file_path):
-        os.makedirs(ceph_file_path) 
+        os.makedirs(ceph_file_path)
 
     json_files = PetrelHelper.list(ceph_file_path, extension='json')
     tokenizer_model = PetrelHelper.list(ceph_file_path, extension='model')

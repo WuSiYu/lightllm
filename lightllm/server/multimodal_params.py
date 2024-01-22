@@ -12,7 +12,7 @@ class ImageItem:
     def __init__(self, **kwargs):
         self._type = kwargs["type"]
         self._data = kwargs["data"]
-        # the unique id for the image 
+        # the unique id for the image
         self.uuid = None
         # the start image token id
         self.token_id = None
@@ -29,11 +29,11 @@ class ImageItem:
                 img_data = base64.b64decode(self._data)
             else:
                 raise ValueError(f"cannot read image which type is {self._type}!")
-    
+
             # check if valid image bytes
             image = Image.open(BytesIO(img_data))
             return img_data
-    
+
         except Exception as e:
             raise ValueError(f"Failed to read image type={self._type}, data[:100]={self._data[:100]}: {e}!")
 

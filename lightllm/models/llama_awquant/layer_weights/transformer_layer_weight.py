@@ -12,7 +12,7 @@ class LlamaTransformerLayerActivationWeightQuantized(TransformerLayerWeight):
     def __init__(self, layer_num, tp_rank, world_size, data_type, network_config, mode=[]):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         self.init_quant_mode()
-    
+
     def init_quant_mode(self):
         if "ppl_int8_activation_weight" in self.mode:
             self.quantize_weight = partial(dynamic_channelwise_quant_fp16_i8_ppl, tp_rank=self.tp_rank_)
@@ -72,11 +72,11 @@ class LlamaTransformerLayerActivationWeightQuantized(TransformerLayerWeight):
             o_weight_ = o_weight_[:, q_split_n_embed * self.tp_rank_: q_split_n_embed * (self.tp_rank_ + 1)]
             self.o_weight_ = self._cuda(o_weight_.transpose(0, 1))
         return
-    
+
     def _load_ffn_weights(self, weights):
         if f"model.layers.{self.layer_num_}.post_attention_layernorm.weight" in weights:
             self.ffn_norm_weight_ = self._cuda(weights[f"model.layers.{self.layer_num_}.post_attention_layernorm.weight"])
-    
+
         inter_size = self.network_config_['intermediate_size']
         split_inter_size = inter_size // self.world_size_
 

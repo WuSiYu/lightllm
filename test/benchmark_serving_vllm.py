@@ -101,14 +101,14 @@ def sample_requests(
         (data["conversations"][0]["value"], data["conversations"][1]["value"])
         for data in dataset
     ]
-    
+
     print("read data set finish")
     # Tokenize the prompts and completions.
     import random
     dataset = random.sample(dataset, num_requests * 3)
     prompts = [prompt for prompt, _ in dataset]
     completions = [completion for _, completion in dataset]
-    
+
     prompt_token_ids = tokenizer(prompts).input_ids
     completion_token_ids = tokenizer(completions).input_ids
     tokenized_dataset = []

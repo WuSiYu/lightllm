@@ -15,7 +15,7 @@ class LlamaTransformerLayerWeightQuantized(TransformerLayerWeight):
     def __init__(self, layer_num, tp_rank, world_size, data_type, network_config, mode=[]):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         self.init_quant_mode()
-    
+
     def init_quant_mode(self):
         if "triton_int8weight" in self.mode:
             self.quantize_weight = partial(quantize_int8, tp_rank=self.tp_rank_)
@@ -63,11 +63,11 @@ class LlamaTransformerLayerWeightQuantized(TransformerLayerWeight):
         n_embed = self.network_config_["hidden_size"]
         q_split_n_embed = n_embed // self.world_size_
         kv_split_n_embed = n_embed // self.network_config_["num_attention_heads"] * self.network_config_["num_key_value_heads"] // self.world_size_
-        
+
         if getattr(self, "qkv_weight_", None) is None:
             self.qkv_weight_ = torch.empty(n_embed, q_split_n_embed + 2 * kv_split_n_embed, dtype=self.data_type_, device='cpu')
             self.qkv_step_ = 0
-        
+
         # q k v weights for llama
         if f"model.layers.{self.layer_num_}.self_attn.q_proj.weight" in weights:
             q_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.q_proj.weight"]
@@ -89,7 +89,7 @@ class LlamaTransformerLayerWeightQuantized(TransformerLayerWeight):
             v_weight_ = v_weight_.transpose(0, 1).to(self.data_type_)
             self.qkv_weight_[:, (q_split_n_embed + kv_split_n_embed):(q_split_n_embed + 2 * kv_split_n_embed)] = v_weight_
             self.qkv_step_ += 1
-        
+
         if self.qkv_step_ == 3:
             self.qkv_step_ = 0
             self.qkv_weight_ = self.quantize_weight(self.qkv_weight_)
@@ -99,13 +99,13 @@ class LlamaTransformerLayerWeightQuantized(TransformerLayerWeight):
             self.o_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.weight"]
             self.o_weight_ = self.o_weight_[:, q_split_n_embed * self.tp_rank_: q_split_n_embed * (self.tp_rank_ + 1)]
             self.o_weight_ = self.quantize_weight(self.o_weight_.transpose(0, 1))
-        
+
         return
-    
+
     def _load_ffn_weights(self, weights):
         if f"model.layers.{self.layer_num_}.post_attention_layernorm.weight" in weights:
             self.ffn_norm_weight_ = self._cuda(weights[f"model.layers.{self.layer_num_}.post_attention_layernorm.weight"])
-    
+
         n_embed = self.network_config_["hidden_size"]
         inter_size = self.network_config_['intermediate_size']
         split_inter_size = inter_size // self.world_size_

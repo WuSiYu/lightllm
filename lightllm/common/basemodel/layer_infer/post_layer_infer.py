@@ -8,4 +8,4 @@ class PostLayerInfer(BaseLayerInfer):
         self.world_size_ = world_size
         self.network_config_ = network_config
         self.mode = mode
-        return 
+        return

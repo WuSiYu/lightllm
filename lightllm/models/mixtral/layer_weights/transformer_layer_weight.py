@@ -16,7 +16,7 @@ class MixtralTransformerLayerWeight(TransformerLayerWeight):
         self._load_qkvo_weights(weights)
         self._load_ffn_weights(weights)
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
         weights = [self.att_norm_weight_, self.q_weight_, self.k_weight_, self.v_weight_,
@@ -27,7 +27,7 @@ class MixtralTransformerLayerWeight(TransformerLayerWeight):
             assert self.experts[i]["w1"] is not None, "layer " + str(self.layer_num_) + " expert " + str(i) + " w1 " + errors
             assert self.experts[i]["w2"] is not None, "layer " + str(self.layer_num_) + " expert " + str(i) + " w2 " + errors
             assert self.experts[i]["w3"] is not None, "layer " + str(self.layer_num_) + " expert " + str(i) + " w3 " + errors
-        return 
+        return
 
     def _load_qkvo_weights(self, weights):
         # input layernorm params
@@ -52,18 +52,18 @@ class MixtralTransformerLayerWeight(TransformerLayerWeight):
             self.v_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.v_proj.weight"]
             self.v_weight_ = self.v_weight_[kv_split_n_embed * self.tp_rank_: kv_split_n_embed * (self.tp_rank_ + 1), :]
             self.v_weight_ = self._cuda(self.v_weight_.transpose(0, 1))
-        
+
         # attention output dense params
         if f"model.layers.{self.layer_num_}.self_attn.o_proj.weight" in weights:
             self.o_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.weight"]
             self.o_weight_ = self.o_weight_[:, q_split_n_embed * self.tp_rank_: q_split_n_embed * (self.tp_rank_ + 1)]
             self.o_weight_ = self._cuda(self.o_weight_.transpose(0, 1))
         return
-    
+
     def _load_ffn_weights(self, weights):
         if f"model.layers.{self.layer_num_}.post_attention_layernorm.weight" in weights:
             self.ffn_norm_weight_ = self._cuda(weights[f"model.layers.{self.layer_num_}.post_attention_layernorm.weight"])
-    
+
         inter_size = self.network_config_['intermediate_size']
         split_inter_size = inter_size // self.world_size_
 
@@ -80,7 +80,7 @@ class MixtralTransformerLayerWeight(TransformerLayerWeight):
                 self.experts[expert_idx]["w2"] = weights[f"model.layers.{self.layer_num_}.block_sparse_moe.experts.{expert_idx}.w2.weight"][:, split_inter_size *
                                                                                          self.tp_rank_: split_inter_size * (self.tp_rank_ + 1)]
                 self.experts[expert_idx]["w2"] = self._cuda(self.experts[expert_idx]["w2"].transpose(0, 1))
-            
+
             if f"model.layers.{self.layer_num_}.block_sparse_moe.experts.{expert_idx}.w3.weight" in weights:
                 self.experts[expert_idx]["w3"] = weights[f"model.layers.{self.layer_num_}.block_sparse_moe.experts.{expert_idx}.w3.weight"][split_inter_size *
                                                                                          self.tp_rank_: split_inter_size * (self.tp_rank_ + 1), :]

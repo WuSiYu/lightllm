@@ -20,8 +20,8 @@ def quantize_int4_lmdeploy(weight, group_size=128, tp_rank=0, pack_order=[0, 2, 
     weight_max = torch.where(weight_max < 0, 0, weight_max)
     weight_min = weight.amin(-1, keepdim=True)
     weight_min = torch.where(weight_min > 0, 0, weight_min)
-    weight_range = weight_max - weight_min 
-    
+    weight_range = weight_max - weight_min
+
     scale = (weight_range / (2 ** 4 - 1))
     zero_point = (-weight_min / scale).round().clamp(0, 15).to(torch.int32)
     # (N, K)

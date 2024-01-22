@@ -28,7 +28,7 @@ class MixtralTransformerLayerInfer(LlamaTransformerLayerInfer):
             w1_out, w3_out = None, None
             current_hidden_states = torch.mm(current_hidden_states, expert_layer['w2'])
             current_hidden_states = current_hidden_states.mul_(expert_weights)
-            
+
             if final_hidden_states is None:
                 final_hidden_states = current_hidden_states
             else:

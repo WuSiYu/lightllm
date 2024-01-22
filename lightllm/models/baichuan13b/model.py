@@ -19,7 +19,7 @@ class Baichuan13bTpPartModel(LlamaTpPartModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    
+
     def _verify_params(self):
         super()._verify_params()
         assert self.mode == [], "baichuan13b only support normal mode"

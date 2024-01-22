@@ -24,15 +24,15 @@ class BloomPreAndPostLayerWeight(PreAndPostLayerWeight):
                                                                  self.tp_rank_: split_vob_size * (self.tp_rank_ + 1), :])
             self.lm_head_weight_ = self.wte_weight_
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
-        weights = [self.pre_norm_weight_, 
-                   self.pre_norm_bias_, 
-                   self.final_norm_weight_, 
+        weights = [self.pre_norm_weight_,
+                   self.pre_norm_bias_,
+                   self.final_norm_weight_,
                    self.final_norm_bias_,
                    self.wte_weight_,
                    self.lm_head_weight_]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return

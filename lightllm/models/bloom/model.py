@@ -37,7 +37,7 @@ class BloomTpPartModel(TpPartBaseModel):
 
     def _reset_num_key_value_heads(self):
         self.config["num_key_value_heads"] = self.config["num_attention_heads"]
-        return 
+        return
 
     def _init_weights(self):
         self.pre_post_weight = self.pre_and_post_weight_class(self.tp_rank_, self.world_size_, torch.float16, network_config=self.config, mode=self.mode)

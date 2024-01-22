@@ -13,7 +13,7 @@ class StarcoderTransformerLayerWeightQuantized(TransformerLayerWeight):
         assert network_config["num_attention_heads"] % self.world_size_ == 0
         LlamaTransformerLayerWeightQuantized.init_quant_mode(self)
         return
-    
+
     def load_hf_weights(self, weights):
         self._load_qkvo_weights(weights)
         self._load_ffn_weights(weights)
@@ -64,7 +64,7 @@ class StarcoderTransformerLayerWeightQuantized(TransformerLayerWeight):
             q_bias_ = qkv_bias_[:n_embed][split_n_embed * self.tp_rank_: split_n_embed * (self.tp_rank_ + 1)]
             k_bias_ = qkv_bias_[n_embed : n_embed + head_dim]
             v_bias_ = qkv_bias_[n_embed + head_dim : n_embed + 2 * head_dim]
- 
+
             self.qkv_bias_ = self._cuda(torch.cat((q_bias_, k_bias_, v_bias_), dim=0))
 
         # attention output dense params

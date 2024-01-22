@@ -17,7 +17,7 @@ import triton.language as tl
 @triton.jit
 def quantize_int8_perrow_kernel(
     fpa_ptr, a_ptr, as_ptr,
-    M, K, 
+    M, K,
     stride_fpam, stride_fpak,
     stride_am, stride_ak,
     stride_asm,
@@ -121,7 +121,7 @@ def matmul_kernel(
     stride_cm, stride_cn,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr, 
+    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)

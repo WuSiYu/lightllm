@@ -15,16 +15,16 @@ class QWenTpPartModelWQuant(QWenTpPartModel):
 
     def __init__(self, kvargs):
         super().__init__(kvargs)
-    
+
     def _verify_params(self):
         super()._verify_params()
         assert any("int8weight" in mode_ or "int4weight" in mode_ for mode_ in self.mode), "only for weight quant model"
         assert self.config["num_key_value_heads"] % self.world_size_ == 0
         assert self.config["num_attention_heads"] % self.world_size_ == 0
         return
-    
+
     def _init_mem_manager(self):
-        self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num, 
+        self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num,
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_key_value_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],

@@ -24,7 +24,7 @@ class VisualModelRpcServer(rpyc.Service):
         #     world_size = kvargs["world_size"]
         # dist.init_process_group('nccl', init_method=f'tcp://127.0.0.1:{kvargs["nccl_port"]}', rank=self.tp_rank, world_size=world_size)
         # torch.cuda.set_device(self.tp_rank)
-        
+
         weight_dir = kvargs["weight_dir"]
         model_cfg, _ = PretrainedConfig.get_config_dict(
             weight_dir
@@ -47,10 +47,10 @@ class VisualModelRpcServer(rpyc.Service):
             import traceback
             traceback.print_exc()
             raise e
-        
+
         set_random_seed(2147483647)
         return
-    
+
     # @calculate_time(show=True, min_cost_ms=150)
     @torch.no_grad()
     def forward(self, images):

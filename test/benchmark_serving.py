@@ -82,14 +82,14 @@ def sample_requests(
         (data["conversations"][0]["value"], data["conversations"][1]["value"])
         for data in dataset
     ]
-    
+
     print("read data set finish")
     # Tokenize the prompts and completions.
     import random
     dataset = random.sample(dataset, num_requests * 3)
     prompts = [prompt for prompt, _ in dataset]
     completions = [completion for _, completion in dataset]
-    
+
     prompt_token_ids = tokenizer(prompts).input_ids
     completion_token_ids = tokenizer(completions).input_ids
     tokenized_dataset = []
@@ -144,7 +144,7 @@ async def send_request(
     headers = {'Content-Type': 'application/json'}
     headers = {"User-Agent": "Benchmark Client"}
     url = 'http://localhost:8000/generate'
-      
+
     data = {
         'inputs': prompt,
         'parameters': {
@@ -154,7 +154,7 @@ async def send_request(
              # 'temperature': 0.1,
         }
     }
-       
+
 
     timeout = aiohttp.ClientTimeout(total=3 * 3600)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -165,7 +165,7 @@ async def send_request(
                     chunks.append(chunk)
             output = b"".join(chunks).decode("utf-8")
             output = json.loads(output)
-            
+
             if "error" not in output:
                 break
 

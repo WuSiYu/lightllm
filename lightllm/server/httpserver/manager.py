@@ -34,7 +34,7 @@ class HttpServerManager:
 
         self.recv_from_detokenization = context.socket(zmq.PULL)
         self.recv_from_detokenization.bind(f"tcp://127.0.0.1:{httpserver_port}")
-        
+
         self.tokenizer = get_tokenizer(
             args.model_dir, args.tokenizer_mode, trust_remote_code=args.trust_remote_code
         )
@@ -47,7 +47,7 @@ class HttpServerManager:
 
         self._init_prompt_cache()
         return
-    
+
     def _init_prompt_cache(self):
         """
         初始化 prompt cache 特性, 这个地方的id 分配要于 router 中 的id 分配对齐
@@ -61,7 +61,7 @@ class HttpServerManager:
                 self.prompt_cache_reqs.append((id, prompt_ids))
                 id -= 1
         return
-    
+
     def _find_prompt_cache_req(self, token_ids):
         prompt_cache_len = 0
         prompt_cache_req_id = None
@@ -141,7 +141,7 @@ class HttpServerManager:
             raise ValueError(
                 f"the req token total len + 1 (input len + output len + 1) is too long > max_total_token_num:{self.total_token_num}"
             )
-        
+
         sampling_params.stop_sentences_to_token_ids(self.tokenizer)
 
         req_status = ReqStatus(request_id, multimodal_params)
@@ -150,7 +150,7 @@ class HttpServerManager:
 
         # 寻找是否有可用的prompt cache 可用
         prompt_cache_len, prompt_cache_req_id = self._find_prompt_cache_req(prompt_ids)
-  
+
         if self.enable_multimodal:
             self.send_to_visual.send_pyobj((prompt_ids, sampling_params, multimodal_params, request_id, prompt_cache_len, prompt_cache_req_id))
         else:
@@ -205,7 +205,7 @@ class HttpServerManager:
                 try:
                     if not finish_status.is_aborted():
                         req_status : ReqStatus = self.req_id_to_out_inf[req_id]
-                        async with req_status.lock: 
+                        async with req_status.lock:
                             req_status.out_token_info_list.append((text, metadata, finish_status))
                             req_status.event.set()
                     else:

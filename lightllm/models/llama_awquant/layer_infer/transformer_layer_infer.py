@@ -15,7 +15,7 @@ from lightllm.common.basemodel import TransformerLayerInferActivationWeightQuant
 from lightllm.common.basemodel.cuda_kernel.ppl_awquant import matmul_i8_i32_ppl, skiprmsnorm_ppl, channel_token_dequant_i32_fp16_ppl
 from lightllm.common.basemodel.cuda_kernel.ppl_awquant import dynamic_channelwise_quant_fp16_i8_ppl, gatesilu_i32_i8_ppl
 from lightllm.utils.infer_utils import mark_cost_time
- 
+
 class LlamaTransformerLayerInferAWquant(TransformerLayerInferActivationWeightQuantTpl):
     """
     """
@@ -29,18 +29,18 @@ class LlamaTransformerLayerInferAWquant(TransformerLayerInferActivationWeightQua
         self.tp_o_head_num_ = self.tp_q_head_num_
         self.head_dim_ = network_config["hidden_size"] // network_config["num_attention_heads"]
         self.embed_dim_ = network_config["hidden_size"]
-        
+
         self.inter_dim_ = network_config['intermediate_size']
         self._bind_func()
         return
-    
+
     def _bind_func(self):
         self._bind_norm()
-        self._bind_matmul()   
-        self._bind_silu()     
+        self._bind_matmul()
+        self._bind_silu()
         LlamaTransformerLayerInfer._bind_attention(self)
         return
-    
+
     def _bind_norm(self):
         if "ppl_int8_activation_weight" in self.mode:
             self._awquant_att_norm = partial(LlamaTransformerLayerInferAWquant._awquant_att_norm_ppl_int8, self)
@@ -48,7 +48,7 @@ class LlamaTransformerLayerInferAWquant(TransformerLayerInferActivationWeightQua
         else:
             raise Exception(f"error mode {self.mode}")
         return
-    
+
     def _bind_matmul(self):
         if "ppl_int8_activation_weight" in self.mode:
             self._awquant_matmul_for_qkv = partial(LlamaTransformerLayerInferAWquant._awquant_matmul_ppl_int8_quant_dequant, self)
@@ -94,20 +94,20 @@ class LlamaTransformerLayerInferAWquant(TransformerLayerInferActivationWeightQua
         return o_tensor
 
     def _ffn(self, input, token_scale, infer_state: LlamaInferStateInfo, layer_weight: LlamaTransformerLayerActivationWeightQuantized) -> torch.Tensor:
-        gate_out = self._awquant_matmul_for_ffn_up(input.view(-1, self.embed_dim_), 
+        gate_out = self._awquant_matmul_for_ffn_up(input.view(-1, self.embed_dim_),
                                                 layer_weight.gate_proj,
                                                 is_prefill=infer_state.is_prefill,)
-        up_out = self._awquant_matmul_for_ffn_up(input.view(-1, self.embed_dim_), 
+        up_out = self._awquant_matmul_for_ffn_up(input.view(-1, self.embed_dim_),
                                                 layer_weight.up_proj,
                                                 is_prefill=infer_state.is_prefill,)
         input = None
         _, gate_proj_scale = layer_weight.gate_proj
         _, up_proj_scale = layer_weight.up_proj
-        ffn1_out, ffn1_out_scale = self._awquant_silu(gate_out, up_out, 
+        ffn1_out, ffn1_out_scale = self._awquant_silu(gate_out, up_out,
                                         gate_proj_scale, up_proj_scale, token_scale)
         gate_out, up_out = None, None
         ffn2_out = self._awquant_matmul_for_ffn_down(ffn1_out, layer_weight.down_proj,
-                                                    is_prefill=infer_state.is_prefill, 
+                                                    is_prefill=infer_state.is_prefill,
                                                     token_scale=ffn1_out_scale)
         ffn1_out = None
 

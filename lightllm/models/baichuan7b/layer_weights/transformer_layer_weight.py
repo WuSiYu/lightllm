@@ -8,7 +8,7 @@ class BaiChuan7bTransformerLayerWeight(LlamaTransformerLayerWeight):
     def __init__(self, layer_num, tp_rank, world_size, data_type, network_config, mode=[]):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         return
-    
+
     def _load_qkvo_weights(self, weights):
         # input layernorm params
         if f"model.layers.{self.layer_num_}.input_layernorm.weight" in weights:
@@ -28,7 +28,7 @@ class BaiChuan7bTransformerLayerWeight(LlamaTransformerLayerWeight):
             self.k_weight_ = self._cuda(self.k_weight_.transpose(0, 1))
             self.v_weight_ = v_weights[split_n_embed * self.tp_rank_: split_n_embed * (self.tp_rank_ + 1), :]
             self.v_weight_ = self._cuda(self.v_weight_.transpose(0, 1))
-        
+
         # attention output dense params
         if f"model.layers.{self.layer_num_}.self_attn.o_proj.weight" in weights:
             self.o_weight_ = weights[f"model.layers.{self.layer_num_}.self_attn.o_proj.weight"][:,split_n_embed * self.tp_rank_: split_n_embed * (self.tp_rank_ + 1)]

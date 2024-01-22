@@ -9,7 +9,7 @@ def skiprmsnorm_ppl(x, weight, skip=None, eps=1e-6):
     from lightllm_ppl_int8_kernel import SkipRmsNormForward_fp16_i8
     if skip is None: skip = torch.zeros_like(x)
     return SkipRmsNormForward_fp16_i8(
-        CONTIGUOUS_TENSOR(x), CONTIGUOUS_TENSOR(weight), 
+        CONTIGUOUS_TENSOR(x), CONTIGUOUS_TENSOR(weight),
         CONTIGUOUS_TENSOR(skip), eps)
 
 def gatesilu_i32_i8_ppl(x, y, x_scale, y_scale, token_scale):

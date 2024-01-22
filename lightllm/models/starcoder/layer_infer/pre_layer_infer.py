@@ -35,7 +35,7 @@ class StarcoderPreLayerInfer(PreLayerInfer):
         if self.world_size_ > 1:
             dist.all_reduce(input_embdings, op=dist.ReduceOp.SUM, async_op=False)
         position_embeds = torch.embedding(layer_weight.wpe_weight_, infer_state.position_ids, padding_idx=-1)
-        
+
         return input_embdings + position_embeds
 
     def token_forward(self, input_ids, infer_state: StarcoderInferStateInfo, layer_weight: PreAndPostLayerWeight):

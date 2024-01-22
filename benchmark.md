@@ -1,4 +1,4 @@
-#### lightllm 
+#### lightllm
 
 #### Launch service
 
@@ -12,7 +12,7 @@ python -m lightllm.server.api_server --model_dir /path/llama-7b --tp 1 --max_tot
 python benchmark_serving.py --tokenizer /path/llama-7b --dataset /path/ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 2000 --request-rate 200
 ~~~
 
-#### vllm 
+#### vllm
 
 #### Launch service
 ~~~shell

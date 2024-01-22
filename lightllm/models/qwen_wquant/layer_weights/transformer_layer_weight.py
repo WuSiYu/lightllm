@@ -10,7 +10,7 @@ class QwenTransformerLayerWeightQuantized(TransformerLayerWeight):
         super().__init__(layer_num, tp_rank, world_size, data_type, network_config, mode)
         LlamaTransformerLayerWeightQuantized.init_quant_mode(self)
         return
-        
+
     def load_hf_weights(self, weights):
         # input layernorm params
         if f"transformer.h.{self.layer_num_}.ln_1.weight" in weights:
@@ -30,7 +30,7 @@ class QwenTransformerLayerWeightQuantized(TransformerLayerWeight):
 
             qkv_weight_ = torch.cat([q_weight_, k_weight_, v_weight_], dim=0)
             self.qkv_weight_ = self.quantize_weight(qkv_weight_.transpose(0, 1))
-        
+
         if f"transformer.h.{self.layer_num_}.attn.c_attn.bias" in weights:
             qkv_bias = weights[f"transformer.h.{self.layer_num_}.attn.c_attn.bias"]
             split_size = qkv_bias.shape[0] // 3
@@ -68,7 +68,7 @@ class QwenTransformerLayerWeightQuantized(TransformerLayerWeight):
             up_proj = up_proj.transpose(0, 1).to(self.data_type_)
             self.gate_up_proj[:, split_inter_size : split_inter_size * 2] = up_proj
             self.gate_up_step += 1
-        
+
         if self.gate_up_step == 2:
             self.gate_up_step = 0
             self.gate_up_proj = self.quantize_weight(self.gate_up_proj)
@@ -77,9 +77,9 @@ class QwenTransformerLayerWeightQuantized(TransformerLayerWeight):
             self.down_proj = weights[f"transformer.h.{self.layer_num_}.mlp.c_proj.weight"]
             self.down_proj = self.down_proj[:,split_inter_size * self.tp_rank_: split_inter_size * (self.tp_rank_ + 1)]
             self.down_proj = self.quantize_weight(self.down_proj.transpose(0, 1))
-            
+
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
         weights = [self.att_norm_weight_,
@@ -92,4 +92,4 @@ class QwenTransformerLayerWeightQuantized(TransformerLayerWeight):
                    ]
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
-        return 
+        return

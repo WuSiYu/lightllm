@@ -22,7 +22,7 @@ class QwenPreAndPostLayerWeight(PreAndPostLayerWeight):
             self.final_norm_weight_ = self._cuda(weights['transformer.ln_f.weight'])
 
         return
-    
+
     def verify_load(self):
         errors = "weights load not ok"
         weights = [self.wte_weight_,
@@ -32,6 +32,6 @@ class QwenPreAndPostLayerWeight(PreAndPostLayerWeight):
         for i in range(len(weights)):
             assert weights[i] is not None, "index:" + str(i) + " " + errors
         return
-    
-    
+
+
 

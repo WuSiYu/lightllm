@@ -19,12 +19,12 @@ class Baichuan2_13bTpPartModel(LlamaTpPartModel):
     def __init__(self, kvargs):
         super().__init__(kvargs)
         return
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
         # repair_config()
         return
-    
+
     def _verify_params(self):
         assert self.load_way == "HF", "llama only support HF format to load Now!"

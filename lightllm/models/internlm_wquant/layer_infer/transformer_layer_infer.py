@@ -16,10 +16,10 @@ class InternlmTransformerLayerInferWquant(LlamaTransformerLayerInferWquant):
         return
 
     def _get_qkv(self, input, cache_k, cache_v, infer_state: LlamaInferStateInfo, layer_weight: InternlmTransformerLayerWeightQuantized):
-        qkv_output = self._wquant_matmul_for_qkv(input.view(-1, self.embed_dim_), 
+        qkv_output = self._wquant_matmul_for_qkv(input.view(-1, self.embed_dim_),
                                                     quant_weight_params=layer_weight.qkv_weight_,
                                                     infer_state=infer_state)
-        
+
         tp_k_head_dim = self.tp_k_head_num_ * self.head_dim_
         q = qkv_output[:, : -2 * tp_k_head_dim].add_(layer_weight.q_bias_)
         k = qkv_output[:, -2 * tp_k_head_dim: -tp_k_head_dim].add_(layer_weight.k_bias_)
@@ -32,7 +32,7 @@ class InternlmTransformerLayerInferWquant(LlamaTransformerLayerInferWquant):
         return q, cache_k_, cache_v_
 
     def _get_o(self, input, infer_state: LlamaInferStateInfo, layer_weight: InternlmTransformerLayerWeightQuantized) -> torch.Tensor:
-        o_tensor = self._wquant_matmul_for_o(input, 
+        o_tensor = self._wquant_matmul_for_o(input,
                                              quant_weight_params=layer_weight.o_weight_,
                                              infer_state=infer_state,
                                              bias=layer_weight.o_bias_ / self.world_size_)

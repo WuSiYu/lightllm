@@ -32,14 +32,14 @@ def _fwd_kernel_flash_decode_stage2(
         tv = tl.load(Mid_O + offs_v + block_seq_n * stride_mid_os)
         tlogic = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n)
         new_max_logic = tl.maximum(tlogic, max_logic)
-        
+
         old_scale = tl.exp(max_logic - new_max_logic)
         acc *= old_scale
         exp_logic = tl.exp(tlogic - new_max_logic)
         acc += exp_logic * tv
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
-    
+
     tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
     return
 
@@ -50,7 +50,7 @@ def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
     assert Lk in {16, 32, 64, 128}
     batch, head_num = mid_out.shape[0], mid_out.shape[1]
     grid = (batch, head_num)
-    
+
     _fwd_kernel_flash_decode_stage2[grid](
         B_Seqlen, mid_out, mid_out_logexpsum, O,
         mid_out.stride(0), mid_out.stride(1), mid_out.stride(2), mid_out.stride(3),

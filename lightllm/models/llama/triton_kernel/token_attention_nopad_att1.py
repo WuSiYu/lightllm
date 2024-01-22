@@ -20,7 +20,7 @@ def _fwd_kernel_token_att1(
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_n = tl.program_id(2)
-    
+
     cur_kv_head = cur_head // kv_group_num
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -41,7 +41,7 @@ def _fwd_kernel_token_att1(
     for start_mark in range(0, block_mask, 1):
         q = tl.load(Q + off_q + start_mark)
         offs_n_new = cur_batch_start_index + offs_n
-        k_loc = tl.load(Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * offs_n_new, 
+        k_loc = tl.load(Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * offs_n_new,
                         mask=offs_n_new < cur_batch_end_index, other=0)
         off_k = k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :] * stride_kd
         k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
@@ -65,7 +65,7 @@ def token_att_fwd(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen
 
     grid = (batch, head_num, triton.cdiv(max_len_in_batch, BLOCK))
     kv_group_num = q.shape[1] // k.shape[1]
-    
+
     if kv_group_num == 1:
         num_warps = 4
     else:

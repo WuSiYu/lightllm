@@ -38,9 +38,9 @@ def _rms_norm_fwd_fused(
         tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
-def rmsnorm_forward(x, weight, eps):
+def rmsnorm_forward(x, weight, eps, out=None):
     # allocate output
-    y = torch.empty_like(x)
+    y = torch.empty_like(x) if out is None else out
     # reshape input data into 2D tensor
     x_arg = x.view(-1, x.shape[-1])
     M, N = x_arg.shape

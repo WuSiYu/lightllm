@@ -1,6 +1,7 @@
 import copy
 import time
 import uuid
+import torch
 import uvloop
 import asyncio
 import rpyc
@@ -281,8 +282,21 @@ class RouterManager:
         await self._init_batch(batch)
         if not self.is_splitfuse_mode:
             # 在 非 splitfuse 模式下，才需要真的执行 prefill 的操作。
+            prefill_len = batch.input_tokens()
+            # print(f"{batch.reqs = }")
+            # print(f"{batch.reqs[0].input_len = }")
+            # print(f"{batch.reqs[0].prompt_ids = }")
+            # torch.cuda.nvtx.range_push("PROFILE")
+            torch.cuda.nvtx.range_push(f"prefill {prefill_len}")
+            es, ee = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            es.record()
+            pts = time.time()
             rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
             ans = await asyncio.gather(*rets)
+            ee.record()
+            pte = time.time()
+            torch.cuda.nvtx.range_pop()
+            # torch.cuda.nvtx.range_pop()
             if self.world_size != 1:
                 req_to_out_status = obtain(ans[0])
             else:
@@ -293,6 +307,8 @@ class RouterManager:
             self._send_to_detokenization_proc(batch, req_to_out_status)
             batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
             await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
+            print(f"prefill prof:\t{prefill_len}\t{es.elapsed_time(ee)}")
+            print(f"(python time {(pte - pts) * 1000})")
         self.metric_client.histogram_observe(
             "lightllm_batch_inference_duration_bucket", time.time() - start_time, "prefill"
         )

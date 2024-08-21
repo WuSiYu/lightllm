@@ -34,14 +34,14 @@ class LlamaTpPartModel(TpPartBaseModel):
     def __init__(self, kvargs):
         super().__init__(kvargs)
         return
-    
+
     def _init_config(self):
         super()._init_config()
         # rename key
         # repair_config()
         self._reset_num_key_value_heads()
-        return 
-    
+        return
+
     def _reset_num_key_value_heads(self):
         if "num_key_value_heads" not in self.config:
             self.config["num_key_value_heads"] = self.config["num_attention_heads"]
@@ -49,16 +49,28 @@ class LlamaTpPartModel(TpPartBaseModel):
 
     def _verify_params(self):
         assert self.load_way in ["HF", "DS"], "llama only supports HF and DS format to load Now!"
-        assert self.config["num_key_value_heads"] % self.world_size_ == 0
-        assert self.config["num_attention_heads"] % self.world_size_ == 0
+        if not self.advanced_tp:
+            assert self.config["num_key_value_heads"] % self.world_size_ == 0
+            assert self.config["num_attention_heads"] % self.world_size_ == 0
+        else:
+            n_kvheads = self.config["num_key_value_heads"]
+            n_tp = self.world_size_
+            if self.tp_rank_ == 0:
+                print(f"we have {n_kvheads = } with {n_tp = }, active [advanced_tp]")
+            factor = (n_kvheads-1) // n_tp + 1
+            self.advanced_tp_kvheads = [i for i in range(self.tp_rank_ * factor, min(n_kvheads, (self.tp_rank_ + 1) * factor))]
+            self.config['advanced_tp_kvheads'] = self.advanced_tp_kvheads
+            print(f"{self.tp_rank_ = }: {self.advanced_tp_kvheads = }")
         return
-    
+
     def _init_mem_manager(self):
-        self.mem_manager = select_mem_manager_class(self.mode)(self.max_total_token_num, 
-                                                     dtype=self.data_type,
-                                                     head_num=self.config["num_key_value_heads"] // self.world_size_,
-                                                     head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+        self.mem_manager = select_mem_manager_class(self.mode)(
+            self.max_total_token_num,
+            dtype=self.data_type,
+            head_num=self.config["num_key_value_heads"] // self.world_size_ if not self.advanced_tp else len(self.advanced_tp_kvheads),
+            head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
+            layer_num=self.config["num_hidden_layers"]
+        )
         return
 
     def _init_custom(self):
@@ -71,6 +83,11 @@ class LlamaTpPartModel(TpPartBaseModel):
             self._init_to_get_dynamic_ntk_rotary()
         else:
             self._init_to_get_rotary()
+
+        if self.advanced_tp:
+            # override
+            self.tp_k_head_num_ = len(self.advanced_tp_kvheads)
+            self.tp_v_head_num_ = self.tp_k_head_num_
         return
 
     def _init_weights(self):
@@ -96,8 +113,8 @@ class LlamaTpPartModel(TpPartBaseModel):
                 prefix='model.layers.',
                 num_layer=self.config["n_layer"])
         self.pre_post_weight.verify_load()
-        [weight.verify_load() for weight in self.trans_layers_weight]            
-        return 
+        [weight.verify_load() for weight in self.trans_layers_weight]
+        return
 
     def _init_to_get_rotary(self, default_base=10000):
         partial_head_dim = int(self.config.get("partial_rotary_factor", 1) * self.head_dim_)
@@ -147,7 +164,7 @@ class LlamaTpPartModel(TpPartBaseModel):
         max_seq_len = max(self.max_seq_length, max_position_embeddings)
         self._cos_cached = torch.zeros((max_seq_len, partial_head_dim // 2), dtype=self.data_type, device="cuda")
         self._sin_cached = torch.zeros((max_seq_len, partial_head_dim // 2), dtype=self.data_type, device="cuda")
-        
+
         inv_freq = 1.0 / (base ** (torch.arange(0, partial_head_dim, 2, device="cpu", dtype=torch.float32) / partial_head_dim))
         t = torch.arange(max_position_embeddings, device="cpu", dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)

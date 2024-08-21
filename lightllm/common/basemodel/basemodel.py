@@ -46,7 +46,8 @@ class TpPartBaseModel:
         self.return_all_prompt_logprobs = kvargs.get("return_all_prompt_logprobs", False)
         self.use_dynamic_prompt_cache = kvargs.get("use_dynamic_prompt_cache", False)
         self.data_type = kvargs.get("data_type", "float16")
-        
+        self.advanced_tp = False
+
         self._init_datatype()
         self._init_config()
         self._verify_must()
@@ -72,12 +73,14 @@ class TpPartBaseModel:
 
     @final
     def _verify_must(self):
-        assert self.config["num_attention_heads"] % self.world_size_ == 0
+        if not self.config["num_attention_heads"] % self.world_size_ == 0:
+            self.advanced_tp = True
         return
 
     def _verify_params(self):
         assert self.load_way == "HF", "only support HF format weights"
-        assert self.config["num_key_value_heads"] % self.world_size_ == 0
+        if not self.advanced_tp:
+            assert self.config["num_key_value_heads"] % self.world_size_ == 0
         return
 
     def _init_weights(self):

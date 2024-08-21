@@ -40,6 +40,17 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         self.tp_o_head_num_ = self.tp_q_head_num_
         self.head_dim_ = network_config["hidden_size"] // network_config["num_attention_heads"]
         self.embed_dim_ = network_config["hidden_size"]
+        self.advanced_tp_kvheads = network_config.get("advanced_tp_kvheads")
+        if self.advanced_tp_kvheads:
+            self.tp_q_head_num_ = len(self.advanced_tp_kvheads) * (network_config["num_attention_heads"] // network_config["num_key_value_heads"])
+            self.tp_k_head_num_ = len(self.advanced_tp_kvheads)
+            self.tp_v_head_num_ = len(self.advanced_tp_kvheads)
+            print(f"{self.advanced_tp_kvheads = }")
+            print(f"{self.tp_q_head_num_ = }")
+            print(f"{self.tp_k_head_num_ = }")
+            self.tp_o_head_num_ = self.tp_q_head_num_
+            # self.head_dim_ = network_config["hidden_size"] // network_config["num_attention_heads"]
+            # self.embed_dim_ = network_config["hidden_size"]
         self._bind_func()
         return
 

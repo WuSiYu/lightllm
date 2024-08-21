@@ -51,15 +51,25 @@ class LlamaTpPartModel(TpPartBaseModel):
 
     def _verify_params(self):
         assert self.load_way in ["HF", "DS"], "llama only supports HF and DS format to load Now!"
-        assert self.config["num_key_value_heads"] % self.world_size_ == 0
-        assert self.config["num_attention_heads"] % self.world_size_ == 0
+        if not self.advanced_tp:
+            assert self.config["num_key_value_heads"] % self.world_size_ == 0
+            assert self.config["num_attention_heads"] % self.world_size_ == 0
+        else:
+            n_kvheads = self.config["num_key_value_heads"]
+            n_tp = self.world_size_
+            if self.tp_rank_ == 0:
+                print(f"we have {n_kvheads = } with {n_tp = }, active [advanced_tp]")
+            factor = (n_kvheads-1) // n_tp + 1
+            self.advanced_tp_kvheads = [i for i in range(self.tp_rank_ * factor, min(n_kvheads, (self.tp_rank_ + 1) * factor))]
+            self.config['advanced_tp_kvheads'] = self.advanced_tp_kvheads
+            print(f"{self.tp_rank_ = }: {self.advanced_tp_kvheads = }")
         return
 
     def _init_mem_manager(self):
         self.mem_manager = select_mem_manager_class(self.mode)(
             self.max_total_token_num,
             dtype=self.data_type,
-            head_num=self.config["num_key_value_heads"] // self.world_size_,
+            head_num=self.config["num_key_value_heads"] // self.world_size_ if not self.advanced_tp else len(self.advanced_tp_kvheads),
             head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
             layer_num=self.config["num_hidden_layers"],
         )
@@ -83,6 +93,11 @@ class LlamaTpPartModel(TpPartBaseModel):
             self._init_to_su_rotary()
         else:
             self._init_to_get_rotary()
+
+        if self.advanced_tp:
+            # override
+            self.tp_k_head_num_ = len(self.advanced_tp_kvheads)
+            self.tp_v_head_num_ = self.tp_k_head_num_
         return
 
     def _init_weights(self):

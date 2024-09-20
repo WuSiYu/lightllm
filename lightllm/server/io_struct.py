@@ -12,6 +12,8 @@ class ReqRunStatus(enum.Enum):
     RUNNING = 1  # 运行
     PAUSED_AND_OFFLOAD = 2  # 暂停卸载KV
     RERUNNING_FROM_OFFLOAD = 3  # 从卸载KV中恢复
+    DIST_KV_SENDING = 4
+    # DIST_KV_RECVICED = 5
 
 
 class FinishStatus(enum.Enum):
@@ -48,7 +50,7 @@ class Req:
         self.sample_params = sample_params
         self.multimodal_params = multimodal_params
         # output_ids 和 output_metadata_list 的维护暂时没有用了，先注释掉，不清除，后续可能会有用
-        # self.output_ids = []
+        self.output_ids = []
         # self.output_metadata_list = []
 
         self.req_status = ReqRunStatus.WAIT_IN_QUEUE
@@ -63,6 +65,7 @@ class Req:
             "request_id": self.request_id,
             "group_req_id": self.group_req_id,
             "input_id": self.prompt_ids,
+            "output_id": self.output_ids,
             "sampling_param": self.sample_params.to_dict(),
             "multimodal_params": self.multimodal_params.to_dict(),
             "req_status": self.req_status,

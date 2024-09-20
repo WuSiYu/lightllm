@@ -452,6 +452,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--enable_monitor_auth", action="store_true", help="Whether to open authentication for push_gateway"
     )
 
+    parser.add_argument("--dist_node", action="store_true", help="enable dynamic dist mode, and launch node-wise process")
+    parser.add_argument("--dist_master_addr", type=str, default='127.0.0.1', help="master node's address for dynamic dist mode")
+    parser.add_argument("--dist_node_rank", type=int, default=0, help="0 for master node")
+    parser.add_argument("--dist_node_count", type=int, default=1)
+    parser.add_argument("--dist_gpu_per_node", type=int, required=False)
+    parser.add_argument("--dist_node_init_override", type=str, default=None, help='e.g. {"prefill": [...], "decode": [4], "multimodal": [], "multimodal_in_prefill": [2, 2]}')
+    # parser.add_argument("--dist_node_init_override", type=str, default=None, help='e.g. {"prefill": [2, 2], "decode": [4], "multimodal": [], "multimodal_in_prefill": [2, 2]}')
+
     return parser
 
 
@@ -503,7 +511,19 @@ def main():
 
     logger.info(f"all start args:{args}")
 
-    can_use_ports = alloc_can_use_network_port(num=6 + args.tp, used_nccl_port=args.nccl_port)
+    assert args.dist_node, "expr code, only support --dist_node"
+    # if args.dist_node:
+    logger.info("{{{}}} Starting as DIST_NODE (--dist_node)")
+    assert args.dist_master_addr is not None
+    assert args.dist_node_rank is not None
+    assert args.dist_node_count is not None
+    assert args.dist_gpu_per_node is not None
+
+    assert not args.use_dynamic_prompt_cache, "reveive cache not supported (yet)"
+
+    logger.info("--tp will been ignored, use --dist_gpu_per_node, which is {args.dist_gpu_per_node}")
+    _max_instances_per_node = 128
+    can_use_ports = alloc_can_use_network_port(num=6 + _max_instances_per_node, used_nccl_port=args.nccl_port)
     router_port, detokenization_port, httpserver_port, visual_port, cache_port, metric_port = can_use_ports[0:6]
     model_rpc_ports = can_use_ports[6:]
 
@@ -515,6 +535,7 @@ def main():
             start_args=[(cache_port, args)],
         )
 
+    # TODO: mod for dist
     start_submodule_processes(
         start_funcs=[
             start_metric_manager,
@@ -530,24 +551,32 @@ def main():
 
         s3_model_prepare(args.model_dir)
 
-    global httpserver_manager
-    httpserver_manager = HttpServerManager(
-        args,
-        router_port=router_port,
-        cache_port=cache_port,
-        visual_port=visual_port,
-        httpserver_port=httpserver_port,
-        enable_multimodal=args.enable_multimodal,
-        metric_port=metric_port,
-    )
+    if args.dist_node_rank == 0:
+        global httpserver_manager
+        httpserver_manager = HttpServerManager(
+            args,
+            router_port=router_port,
+            cache_port=cache_port,
+            visual_port=visual_port,
+            httpserver_port=httpserver_port,
+            enable_multimodal=args.enable_multimodal,
+            metric_port=metric_port,
+        )
 
     start_submodule_processes(
-        start_funcs=[start_router_process, start_detokenization_process],
+        start_funcs=[start_router_process],
         start_args=[
             (args, router_port, detokenization_port, model_rpc_ports, metric_port),
-            (args, detokenization_port, httpserver_port),
         ],
     )
+
+    if args.dist_node_rank == 0:
+        start_submodule_processes(
+            start_funcs=[start_detokenization_process],
+            start_args=[
+                (args, detokenization_port, httpserver_port),
+            ],
+        )
     if args.enable_multimodal:
         start_submodule_processes(
             start_funcs=[

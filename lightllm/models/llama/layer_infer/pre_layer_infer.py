@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -22,6 +23,10 @@ class LlamaPreLayerInfer(PreLayerInferTpl):
         input_mask = torch.logical_or(self.vob_start_id_ > input_ids, input_ids >= self.vob_end_id_)
         tmp_input_ids = input_ids - self.vob_start_id_
         tmp_input_ids[input_mask] = 0
+        # print(f"{layer_weight.wte_weight_ = }")
+        # print(f"{tmp_input_ids = }")
+        # print(f"[{os.getpid()}] {torch.cuda.current_device() = }")
+        # print(f"{self.world_size_ = }")
         input_embdings = torch.embedding(layer_weight.wte_weight_, tmp_input_ids, padding_idx=-1)
         input_embdings[input_mask] = 0.0
         if self.world_size_ > 1:

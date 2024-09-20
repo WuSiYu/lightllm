@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from lightllm.server.router.model_infer.infer_batch import requests_mapping, InferReq, InferBatch
@@ -8,6 +9,7 @@ from lightllm.common.mem_manager import MemoryManager
 
 # @calculate_time(show=True, min_cost_ms=1)
 def prepare_prefill_inputs(batch: InferBatch, radix_cache: RadixCache, is_multimodal=False):
+    print(f"[{os.getpid()}] prepare_prefill_inputs {torch.cuda.current_device() = }")
     run_reqs = []
     nopad_total_token_num = 0
     nopad_max_len_in_batch = 0

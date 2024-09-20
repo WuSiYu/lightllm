@@ -1,3 +1,5 @@
+import os
+import time
 import torch
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
 from lightllm.utils.infer_utils import set_random_seed
@@ -24,7 +26,10 @@ class ContinuesBatchBackend(ModeBackend):
     def forward(self, batch_id, is_prefill):
         # special code for return all prompt_logprobs
         output_dict = {}
+        # batch: InferBatch = self.cache[batch_id]        # expr: readonly batch operations, don't pop
         batch: InferBatch = self.cache.pop(batch_id)
+        # print(f"impl [{os.getpid()}] @ {time.time()}: forward({batch_id=}, {is_prefill=}) {batch.batch_id = }, {id(batch) = }, {batch.request_ids = }", flush=True)
+        # print(f"impl [{os.getpid()}] @ {time.time()}: forward({batch_id=}, {is_prefill=}) {batch.batch_id = }, {id(batch) = }, {batch.request_ids = }, ({self.cache=}, {id(self.cache)=})", flush=True)
         if is_prefill:
             kwargs, run_reqs = prepare_prefill_inputs(batch, self.radix_cache, self.is_multimodal)
         else:

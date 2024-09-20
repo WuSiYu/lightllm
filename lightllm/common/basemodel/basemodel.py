@@ -33,7 +33,9 @@ class TpPartBaseModel:
     splitfuse_infer_state_class = SplitFuseInferStateInfo
 
     def __init__(self, kvargs):
+        print(f"[{os.getpid()}] TpPartBaseModel __init__ {kvargs = } {torch.cuda.current_device()}")
         self.tp_rank_ = kvargs["tp_rank"]
+        self.gpu_id_ = kvargs["gpu_id"]
         self.world_size_ = kvargs["world_size"]
         self.weight_dir_ = kvargs["weight_dir"]
         self.max_total_token_num = kvargs["max_total_token_num"]

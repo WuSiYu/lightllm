@@ -6,6 +6,7 @@ import threading
 class BaseLayerWeight:
     def __init__(self):
         self.tp_rank_ = None
+        self.gpu_id_ = None
         self.lock = threading.Lock()
 
     def load_hf_weights(self, weights):
@@ -28,10 +29,10 @@ class BaseLayerWeight:
         pass
 
     def _cuda(self, cpu_tensor):
-        if self.tp_rank_ is None:
+        if self.gpu_id_ is None:
             return cpu_tensor.contiguous().to(self.data_type_).cuda()
         else:
-            return cpu_tensor.contiguous().to(self.data_type_).cuda(self.tp_rank_)
+            return cpu_tensor.contiguous().to(self.data_type_).cuda(self.gpu_id_)
 
     def _try_cat_to(self, source_tensor_names, dest_name, cat_dim, handle_func=None):
         if all(hasattr(self, src_name) for src_name in source_tensor_names) and not hasattr(self, dest_name):

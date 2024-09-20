@@ -1,4 +1,6 @@
 import copy
+import itertools
+import json
 import time
 import uuid
 import torch
@@ -9,7 +11,7 @@ import rpyc
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import zmq
 import zmq.asyncio
-from typing import Dict, List, Optional
+from typing import Coroutine, Dict, List, Tuple, Union, Literal, Optional
 from ..sampling_params import SamplingParams
 from ..io_struct import Req, NormalReq, SplitFuseReq, Batch
 from ..multimodal_params import MultimodalParams
@@ -30,12 +32,75 @@ from lightllm.server.metrics.manager import MetricClient
 
 logger = init_logger(__name__)
 
+def DeDupPrinter(log_func=print):
+    last_print_ = f"DeDupPrinter({log_func=})"
+    last_print_n_ = 1
+    def print_(*args, sep=' ', **kargs):
+        nonlocal last_print_, last_print_n_
+        string = sep.join(map(str, args))
+        if last_print_ != string:
+            if last_print_n_ > 1:
+                if last_print_n_ > 2:
+                    print(f"({last_print_n_-2} same line omitted)")
+                print(last_print_)
+            print(string, **kargs)
+            last_print_n_ = 1
+            last_print_ = string
+        else:
+            last_print_n_ += 1
+    return print_
+
+print_ = DeDupPrinter()
+
+cnt_ = itertools.count()
+
+
+class ModelInstanceHandle():
+    def __init__(self, inital_mode: Literal["prefill", "decode"], gpu_list: Tuple[int]):
+        self.state = inital_mode
+        self.gpu_list = gpu_list
+        self.world_size = len(gpu_list)
+        self.dist = f"tp{self.world_size}"    # tp only for now
+        self.model_rpcs: List[ModelRpcClient] = []
+        self.batch: Optional[Batch] = None
+        self._batch_lock: Union[asyncio.Lock, None] = None      # lazy init, lock must created in same event_loop when python <= 3.9
+        self._batch_send_pending: List[Batch] = []  # for prefill inst only
+        self.current_task = {"compute": None, "io": None}
+
+    def get_batch_lock(self):
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+        return self._batch_lock
+
+    def __repr__(self) -> str:
+        return f"MODEL_INST <{self.state}> @ GPU{self.gpu_list}, batch={self.batch.batch_id if self.batch is not None else 'N/A'}, current_task={[k for k, v in self.current_task.items() if v is not None]})"
+        # return f"{self.__class__.__name__} @ {id(self)} ({self.state = }, {self.gpu_list = }, {self.dist}, batch={id(self.batch) if self.batch is not None else None}, current_task={[k for k, v in self.current_task.items() if v is not None]})"
+        # return f"{self.__class__.__name__} @ {id(self)} ({self.state = }, {self.gpu_list = }, {self.dist}, {self.model_rpcs}, {self.batch}, {self.current_task = })"
+
+
+# dist_config:  {"prefill": [(0, 1), (2, 3), (8, 9, 10, 11)], "decode": [(4, 5, 6, 7), (12, 13, 14, 15)]}
+# globle rank:  0   1   2   3   4   5   6   7   8   9   10  11  12  13  14  15
+# node rank:    0   0   0   0   0   0   0   0   1   1   1   1   1   1   1   1           (0 is master node)
+# local rank:   0   1   0   1   0   1   2   3   0   1   2   3   0   1   2   3
+# gpu_id:       0   1   2   3   4   5   6   7   0   1   2   3   4   5   6   7
 
 class RouterManager:
     def __init__(self, args, router_port, detokenization_port, model_rpc_ports, metric_port):
         self.args = args
+        self.node_rank: int = args.dist_node_rank
+        self.node_count: int = args.dist_node_count
+        self.master_addr: str = args.dist_master_addr
+        self.gpu_per_node: int = args.dist_gpu_per_node
+        self.model_instences: List[ModelInstanceHandle] = []
+
+        _default = {"prefill": [(0, 1), (2, 3)], "decode": [(4, 5, 6, 7)]}
+
+        self.local_dist_config = json.loads(args.dist_node_init_override) if args.dist_node_init_override else _default
+        logger.info(f"init with {self.local_dist_config = }")
+        _gpus = [g for type, gpus_list in self.local_dist_config.items() for gpus in gpus_list for g in gpus]
+        assert all(gpu_id < self.gpu_per_node * self.node_count for gpu_id in _gpus)
+
         self.model_weightdir = args.model_dir
-        self.world_size = args.tp
         self.load_way = args.load_way
         self.mode = args.mode
         self.max_total_token_num = args.max_total_token_num
@@ -59,11 +124,12 @@ class RouterManager:
         self.max_wait_tokens = args.router_max_wait_tokens
 
         context = zmq.asyncio.Context(2)
-        self.recv_from_httpserver = context.socket(zmq.PULL)
-        self.recv_from_httpserver.bind(f"tcp://127.0.0.1:{router_port}")
+        if self.node_rank == 0:
+            self.recv_from_httpserver = context.socket(zmq.PULL)
+            self.recv_from_httpserver.bind(f"tcp://127.0.0.1:{router_port}")
 
         self.send_to_detokenization = context.socket(zmq.PUSH)
-        self.send_to_detokenization.connect(f"tcp://127.0.0.1:{detokenization_port}")
+        self.send_to_detokenization.connect(f"tcp://{self.master_addr}:{detokenization_port}")
         self.model_rpc_ports = model_rpc_ports
 
         self.is_splitfuse_mode = args.splitfuse_mode
@@ -74,38 +140,67 @@ class RouterManager:
         return
 
     async def wait_to_model_ready(self):
+
         # 初始化模型
-        self.model_rpcs: List[ModelRpcClient] = []
-        for rank_id in range(self.world_size):
-            rpc_model = await start_model_process(port=self.model_rpc_ports[rank_id], world_size=self.world_size)
-            self.model_rpcs.append(rpc_model)
-
+        # self.model_rpcs: List[ModelRpcClient] = []
         init_model_ret = []
-        for rank_id in range(self.world_size):  # async init model process
-            kvargs = {
-                "rank_id": rank_id,
-                "world_size": self.world_size,
-                "weight_dir": self.model_weightdir,
-                "load_way": self.load_way,
-                "max_total_token_num": self.max_total_token_num,
-                "mode": self.mode,
-                "max_req_num": self.args.running_max_req_size + 8,
-                "max_seq_length": self.args.max_req_total_len + 8,  # 留一点余量
-                "nccl_port": self.args.nccl_port,
-                "is_splitfuse_mode": self.is_splitfuse_mode,
-                "splitfuse_block_size": self.splitfuse_block_size,
-                "is_token_healing": self.args.token_healing_mode,
-                "return_all_prompt_logprobs": self.args.return_all_prompt_logprobs,
-                "use_reward_model": self.args.use_reward_model,
-                "use_dynamic_prompt_cache": self.args.use_dynamic_prompt_cache,
-                "data_type": self.args.data_type,
-                "eos_id": self.eos_id,
-                "beam_mode": self.args.beam_mode,
-                "diverse_mode": self.args.diverse_mode,
-            }
-            init_model_ret.append(self.model_rpcs[rank_id].init_model(kvargs))
+        model_rpc_ports_iter = iter(self.model_rpc_ports)
+        for instance_mode, instances_gpus_list in self.local_dist_config.items():
+            print(f"--{instance_mode = }, {instances_gpus_list = }")
 
+            for gpu_list in instances_gpus_list:    # global gpu index
+                print(f"----{gpu_list = }")
+                # per model instance
+
+                model_instence = ModelInstanceHandle(
+                    inital_mode=instance_mode, gpu_list=gpu_list
+                )
+
+                for local_rank, global_rank in enumerate(gpu_list):
+                    print(f"------{local_rank = }, {global_rank = }")
+                    print()
+                    model_rpc_client = await start_model_process(port=next(model_rpc_ports_iter))
+                    model_instence.model_rpcs.append(model_rpc_client)
+
+                    kvargs = {
+                        "inital_mode": instance_mode,
+                        "local_rank": local_rank,   # local tp rank in the model instance
+                        "local_gpu_id": global_rank % self.gpu_per_node,
+                        "local_world_size": len(gpu_list),
+                        "gpu_per_node": self.gpu_per_node,
+                        "node_rank": self.node_rank,
+                        "node_count": self.node_count,
+                        "global_rank": global_rank,
+                        "global_world_size": self.gpu_per_node * self.node_count,
+                        "master_addr": self.master_addr,
+                        "weight_dir": self.model_weightdir,
+                        "load_way": self.load_way,
+                        "max_total_token_num": self.max_total_token_num,
+                        "mode": self.mode,
+                        "max_req_num": self.args.running_max_req_size + 8,
+                        "max_seq_length": self.args.max_req_total_len + 8,  # 留一点余量
+                        "nccl_port": self.args.nccl_port,
+                        "is_splitfuse_mode": self.is_splitfuse_mode,
+                        "splitfuse_block_size": self.splitfuse_block_size,
+                        "is_token_healing": self.args.token_healing_mode,
+                        "return_all_prompt_logprobs": self.args.return_all_prompt_logprobs,
+                        "use_reward_model": self.args.use_reward_model,
+                        "use_dynamic_prompt_cache": self.args.use_dynamic_prompt_cache,
+                        "data_type": self.args.data_type,
+                        "eos_id": self.eos_id,
+                        "beam_mode": self.args.beam_mode,
+                        "diverse_mode": self.args.diverse_mode,
+                    }
+                    print(f"init model {kvargs = }")
+                    init_model_ret.append(model_rpc_client.init_model(kvargs))
+
+                self.model_instences.append(model_instence)
+
+        print("pre")
+        print(init_model_ret)
+        print(self.model_instences)
         await asyncio.gather(*init_model_ret)
+        print("post")
 
         self.req_queue = build_req_queue(self.args, self)
         logger.info(f"use req queue {self.req_queue.__class__.__name__}")
@@ -199,9 +294,108 @@ class RouterManager:
                     self.metric_client.gauge_set("lightllm_batch_current_max_tokens", 0.0)
 
             if self.running_batch is None:
-                await asyncio.sleep(0.01)  # 10ms
+                await asyncio.sleep(0.001)  # 1ms
+
+    def _background_task(self, model_instance: ModelInstanceHandle, slot: Literal['compute', 'io'], task: Coroutine, task_name: str = ""):
+        model_instance.current_task[slot] = task
+        async def _task_wrapper():
+            await task
+            print_(f" ==> task {task_name} DONE @ {time.time()}, {slot = }, {model_instance} {task}")
+            model_instance.current_task[slot] = None
+        print_(f" ==> task {task_name} START @ {time.time()}, {slot = }, {model_instance} {task}")
+        # asyncio.create_task(_task_wrapper(), name=task_name)
+        asyncio.create_task(_task_wrapper(), name=task_name)
 
     async def _step(self):
+        """
+        事件处理循环
+        """
+        print_("----_step")
+        step_cnt = next(cnt_)
+        for model_instance in self.model_instences:
+            # print("+---inst", model_instance)
+            if model_instance.state == 'prefill':
+                if model_instance.current_task["compute"] is None and self.req_queue.waiting_req_list:
+                    print_(f"    +---prefill inst compute free", model_instance)
+                    print_(f"    +---and has waiting {len(self.req_queue.waiting_req_list)} reqs")
+                    async def _task(model_instance: ModelInstanceHandle):
+                        task_name = asyncio.current_task().get_name()
+
+                        # tmp req_queue logic
+                        MAX_REQ = 10
+                        reqs = self.req_queue.waiting_req_list[:MAX_REQ]
+                        self.req_queue.waiting_req_list = self.req_queue.waiting_req_list[len(reqs):]
+
+                        new_batch = Batch(uuid.uuid4().hex, reqs)
+                        self.metric_client.histogram_observe("lightllm_batch_next_size", len(new_batch.reqs))
+                        for req in new_batch.reqs:
+                            self.metric_client.histogram_observe(
+                                "lightllm_request_queue_duration_bucket", time.time() - req.start_time
+                            )
+                        # self.stats_tool.count_prompt_tokens(new_batch)
+                        assert model_instance.batch is None
+                        model_instance.batch = new_batch
+                        print_(f"    ==> _task({task_name}) prefill reqs req_id={[req.request_id for req in model_instance.batch.reqs]}")
+
+                        await self._prefill_batch(model_instance, model_instance.batch)
+                        if not model_instance.batch.is_clear():
+                            model_instance._batch_send_pending.append(model_instance.batch)
+                        model_instance.batch = None
+
+                    task = _task(model_instance)
+                    print_(f"    +---_background_task new prefill compute task: {model_instance} {task}")
+                    self._background_task(model_instance=model_instance, slot='compute', task=task, task_name=f"prefill_{step_cnt}")
+
+                if model_instance.current_task["io"] is None and model_instance._batch_send_pending:
+                    print_(f"    +---prefill inst io free", model_instance)
+                    print_(f"    +---{len(model_instance._batch_send_pending) = }")
+                    async def _task(model_instance: ModelInstanceHandle):
+                        task_name = asyncio.current_task().get_name()
+
+                        batch_to_send = model_instance._batch_send_pending.pop(0)
+                        recv_inst = await self.get_recv_decode_inst(batch_to_send)
+                        print_(f"    ==> _task({task_name}) send kv reqs req_id={[req.request_id for req in batch_to_send.reqs]}")
+                        await self._transfer_kv_batch(model_instance, batch_to_send, recv_inst)
+                        await self._remove_batch(model_instance, batch_to_send)
+                        if recv_inst.batch is None:
+                            recv_inst.batch = batch_to_send
+                        else:
+                            print_(f"    ==> _task({task_name}) send kv merge reqs: {[req.request_id for req in recv_inst.batch.reqs]} with {[req.request_id for req in batch_to_send.reqs]}")
+                            async with recv_inst.get_batch_lock():
+                                recv_inst.batch.merge(batch_to_send)        # local batch merge (this line) must before remote call (line below)
+                                await self._merge_batch(recv_inst, recv_inst.batch, batch_to_send)
+
+                    task = _task(model_instance)
+                    print_(f"    +---_background_task new prefill io task: {model_instance} {task}")
+                    self._background_task(model_instance=model_instance, slot='io', task=task, task_name=f"send_kv_{step_cnt}")
+
+
+            elif model_instance.state == 'decode':
+                if model_instance.current_task["compute"] is None and model_instance.batch:
+                    print_(f"    +---decode inst compute free", model_instance)
+                    async def _task(model_instance: ModelInstanceHandle):
+                        task_name = asyncio.current_task().get_name()
+
+                        # self.stats_tool.count_output_tokens(model_instance.batch)
+                        # print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)}")
+                        print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)} req_id={[req.request_id for req in model_instance.batch.reqs]}")
+                        async with model_instance.get_batch_lock():
+                            await self._decode_batch(model_instance, model_instance.batch)
+                        if model_instance.batch.is_clear():
+                            model_instance.batch = None
+
+                    task = _task(model_instance)
+                    print_(f"    +---_background_task new decode {model_instance} compute {task}")
+                    self._background_task(model_instance=model_instance, slot='compute', task=task, task_name=f"decode_{step_cnt}")
+
+
+    async def get_recv_decode_inst(self, batch):
+        #tmp
+        for inst in self.model_instences:
+            if inst.state == 'decode':
+                return inst
+
+    async def _step_old(self):
         """
         事件处理循环
         """
@@ -253,14 +447,15 @@ class RouterManager:
             return
         return
 
-    async def _init_batch(self, batch: Batch):
+    async def _init_batch(self, instance: ModelInstanceHandle, batch: Batch):
         reqs = [r.to_rpc_obj() for r in batch.reqs]
-        rets = [self.model_rpcs[tp_rank].init_batch(batch.batch_id, reqs) for tp_rank in range(self.world_size)]
+        rets = [instance.model_rpcs[tp_rank].init_batch(batch.batch_id, reqs) for tp_rank in range(instance.world_size)]
         ans = await asyncio.gather(*rets)
-        if self.world_size != 1:
-            req_to_req_status = obtain(ans[0])
-        else:
-            req_to_req_status = ans[0]
+        req_to_req_status = obtain(ans[0])
+        # if self.world_size != 1:
+        #     req_to_req_status = obtain(ans[0])
+        # else:
+        #     req_to_req_status = ans[0]
 
         self._update_init_status_to_batch(batch, req_to_req_status)
         for req in batch.reqs:
@@ -276,10 +471,10 @@ class RouterManager:
         logger.debug(f"Init Batch: {batch.simple_log()} \n")
         return
 
-    async def _prefill_batch(self, batch: Batch):
+    async def _prefill_batch(self, instance: ModelInstanceHandle, batch: Batch):
         start_time = time.time()
         self.metric_client.counter_inc("lightllm_batch_inference_count", "prefill")
-        await self._init_batch(batch)
+        await self._init_batch(instance, batch)
         if not self.is_splitfuse_mode:
             # 在 非 splitfuse 模式下，才需要真的执行 prefill 的操作。
             prefill_len = batch.input_tokens()
@@ -291,22 +486,24 @@ class RouterManager:
             es, ee = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             es.record()
             pts = time.time()
-            rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
+            rets = [instance.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(instance.world_size)]
             ans = await asyncio.gather(*rets)
             ee.record()
             pte = time.time()
             torch.cuda.nvtx.range_pop()
             # torch.cuda.nvtx.range_pop()
-            if self.world_size != 1:
-                req_to_out_status = obtain(ans[0])
-            else:
-                req_to_out_status = ans[0]
+            req_to_out_status = obtain(ans[0])
+            # if self.world_size != 1:
+            #     req_to_out_status = obtain(ans[0])
+            # else:
+            #     req_to_out_status = ans[0]
 
             self._update_out_status_to_batch(batch, req_to_out_status)
             unfinished_req_ids, finished_req_ids = batch.mark_and_get_finished_req_and_preupdate_status()
             self._send_to_detokenization_proc(batch, req_to_out_status)
             batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
-            await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
+            await self._handle_finish_req(instance, batch, unfinished_req_ids, finished_req_ids)
+            torch.cuda.synchronize()
             print(f"prefill prof:\t{prefill_len}\t{es.elapsed_time(ee)}")
             print(f"(python time {(pte - pts) * 1000})")
         self.metric_client.histogram_observe(
@@ -314,43 +511,60 @@ class RouterManager:
         )
         return
 
-    async def _decode_batch(self, batch: Batch):
+    async def _transfer_kv_batch(self, sender: ModelInstanceHandle, batch: Batch, receiver: ModelInstanceHandle):
+        for req in batch.reqs:
+            req.req_status = ReqRunStatus.DIST_KV_SENDING
+        reqs = [r.to_rpc_obj() for r in batch.reqs]
+        if sender.world_size == receiver.world_size:
+            await self._init_batch(receiver, batch)
+            rets1 = [sender.model_rpcs[tp_rank].send_kv_batch(batch.batch_id, reqs, receiver.gpu_list[tp_rank]) for tp_rank in range(sender.world_size)]
+            rets2 = [receiver.model_rpcs[tp_rank].recv_kv_batch(batch.batch_id, reqs, sender.gpu_list[tp_rank]) for tp_rank in range(receiver.world_size)]
+            ans = await asyncio.gather(*rets1, *rets2)
+        else:
+            raise NotImplementedError()
+        return
+
+    async def _decode_batch(self, instance: ModelInstanceHandle, batch: Batch):
         start_time = time.time()
         self.metric_client.counter_inc("lightllm_batch_inference_count", "decode")
-        rets = [self.model_rpcs[tp_rank].decode_batch(batch.batch_id) for tp_rank in range(self.world_size)]
+        # async with instance.get_batch_lock():
+        rets = [instance.model_rpcs[tp_rank].decode_batch(batch.batch_id) for tp_rank in range(instance.world_size)]
         ans = await asyncio.gather(*rets)
-        if self.world_size != 1:
-            req_to_out_status = obtain(ans[0])
-        else:
-            req_to_out_status = ans[0]
+        req_to_out_status = obtain(ans[0])
+        # if self.world_size != 1:
+        #     req_to_out_status = obtain(ans[0])
+        # else:
+        #     req_to_out_status = ans[0]
 
         self._update_out_status_to_batch(batch, req_to_out_status)
         unfinished_req_ids, finished_req_ids = batch.mark_and_get_finished_req_and_preupdate_status()
         self._send_to_detokenization_proc(batch, req_to_out_status)
         batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
-        await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
+
+        await self._handle_finish_req(instance, batch, unfinished_req_ids, finished_req_ids)
         self.metric_client.histogram_observe(
             "lightllm_batch_inference_duration_bucket", time.time() - start_time, "decode"
         )
         return
 
-    async def _filter_batch(self, batch: Batch, unfinished_req_ids, finished_req_ids: List):
+    async def _filter_batch(self, instance: ModelInstanceHandle, batch: Batch, unfinished_req_ids, finished_req_ids: List):
+        print_(f"{asyncio.current_task().get_name()} {finished_req_ids=}")
         rets = [
-            self.model_rpcs[tp_rank].filter_batch(batch.batch_id, unfinished_req_ids, finished_req_ids)
-            for tp_rank in range(self.world_size)
+            instance.model_rpcs[tp_rank].filter_batch(batch.batch_id, unfinished_req_ids, finished_req_ids)
+            for tp_rank in range(instance.world_size)
         ]
         await asyncio.gather(*rets)
         return
 
-    async def _merge_batch(self, batch1, batch2):
+    async def _merge_batch(self, instance: ModelInstanceHandle, batch1, batch2):
         rets = [
-            self.model_rpcs[tp_rank].merge_batch(batch1.batch_id, batch2.batch_id) for tp_rank in range(self.world_size)
+            instance.model_rpcs[tp_rank].merge_batch(batch1.batch_id, batch2.batch_id) for tp_rank in range(instance.world_size)
         ]
         await asyncio.gather(*rets)
         return
 
-    async def _remove_batch(self, batch):
-        rets = [self.model_rpcs[tp_rank].remove_batch(batch.batch_id) for tp_rank in range(self.world_size)]
+    async def _remove_batch(self, instance: ModelInstanceHandle, batch):
+        rets = [instance.model_rpcs[tp_rank].remove_batch(batch.batch_id) for tp_rank in range(instance.world_size)]
         await asyncio.gather(*rets)
         return
 
@@ -362,12 +576,12 @@ class RouterManager:
         await asyncio.gather(*rets)
         return
 
-    async def _handle_finish_req(self, batch: Batch, unfinished_req_ids, finished_req_ids):
+    async def _handle_finish_req(self, instance: ModelInstanceHandle, batch: Batch, unfinished_req_ids, finished_req_ids):
         if len(finished_req_ids) != 0:
             if batch.is_clear():
-                await self._remove_batch(batch)
+                await self._remove_batch(instance, batch)
             else:
-                await self._filter_batch(batch, unfinished_req_ids, finished_req_ids)
+                await self._filter_batch(instance, batch, unfinished_req_ids, finished_req_ids)
         return
 
     def _filter_runing_batch(self):
@@ -390,12 +604,16 @@ class RouterManager:
             extral_info,
         ) in req_to_out_status.items():
             req: Req = batch.id_to_reqs[req_id]
+            # try:
+            #     req: Req = batch.id_to_reqs[req_id]
+            # except KeyError:
+            #     print_(f"RMUBKE: task {asyncio.current_task().get_name()} req {req_id=} not found, this should not happend, {req_to_out_status=}")
             req.req_status = req_status
             req.cur_kv_len = cur_kv_len
             req.cur_output_len = cur_output_len
             # 暂时不维护 output_ids 和 output_metadata_list
-            # for (new_token_id, new_gen_metadata) in token_info_list:
-            #     req.output_ids.append(new_token_id)
+            for (new_token_id, new_gen_metadata) in token_info_list:
+                req.output_ids.append(new_token_id)
             #     req.output_metadata_list.append(new_gen_metadata)
             # 当没有被 aborted 的时候，才更新请求状态。
             if not req.finish_status.is_aborted():

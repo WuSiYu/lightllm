@@ -1,4 +1,5 @@
 import asyncio
+import os
 import rpyc
 from datetime import timedelta
 from typing import Dict, List, Tuple
@@ -18,10 +19,11 @@ logger = init_logger(__name__)
 
 class ModelRpcServer(rpyc.Service):
     def exposed_init_model(self, kvargs):
-        self.world_size = kvargs["world_size"]
+        self.world_size = 114514
+        # self.world_size = kvargs["world_size"]
         if self.world_size != 1:
             kvargs = obtain(kvargs)
-            self.world_size = kvargs["world_size"]
+            # self.world_size = kvargs["world_size"]
 
         is_splitfuse_mode = kvargs.get("is_splitfuse_mode", False)
         return_all_prompt_logprobs = kvargs.get("return_all_prompt_logprobs", False)
@@ -44,6 +46,7 @@ class ModelRpcServer(rpyc.Service):
             self.backend = ContinuesBatchBackend()
 
         logger.info(f"use {self.backend.__class__.__name__}")
+        print(f"[{os.getpid()}] init model {kvargs = }")
         self.backend.init_model(kvargs)
 
         return
@@ -66,6 +69,18 @@ class ModelRpcServer(rpyc.Service):
         if self.world_size != 1:
             batch_id = obtain(batch_id)
         return self.backend.decode_batch(batch_id)
+
+    # @calculate_time(show=False, min_cost_ms=300)
+    def exposed_send_kv_batch(self, batch_id, reqs, target):
+        if self.world_size != 1:
+            batch_id, reqs, target = obtain(batch_id), obtain(reqs), obtain(target)
+        return self.backend.send_kv_batch(batch_id, reqs, target)
+
+    # @calculate_time(show=True, min_cost_ms=200)
+    def exposed_recv_kv_batch(self, batch_id, reqs, target):
+        if self.world_size != 1:
+            batch_id, reqs, target = obtain(batch_id), obtain(reqs), obtain(target)
+        return self.backend.recv_kv_batch(batch_id, reqs, target)
 
     # @calculate_time(show=True, min_cost_ms=0.1)
     def exposed_filter_batch(self, batch_id, req_id_list, finished_req_id_list):
@@ -99,11 +114,10 @@ class ModelRpcServer(rpyc.Service):
 
 
 class ModelRpcClient:
-    def __init__(self, model_rpc, world_size, rpc_server_process=None):
+    def __init__(self, model_rpc, rpc_server_process=None):
         self.model: ModelRpcServer = model_rpc
-        self.world_size = world_size
         self.rpc_server_process = rpc_server_process
-        self.use_rpc = self.world_size != 1
+        self.use_rpc = True
         if self.use_rpc:
 
             def async_wrap(f):
@@ -121,6 +135,8 @@ class ModelRpcClient:
             self._add_batch = async_wrap(self.model.add_batch)
             self._prefill_batch = async_wrap(self.model.prefill_batch)
             self._decode_batch = async_wrap(self.model.decode_batch)
+            self._send_kv_batch = async_wrap(self.model.send_kv_batch)
+            self._recv_kv_batch = async_wrap(self.model.recv_kv_batch)
             self._pause_reqs = async_wrap(self.model.pause_reqs)
             self._filter_batch = async_wrap(self.model.filter_batch)
             self._merge_batch = async_wrap(self.model.merge_batch)
@@ -130,6 +146,8 @@ class ModelRpcClient:
             self._add_batch = self.model.exposed_add_batch
             self._prefill_batch = self.model.exposed_prefill_batch
             self._decode_batch = self.model.exposed_decode_batch
+            self._send_kv_batch = self.model.exposed_send_kv_batch
+            self._recv_kv_batch = self.model.exposed_recv_kv_batch
             self._pause_reqs = self.model.exposed_pause_reqs
             self._filter_batch = self.model.exposed_filter_batch
             self._merge_batch = self.model.exposed_merge_batch
@@ -160,6 +178,20 @@ class ModelRpcClient:
 
     async def decode_batch(self, batch_id):
         ans = self._decode_batch(batch_id)
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
+
+    async def send_kv_batch(self, batch_id, reqs, targrt_rank):
+        ans = self._send_kv_batch(batch_id, reqs, targrt_rank)
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
+
+    async def recv_kv_batch(self, batch_id, reqs, targrt_rank):
+        ans = self._recv_kv_batch(batch_id, reqs, targrt_rank)
         if self.use_rpc:
             return await ans
         else:
@@ -208,14 +240,15 @@ def _init_env(port):
     from rpyc.utils.server import ThreadedServer
 
     t = ThreadedServer(ModelRpcServer(), port=port, protocol_config={"allow_pickle": True})
+    print(f"[{os.getpid()}] ModelRpcServer start")
     t.start()
     return
 
 
-async def start_model_process(port, world_size):
-    # 单卡时不使用 rpc
-    if world_size == 1:
-        return ModelRpcClient(ModelRpcServer(), world_size)
+async def start_model_process(port): #, world_size):
+    # # 单卡时不使用 rpc
+    # if world_size == 1:
+    #     return ModelRpcClient(ModelRpcServer(), world_size)
 
     import multiprocessing
 
@@ -234,4 +267,4 @@ async def start_model_process(port, world_size):
         raise Exception("init rpc env error!")
 
     assert proc.is_alive()
-    return ModelRpcClient(con.root, world_size, rpc_server_process=proc)
+    return ModelRpcClient(con.root, rpc_server_process=proc)

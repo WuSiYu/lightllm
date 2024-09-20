@@ -16,7 +16,7 @@ from lightllm.utils.log_utils import init_logger
 from lightllm.server.req_id_generator import convert_sub_id_to_group_id
 
 logger = init_logger(__name__)
-requests_mapping = {}
+requests_mapping: Dict[int, 'InferReq'] = {}
 group_mapping = {}
 
 
@@ -76,7 +76,7 @@ class InferReq:
         self.multimodal_params = multimodal_params
         self.req_idx = req_idx
         self.prompt_len = prompt_len
-        self.input_token_ids = input_token_ids
+        self.input_token_ids: List[int] = input_token_ids
         self.req_status = req_status
         self.cur_kv_len = 0  # 当前已经占用掉 token 现存的 kv len 长度
         self.shared_kv_node = None
@@ -259,7 +259,7 @@ class InferBatch:
                 sampling_param = r["sampling_param"]
                 multimodal_params = r["multimodal_params"]
                 sampling_param["vocab_size"] = vocab_size
-                assert r["req_status"] == ReqRunStatus.WAIT_IN_QUEUE
+                assert r["req_status"] in (ReqRunStatus.WAIT_IN_QUEUE, ReqRunStatus.DIST_KV_SENDING)
                 group_req_id = r["group_req_id"]
                 r_obj = InferReq(
                     r_id,
@@ -366,6 +366,7 @@ class InferBatch:
         if len(requests_mapping) == 0:
             raise ValueError("Batch must have at least one request")
         if len(request_ids) == len(self):
+            assert len(finished_request_ids) == 0
             return self
         if len(request_ids) == 0:
             self.free_self()

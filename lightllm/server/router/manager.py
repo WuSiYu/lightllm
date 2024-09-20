@@ -56,21 +56,36 @@ cnt_ = itertools.count()
 
 
 class ModelInstanceHandle():
-    def __init__(self, inital_mode: Literal["prefill", "decode"], gpu_list: Tuple[int]):
+    def __init__(self, inital_mode: Literal["prefill", "decode"], gpu_list: Tuple[int], kv_token_capacity: int):
         self.state = inital_mode
         self.gpu_list = gpu_list
         self.world_size = len(gpu_list)
+        self.kv_token_capacity = kv_token_capacity
         self.dist = f"tp{self.world_size}"    # tp only for now
         self.model_rpcs: List[ModelRpcClient] = []
         self.batch: Optional[Batch] = None
         self._batch_lock: Union[asyncio.Lock, None] = None      # lazy init, lock must created in same event_loop when python <= 3.9
         self._batch_send_pending: List[Batch] = []  # for prefill inst only
+        self._batch_sending: Optional[Batch] = None     # for prefill inst only
+        self._batch_receving: Optional[Batch] = None    # for docode inst only
         self.current_task = {"compute": None, "io": None}
 
     def get_batch_lock(self):
         if self._batch_lock is None:
             self._batch_lock = asyncio.Lock()
         return self._batch_lock
+
+    def get_used_kv_token(self):
+        used_kv_token = 0
+        if self.batch:
+            used_kv_token += sum(req.get_used_tokens() for req in self.batch.reqs)
+        if self._batch_send_pending:
+            used_kv_token += sum(req.get_used_tokens() for b in self._batch_send_pending for req in b.reqs)
+        if self._batch_sending:
+            used_kv_token += sum(req.get_used_tokens() for req in self._batch_sending.reqs)
+        if self._batch_receving:
+            used_kv_token += sum(req.get_used_tokens() for req in self._batch_receving.reqs)
+        return used_kv_token
 
     def __repr__(self) -> str:
         return f"MODEL_INST <{self.state}> @ GPU{self.gpu_list}, batch={self.batch.batch_id if self.batch is not None else 'N/A'}, current_task={[k for k, v in self.current_task.items() if v is not None]})"
@@ -153,7 +168,7 @@ class RouterManager:
                 # per model instance
 
                 model_instence = ModelInstanceHandle(
-                    inital_mode=instance_mode, gpu_list=gpu_list
+                    inital_mode=instance_mode, gpu_list=gpu_list, kv_token_capacity=self.max_total_token_num
                 )
 
                 for local_rank, global_rank in enumerate(gpu_list):
@@ -318,13 +333,22 @@ class RouterManager:
                 if model_instance.current_task["compute"] is None and self.req_queue.waiting_req_list:
                     print_(f"    +---prefill inst compute free", model_instance)
                     print_(f"    +---and has waiting {len(self.req_queue.waiting_req_list)} reqs")
-                    async def _task(model_instance: ModelInstanceHandle):
+                    async def _task(inst: ModelInstanceHandle):
                         task_name = asyncio.current_task().get_name()
 
                         # tmp req_queue logic
-                        MAX_REQ = 10
-                        reqs = self.req_queue.waiting_req_list[:MAX_REQ]
-                        self.req_queue.waiting_req_list = self.req_queue.waiting_req_list[len(reqs):]
+                        # MAX_REQ = 10
+                        # for _ in range(MAX_REQ):
+                        #     if not self.req_queue.waiting_req_list:
+                        #         break
+
+                        # reqs = self.req_queue.waiting_req_list[:MAX_REQ]
+                        # self.req_queue.waiting_req_list = self.req_queue.waiting_req_list[len(reqs):]
+
+                        reqs = await self.inst_fetch_prefill_reqs_naive(inst, self.req_queue.waiting_req_list)
+                        if not reqs:
+                            print_("    ==> _task({task_name}) WARNING: FAILED, prefill inst is too full for prefill")
+                            return
 
                         new_batch = Batch(uuid.uuid4().hex, reqs)
                         self.metric_client.histogram_observe("lightllm_batch_next_size", len(new_batch.reqs))
@@ -333,14 +357,14 @@ class RouterManager:
                                 "lightllm_request_queue_duration_bucket", time.time() - req.start_time
                             )
                         # self.stats_tool.count_prompt_tokens(new_batch)
-                        assert model_instance.batch is None
-                        model_instance.batch = new_batch
-                        print_(f"    ==> _task({task_name}) prefill reqs req_id={[req.request_id for req in model_instance.batch.reqs]}")
+                        assert inst.batch is None
+                        inst.batch = new_batch
+                        print_(f"    ==> _task({task_name}) prefill reqs req_id={[req.request_id for req in inst.batch.reqs]}")
 
-                        await self._prefill_batch(model_instance, model_instance.batch)
-                        if not model_instance.batch.is_clear():
-                            model_instance._batch_send_pending.append(model_instance.batch)
-                        model_instance.batch = None
+                        await self._prefill_batch(inst, inst.batch)
+                        if not inst.batch.is_clear():
+                            inst._batch_send_pending.append(inst.batch)
+                        inst.batch = None
 
                     task = _task(model_instance)
                     print_(f"    +---_background_task new prefill compute task: {model_instance} {task}")
@@ -349,21 +373,34 @@ class RouterManager:
                 if model_instance.current_task["io"] is None and model_instance._batch_send_pending:
                     print_(f"    +---prefill inst io free", model_instance)
                     print_(f"    +---{len(model_instance._batch_send_pending) = }")
-                    async def _task(model_instance: ModelInstanceHandle):
+                    async def _task(inst: ModelInstanceHandle):
                         task_name = asyncio.current_task().get_name()
 
-                        batch_to_send = model_instance._batch_send_pending.pop(0)
-                        recv_inst = await self.get_recv_decode_inst(batch_to_send)
-                        print_(f"    ==> _task({task_name}) send kv reqs req_id={[req.request_id for req in batch_to_send.reqs]}")
-                        await self._transfer_kv_batch(model_instance, batch_to_send, recv_inst)
-                        await self._remove_batch(model_instance, batch_to_send)
+                        assert inst._batch_sending is None
+                        inst._batch_sending = inst._batch_send_pending.pop(0)
+
+                        recv_inst = await self.get_recv_decode_inst(inst._batch_sending)
+                        if recv_inst is None:
+                            print_("    ==> _task({task_name}) WARNING: FAILED, no available decode inst to send, task exit")
+                            inst._batch_send_pending.insert(0, inst._batch_sending)
+                            inst._batch_sending = None
+                            return
+
+                        assert recv_inst._batch_receving is None
+                        recv_inst._batch_receving = inst._batch_sending
+
+                        print_(f"    ==> _task({task_name}) send kv reqs req_id={[req.request_id for req in inst._batch_sending.reqs]}")
+                        await self._transfer_kv_batch(inst, inst._batch_sending, recv_inst)
+                        await self._remove_batch(inst, inst._batch_sending)
                         if recv_inst.batch is None:
-                            recv_inst.batch = batch_to_send
+                            recv_inst.batch = inst._batch_sending
                         else:
-                            print_(f"    ==> _task({task_name}) send kv merge reqs: {[req.request_id for req in recv_inst.batch.reqs]} with {[req.request_id for req in batch_to_send.reqs]}")
+                            print_(f"    ==> _task({task_name}) send kv merge reqs: {[req.request_id for req in recv_inst.batch.reqs]} with {[req.request_id for req in inst._batch_sending.reqs]}")
                             async with recv_inst.get_batch_lock():
-                                recv_inst.batch.merge(batch_to_send)        # local batch merge (this line) must before remote call (line below)
-                                await self._merge_batch(recv_inst, recv_inst.batch, batch_to_send)
+                                recv_inst.batch.merge(inst._batch_sending)        # local batch merge (this line) must before remote call (line below)
+                                await self._merge_batch(recv_inst, recv_inst.batch, inst._batch_sending)
+                        inst._batch_sending = None
+                        recv_inst._batch_receving = None
 
                     task = _task(model_instance)
                     print_(f"    +---_background_task new prefill io task: {model_instance} {task}")
@@ -373,27 +410,52 @@ class RouterManager:
             elif model_instance.state == 'decode':
                 if model_instance.current_task["compute"] is None and model_instance.batch:
                     print_(f"    +---decode inst compute free", model_instance)
-                    async def _task(model_instance: ModelInstanceHandle):
+                    async def _task(inst: ModelInstanceHandle):
                         task_name = asyncio.current_task().get_name()
 
                         # self.stats_tool.count_output_tokens(model_instance.batch)
                         # print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)}")
-                        print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)} req_id={[req.request_id for req in model_instance.batch.reqs]}")
-                        async with model_instance.get_batch_lock():
-                            await self._decode_batch(model_instance, model_instance.batch)
-                        if model_instance.batch.is_clear():
-                            model_instance.batch = None
+                        print_(f"    ==> _task({task_name}) decode bs={len(inst.batch.reqs)} req_id={[req.request_id for req in inst.batch.reqs]}")
+                        async with inst.get_batch_lock():
+                            await self._decode_batch(inst, inst.batch)
+                        if inst.batch.is_clear():
+                            inst.batch = None
 
                     task = _task(model_instance)
                     print_(f"    +---_background_task new decode {model_instance} compute {task}")
                     self._background_task(model_instance=model_instance, slot='compute', task=task, task_name=f"decode_{step_cnt}")
 
 
-    async def get_recv_decode_inst(self, batch):
+    async def inst_fetch_prefill_reqs_naive(self, model_instance: ModelInstanceHandle, req_queue: List[Req]):
+        MAX_BATCH_TOKEN = 8192
+        reqs_to_prefill: List[Req] = []
+        available_tokens = model_instance.kv_token_capacity - model_instance.get_used_kv_token()
+        available_tokens = min(available_tokens, MAX_BATCH_TOKEN)
+        batched_tokens = 0
+        while req_queue:
+            pending_req_tokens = req_queue[0].input_len
+            if available_tokens >= batched_tokens + pending_req_tokens:
+                reqs_to_prefill.append(req_queue.pop(0))
+                batched_tokens += pending_req_tokens
+            else:
+                break
+        return reqs_to_prefill
+
+
+
+    async def get_recv_decode_inst(self, batch: Batch):
         #tmp
+        MINIMAL_FREE_RATIO = 0.25
+        batch_tokens = sum(req.get_used_tokens() for req in batch.reqs)
+        best_inst, best_ratio = None, MINIMAL_FREE_RATIO
         for inst in self.model_instences:
-            if inst.state == 'decode':
-                return inst
+            if inst.state == 'decode' and inst._batch_receving is None:
+                minimal_needed_token = inst.get_used_kv_token() + batch_tokens
+                free_ratio = 1 - minimal_needed_token / inst.kv_token_capacity
+                if free_ratio > best_ratio:
+                    best_inst, best_ratio = inst, free_ratio
+
+        return best_inst
 
     async def _step_old(self):
         """

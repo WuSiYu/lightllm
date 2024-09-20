@@ -112,6 +112,7 @@ class TpPartBaseModel:
 
     def _init_mem_manager(self):
         assert self.config["num_attention_heads"] % self.world_size_ == 0
+        print("@ _init_mem_manager()", torch.cuda.memory_stats())
         self.mem_manager = MemoryManager(
             self.max_total_token_num,
             dtype=self.data_type,

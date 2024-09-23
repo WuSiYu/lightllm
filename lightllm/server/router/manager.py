@@ -51,9 +51,7 @@ def DeDupPrinter(log_func=print):
     return print_
 
 print_ = DeDupPrinter()
-
-cnt_ = itertools.count()
-
+print_ = lambda *args, **kargs: None
 
 class ModelInstanceHandle():
     def __init__(self, inital_mode: Literal["prefill", "decode"], gpu_list: Tuple[int], kv_token_capacity: int):
@@ -78,12 +76,16 @@ class ModelInstanceHandle():
     def get_used_kv_token(self):
         used_kv_token = 0
         if self.batch:
+            print_("        ==> get_used_kv_token(): self.batch", sum(req.get_used_tokens() for req in self.batch.reqs))
             used_kv_token += sum(req.get_used_tokens() for req in self.batch.reqs)
         if self._batch_send_pending:
+            print_("        ==> get_used_kv_token(): self._batch_send_pending", sum(req.get_used_tokens() for b in self._batch_send_pending for req in b.reqs))
             used_kv_token += sum(req.get_used_tokens() for b in self._batch_send_pending for req in b.reqs)
         if self._batch_sending:
+            print_("        ==> get_used_kv_token(): self._batch_sending", sum(req.get_used_tokens() for req in self._batch_sending.reqs))
             used_kv_token += sum(req.get_used_tokens() for req in self._batch_sending.reqs)
         if self._batch_receving:
+            print_("        ==> get_used_kv_token(): self._batch_receving", sum(req.get_used_tokens() for req in self._batch_receving.reqs))
             used_kv_token += sum(req.get_used_tokens() for req in self._batch_receving.reqs)
         return used_kv_token
 
@@ -274,62 +276,89 @@ class RouterManager:
     ):
         counter_count = 0
         while True:
-            await self._step()
+            await self._step(counter_count)
             counter_count += 1
-            if self.running_batch is not None:
-                if counter_count % 50 == 0:
-                    token_ratio1 = self.get_used_tokens() / self.max_total_token_num
-                    token_ratio2 = (
-                        self.max_total_token_num - self.shared_can_use_token_num.get_value()
-                    ) / self.max_total_token_num
-                    logger.debug(
-                        f"current batch size: {len(self.running_batch.reqs)} \n"
-                        f"paused req num: {len(self.req_queue.pause_req_dict)} \n"
-                        f"token used ratio: {token_ratio1} not contain prompt cache tree unrefed tokens\n"
-                        f"token used ratio: {token_ratio2} contain prompt cache tree unrefed tokens"
-                    )
-                    self.shared_token_load.set_current_load(token_ratio1)
-                    self.req_queue.update_token_load(self.running_batch)
-                    pass
-                self.stats_tool.print_stats()
-                self.metric_client.gauge_set("lightllm_batch_current_size", len(self.running_batch.reqs))
-                self.metric_client.gauge_set("lightllm_batch_pause_size", len(self.req_queue.pause_req_dict))
-                self.metric_client.gauge_set("lightllm_queue_size", len(self.req_queue.waiting_req_list))
-                self.metric_client.gauge_set(
-                    "lightllm_batch_current_max_tokens",
-                    int(self.shared_token_load.get_dynamic_max_load() * self.max_total_token_num),
-                )
-            else:
-                self.shared_token_load.set_dynamic_max_load(0.0)
-                self.shared_token_load.set_current_load(0.0)
-                if counter_count % 300 == 0:
-                    self.metric_client.gauge_set("lightllm_batch_current_size", 0.0)
-                    self.metric_client.gauge_set("lightllm_batch_pause_size", 0.0)
-                    self.metric_client.gauge_set("lightllm_queue_size", 0.0)
-                    self.metric_client.gauge_set("lightllm_batch_current_max_tokens", 0.0)
+            # if self.running_batch is not None:
+            #     if counter_count % 50 == 0:
+            #         token_ratio1 = self.get_used_tokens() / self.max_total_token_num
+            #         token_ratio2 = (
+            #             self.max_total_token_num - self.shared_can_use_token_num.get_value()
+            #         ) / self.max_total_token_num
+            #         logger.debug(
+            #             f"current batch size: {len(self.running_batch.reqs)} \n"
+            #             f"paused req num: {len(self.req_queue.pause_req_dict)} \n"
+            #             f"token used ratio: {token_ratio1} not contain prompt cache tree unrefed tokens\n"
+            #             f"token used ratio: {token_ratio2} contain prompt cache tree unrefed tokens"
+            #         )
+            #         self.shared_token_load.set_current_load(token_ratio1)
+            #         self.req_queue.update_token_load(self.running_batch)
+            #         pass
+            #     self.stats_tool.print_stats()
+            #     self.metric_client.gauge_set("lightllm_batch_current_size", len(self.running_batch.reqs))
+            #     self.metric_client.gauge_set("lightllm_batch_pause_size", len(self.req_queue.pause_req_dict))
+            #     self.metric_client.gauge_set("lightllm_queue_size", len(self.req_queue.waiting_req_list))
+            #     self.metric_client.gauge_set(
+            #         "lightllm_batch_current_max_tokens",
+            #         int(self.shared_token_load.get_dynamic_max_load() * self.max_total_token_num),
+            #     )
+            # else:
+            #     self.shared_token_load.set_dynamic_max_load(0.0)
+            #     self.shared_token_load.set_current_load(0.0)
+            #     if counter_count % 300 == 0:
+            #         self.metric_client.gauge_set("lightllm_batch_current_size", 0.0)
+            #         self.metric_client.gauge_set("lightllm_batch_pause_size", 0.0)
+            #         self.metric_client.gauge_set("lightllm_queue_size", 0.0)
+            #         self.metric_client.gauge_set("lightllm_batch_current_max_tokens", 0.0)
 
-            if self.running_batch is None:
-                await asyncio.sleep(0.001)  # 1ms
+            # if self.running_batch is None:
+            #     await asyncio.sleep(0.001)  # 1ms
 
     def _background_task(self, model_instance: ModelInstanceHandle, slot: Literal['compute', 'io'], task: Coroutine, task_name: str = ""):
         model_instance.current_task[slot] = task
         async def _task_wrapper():
-            await task
+            with torch.cuda.nvtx.range(task_name):
+                await task
             print_(f" ==> task {task_name} DONE @ {time.time()}, {slot = }, {model_instance} {task}")
             model_instance.current_task[slot] = None
         print_(f" ==> task {task_name} START @ {time.time()}, {slot = }, {model_instance} {task}")
         # asyncio.create_task(_task_wrapper(), name=task_name)
         asyncio.create_task(_task_wrapper(), name=task_name)
 
-    async def _step(self):
+    async def _step(self, step_cnt):
         """
         事件处理循环
         """
         print_("----_step")
-        step_cnt = next(cnt_)
+
+        await asyncio.sleep(0)    # let background tasks to run
+
         for model_instance in self.model_instences:
-            # print("+---inst", model_instance)
-            if model_instance.state == 'prefill':
+            await asyncio.sleep(0)    # let background tasks to run
+
+            # print_("+---inst", model_instance)
+
+            ### DECODE
+            if model_instance.state == 'decode':
+                if model_instance.current_task["compute"] is None and model_instance.batch:
+                    print_(f"    +---decode inst compute free", model_instance)
+                    async def _task(inst: ModelInstanceHandle):
+                        task_name = asyncio.current_task().get_name()
+
+                        # self.stats_tool.count_output_tokens(model_instance.batch)
+                        # print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)}")
+                        print_(f"    ==> _task({task_name}) decode bs={len(inst.batch.reqs)} req_id={[req.request_id for req in inst.batch.reqs]}")
+                        async with inst.get_batch_lock():
+                            with torch.cuda.nvtx.range(f"_decode_batch gpu={inst.gpu_list} bs={len(inst.batch.reqs)}"):
+                                await self._decode_batch(inst, inst.batch)
+                        if inst.batch.is_clear():
+                            inst.batch = None
+
+                    task = _task(model_instance)
+                    print_(f"    +---_background_task new decode {model_instance} compute {task}")
+                    self._background_task(model_instance=model_instance, slot='compute', task=task, task_name=f"decode_{step_cnt}")
+
+            ### PREFILL
+            elif model_instance.state == 'prefill':
                 if model_instance.current_task["compute"] is None and self.req_queue.waiting_req_list:
                     print_(f"    +---prefill inst compute free", model_instance)
                     print_(f"    +---and has waiting {len(self.req_queue.waiting_req_list)} reqs")
@@ -407,29 +436,11 @@ class RouterManager:
                     self._background_task(model_instance=model_instance, slot='io', task=task, task_name=f"send_kv_{step_cnt}")
 
 
-            elif model_instance.state == 'decode':
-                if model_instance.current_task["compute"] is None and model_instance.batch:
-                    print_(f"    +---decode inst compute free", model_instance)
-                    async def _task(inst: ModelInstanceHandle):
-                        task_name = asyncio.current_task().get_name()
-
-                        # self.stats_tool.count_output_tokens(model_instance.batch)
-                        # print_(f"    ==> _task({task_name}) decode bs={len(model_instance.batch.reqs)}")
-                        print_(f"    ==> _task({task_name}) decode bs={len(inst.batch.reqs)} req_id={[req.request_id for req in inst.batch.reqs]}")
-                        async with inst.get_batch_lock():
-                            await self._decode_batch(inst, inst.batch)
-                        if inst.batch.is_clear():
-                            inst.batch = None
-
-                    task = _task(model_instance)
-                    print_(f"    +---_background_task new decode {model_instance} compute {task}")
-                    self._background_task(model_instance=model_instance, slot='compute', task=task, task_name=f"decode_{step_cnt}")
-
-
     async def inst_fetch_prefill_reqs_naive(self, model_instance: ModelInstanceHandle, req_queue: List[Req]):
         MAX_BATCH_TOKEN = 8192
         reqs_to_prefill: List[Req] = []
         available_tokens = model_instance.kv_token_capacity - model_instance.get_used_kv_token()
+        print_(f"        +---fetch_prefill: available_tokens {available_tokens} / {model_instance.kv_token_capacity}")
         available_tokens = min(available_tokens, MAX_BATCH_TOKEN)
         batched_tokens = 0
         while req_queue:
@@ -439,6 +450,8 @@ class RouterManager:
                 batched_tokens += pending_req_tokens
             else:
                 break
+
+        print_(f"        +---fetch_prefill: done, {batched_tokens = }, reqs_to_prefill (id): {[req.request_id for req in reqs_to_prefill]}")
         return reqs_to_prefill
 
 
@@ -450,11 +463,14 @@ class RouterManager:
         best_inst, best_ratio = None, MINIMAL_FREE_RATIO
         for inst in self.model_instences:
             if inst.state == 'decode' and inst._batch_receving is None:
-                minimal_needed_token = inst.get_used_kv_token() + batch_tokens
+                used_kv_token = inst.get_used_kv_token()
+                minimal_needed_token = used_kv_token + batch_tokens
                 free_ratio = 1 - minimal_needed_token / inst.kv_token_capacity
+                print_(f"        +---get_decode: free recv inst {inst}, {used_kv_token = }, {free_ratio = }")
                 if free_ratio > best_ratio:
                     best_inst, best_ratio = inst, free_ratio
 
+        print_(f"        +---get_decode: done, {best_inst = }")
         return best_inst
 
     async def _step_old(self):
@@ -578,12 +594,14 @@ class RouterManager:
             req.req_status = ReqRunStatus.DIST_KV_SENDING
         reqs = [r.to_rpc_obj() for r in batch.reqs]
         if sender.world_size == receiver.world_size:
-            await self._init_batch(receiver, batch)
+            # await self._init_batch(receiver, batch)
             rets1 = [sender.model_rpcs[tp_rank].send_kv_batch(batch.batch_id, reqs, receiver.gpu_list[tp_rank]) for tp_rank in range(sender.world_size)]
             rets2 = [receiver.model_rpcs[tp_rank].recv_kv_batch(batch.batch_id, reqs, sender.gpu_list[tp_rank]) for tp_rank in range(receiver.world_size)]
             ans = await asyncio.gather(*rets1, *rets2)
         else:
             raise NotImplementedError()
+        for req in batch.reqs:
+            req.req_status = ReqRunStatus.RUNNING
         return
 
     async def _decode_batch(self, instance: ModelInstanceHandle, batch: Batch):
@@ -657,6 +675,7 @@ class RouterManager:
 
     def _update_out_status_to_batch(self, batch: Batch, req_to_out_status):
         new_batch_decode_need_tokens = 0  # 只有在 splitfuse 模式下有意义
+        # print_(f"{req_to_out_status = }")
         for req_id, (
             req_status,
             cur_kv_len,
@@ -670,6 +689,9 @@ class RouterManager:
             #     req: Req = batch.id_to_reqs[req_id]
             # except KeyError:
             #     print_(f"RMUBKE: task {asyncio.current_task().get_name()} req {req_id=} not found, this should not happend, {req_to_out_status=}")
+            # print_(f"{req.req_status = } <--- {req_status}")
+            # print_(f"{req.cur_kv_len = } <--- {cur_kv_len}")
+            # print_(f"{req.cur_output_len = } <--- {cur_output_len}")
             req.req_status = req_status
             req.cur_kv_len = cur_kv_len
             req.cur_output_len = cur_output_len

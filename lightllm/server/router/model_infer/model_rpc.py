@@ -121,13 +121,15 @@ class ModelRpcClient:
         if self.use_rpc:
 
             def async_wrap(f):
-                f = rpyc.async_(f)
+                # f = rpyc.async_(f)
 
+                # async def _func(*args, **kwargs):
+                #     ans = f(*args, **kwargs)
+                #     await asyncio.to_thread(ans.wait)
+                #     # raise if exception
+                #     return ans.value
                 async def _func(*args, **kwargs):
-                    ans = f(*args, **kwargs)
-                    await asyncio.to_thread(ans.wait)
-                    # raise if exception
-                    return ans.value
+                    return await asyncio.to_thread(f, *args, **kwargs)
 
                 return _func
 
@@ -258,7 +260,7 @@ async def start_model_process(port): #, world_size):
     repeat_count = 0
     while repeat_count < 20:
         try:
-            con = rpyc.connect("localhost", port, config={"allow_pickle": True})
+            con = rpyc.connect("localhost", port, config={"allow_pickle": True, "sync_request_timeout": None})
             break
         except BaseException:
             await asyncio.sleep(1)

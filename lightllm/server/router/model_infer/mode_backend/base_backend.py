@@ -267,7 +267,7 @@ class ModeBackend:
         raise NotImplementedError()
 
     @calculate_time(show=True, min_cost_ms=1)
-    def send_kv_batch(self, batch_id, reqs: List[dict], target_rank):
+    def send_kv_batch(self, batch_id, reqs: List[dict], target_rank: int):
         # batch = self.cache[batch_id]    # expr: readonly batch operations, don't pop
         batch = self.cache.pop(batch_id)
         for i, req in enumerate(reqs):
@@ -290,17 +290,21 @@ class ModeBackend:
         return
 
     @calculate_time(show=True, min_cost_ms=1)
-    def recv_kv_batch(self, batch_id, reqs, target_rank):
-        # batch = InferBatch.init_batch(
-        #     batch_id,
-        #     reqs,
-        #     self.model.data_type,
-        #     torch.cuda.current_device(),
-        #     self.model.req_manager,
-        #     self.model.vocab_size,
-        #     self.radix_cache,
-        # )
-        batch = self.cache.pop(batch_id)
+    def recv_kv_batch(self, batch_id, reqs: List[dict], target_rank: int):
+        batch = InferBatch.init_batch(
+            batch_id,
+            reqs,
+            self.model.data_type,
+            torch.cuda.current_device(),
+            self.model.req_manager,
+            self.model.vocab_size,
+            self.radix_cache,
+        )
+        # batch = self.cache.pop(batch_id)
+
+        # print(f"impl @ {time.time()}: recv_kv_batch({batch_id=}, {reqs=}, {target_rank=})", flush=True)
+        # print(f"                            : (after) {reqs = }", flush=True)
+        # print(f"                            : {batch = }", flush=True)
 
         for i, req in enumerate(reqs):
             req_id = req["request_id"]
@@ -312,14 +316,14 @@ class ModeBackend:
 
             manager_idx = req_obj.req_idx
             kv_idx_t = batch.req_manager.req_to_token_indexs[manager_idx]
-            kv_len = len(req["input_id"])
+            kv_len = req_obj.prompt_len
             req_obj.cur_kv_len = kv_len
             mm = batch.req_manager.mem_manager
             recv_pack_t = torch.empty(mm.layer_num, kv_len, 2 * mm.head_num, mm.head_dim, dtype=mm.dtype, device='cuda')
 
-            print(f"blocking recv #{i} START, time = {time.time()}")
+            # print(f"blocking recv #{i} START, time = {time.time()}")
             torch.distributed.recv(recv_pack_t, src=target_rank)
-            print(f"blocking recv #{i} DONE, time = {time.time()}, {req_id = }, {recv_pack_t.shape = } ({recv_pack_t.shape.numel() / 1024**2:.2f}Me)")
+            # print(f"blocking recv #{i} DONE, time = {time.time()}, {req_id = }, {recv_pack_t.shape = } ({recv_pack_t.shape.numel() / 1024**2:.2f}Me)")
             # print(recv_pack_t)
 
             kv_alloc_idx_t = mm.alloc(kv_len)    # TODO: alloc_contiguous opti

@@ -87,7 +87,7 @@ def prepare_decode_inputs(batch: InferBatch, radix_cache: RadixCache):
         nopad_b_start_loc.append(start_loc)
         input_id = req.input_token_ids[-1]
         seq_len = len(req.input_token_ids)
-        assert req.cur_kv_len == seq_len - 1
+        assert req.cur_kv_len == seq_len - 1, f"{req.cur_kv_len = }, {seq_len = }"
         nopad_b_seq_len.append(seq_len)
         input_ids.append(input_id)
         nopad_total_token_num += seq_len

@@ -17,11 +17,13 @@ class ContinuesBatchBackend(ModeBackend):
 
     @calculate_time(show=False, min_cost_ms=300)
     def prefill_batch(self, batch_id):
-        return self.forward(batch_id, is_prefill=True)
+        with torch.cuda.nvtx.range(f"prefill {batch_id}"):
+            return self.forward(batch_id, is_prefill=True)
 
     @calculate_time(show=True, min_cost_ms=200)
     def decode_batch(self, batch_id):
-        return self.forward(batch_id, is_prefill=False)
+        with torch.cuda.nvtx.range(f"decode {batch_id}"):
+            return self.forward(batch_id, is_prefill=False)
 
     def forward(self, batch_id, is_prefill):
         # special code for return all prompt_logprobs

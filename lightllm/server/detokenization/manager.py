@@ -42,7 +42,7 @@ class DeTokenizationManager:
     async def handle_loop(self):
         while True:
             try:
-                recv_obj:Union(BatchTokenIdOut, ReqDetokenizationState, AbortReq) = await self.recv_from_router.recv_pyobj() 
+                recv_obj: Union[BatchTokenIdOut, ReqDetokenizationState, AbortReq] = await self.recv_from_router.recv_pyobj()
                 assert isinstance(recv_obj, (BatchTokenIdOut, ReqDetokenizationState, AbortReq)), f"type is not right {type(recv_obj)}"
                 if isinstance(recv_obj, ReqDetokenizationState):
                     self.req_id_to_out[recv_obj.request_id] = recv_obj

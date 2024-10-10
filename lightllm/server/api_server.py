@@ -43,6 +43,7 @@ from .router.manager import start_router_process
 from .embed_cache.manager import start_cache_manager
 from .visualserver.manager import start_visual_process
 from .req_id_generator import ReqIDGenerator
+from .io_struct import FinishStatus
 
 from lightllm.utils.net_utils import alloc_can_use_network_port
 from lightllm.utils.start_utils import start_submodule_processes
@@ -84,6 +85,7 @@ async def generate(request: Request) -> Response:
     if isFirst:
         loop = asyncio.get_event_loop()
         loop.create_task(httpserver_manager.handle_loop())
+        loop.create_task(httpserver_manager.handle_loop_abort())
         isFirst = False
 
     request_dict = await request.json()
@@ -106,11 +108,14 @@ async def generate(request: Request) -> Response:
     prompt_token_ids = None
     is_first_metadata = True
     async for request_output, metadata, finish_status in results_generator:
+        if finish_status == FinishStatus.FINISHED_SLA_ABORT:
+            return Response(status_code=503)
+
         if await request.is_disconnected():
             # Abort the request if the client disconnects.
             await httpserver_manager.abort(request_id)
             return Response(status_code=499)
-        
+
         # when set "--return_all_prompt_logprobs", the first token metadata will contains
         # prompt_logprobs and prompt_token_ids
         if is_first_metadata:
@@ -149,6 +154,7 @@ async def generate_stream(request: Request) -> Response:
     if isFirst:
         loop = asyncio.get_event_loop()
         loop.create_task(httpserver_manager.handle_loop())
+        loop.create_task(httpserver_manager.handle_loop_abort())
         isFirst = False
 
     request_dict = await request.json()
@@ -163,9 +169,20 @@ async def generate_stream(request: Request) -> Response:
     request_id = g_id_gen.generate_id()
     results_generator = httpserver_manager.generate(prompt, sampling_params, request_id, multimodal_params)
 
+    server_side_abort = False
+
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
+        nonlocal server_side_abort
         async for request_output, metadata, finish_status in results_generator:
+            if finish_status == FinishStatus.FINISHED_SLA_ABORT:
+                ret = {"finished": True, "finish_reason": finish_status.get_finish_reason(), "abort": True}
+                server_side_abort = True
+                yield ("data:" + json.dumps(ret, ensure_ascii=False) + f"\n\n").encode(
+                    "utf-8"
+                )
+                return
+
             ret = {
                 "token": {
                     "id": metadata.get("id", None),
@@ -185,7 +202,8 @@ async def generate_stream(request: Request) -> Response:
             )
 
     async def abort_request() -> None:
-        await httpserver_manager.abort(request_id)
+        if not server_side_abort:
+            await httpserver_manager.abort(request_id)
 
     background_tasks = BackgroundTasks()
     # Abort the request if the client disconnects.
@@ -204,6 +222,7 @@ async def chat_completions(
     if isFirst:
         loop = asyncio.get_event_loop()
         loop.create_task(httpserver_manager.handle_loop())
+        loop.create_task(httpserver_manager.handle_loop_abort())
         isFirst = False
 
     if request.logit_bias is not None:
@@ -309,7 +328,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None,
                         help="the model weight dir path, the app will load config, weights and tokenizer from this dir")
     parser.add_argument("--tokenizer_mode", type=str, default="slow",
-                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test, 
+                        help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test,
                         when you want to get best performance, try auto mode""")
     parser.add_argument("--load_way", type=str, default="HF",
                         help="the way of loading model weights, the default is HF(Huggingface format), llama also supports DS(Deepspeed)")
@@ -330,9 +349,9 @@ def main():
     parser.add_argument("--nccl_port", type=int, default=28765,
                         help="the nccl_port to build a distributed environment for PyTorch")
     parser.add_argument("--mode", type=str, default=[], nargs='+',
-                        help="""Model mode: [triton_int8kv | ppl_int8kv | ppl_fp16 | triton_flashdecoding 
-                        | triton_gqa_attention | triton_gqa_flashdecoding] 
-                        [triton_w4a16 | triton_w8a16 | lmdeploy_w4a16 | ppl_w4a16 | ppl_w8a8], 
+                        help="""Model mode: [triton_int8kv | ppl_int8kv | ppl_fp16 | triton_flashdecoding
+                        | triton_gqa_attention | triton_gqa_flashdecoding]
+                        [triton_w4a16 | triton_w8a16 | lmdeploy_w4a16 | ppl_w4a16 | ppl_w8a8],
                         triton_flashdecoding mode is for long context, current support llama llama2 qwen;
                         triton_gqa_attention and triton_gqa_flashdecoding is fast kernel for model which use GQA;
                         triton_int8kv mode use int8 to store kv cache, can increase token capacity, use triton kernel;
@@ -346,12 +365,12 @@ def main():
                         help="disable logging throughput stats.")
     parser.add_argument("--log_stats_interval", type=int, default=10,
                         help="log stats interval in second.")
-    
+
     parser.add_argument("--router_token_ratio", type=float, default=0.0,
                         help="token ratio to control router dispatch")
     parser.add_argument("--router_max_new_token_len", type=int, default=1024,
                         help="the request max new token len for router")
-    
+
     parser.add_argument("--future_past_scheduler", action='store_true',
                         help="use future_past_scheduler, override the above two options")
 
@@ -359,11 +378,11 @@ def main():
                         help="whether to skip special tokens when decoding")
     parser.add_argument("--no_spaces_between_special_tokens", action="store_true",
                         help="whether to add spaces between special tokens when decoding")
-    
+
     parser.add_argument("--splitfuse_mode", action='store_true',
                     help="use splitfuse mode")
     parser.add_argument("--splitfuse_block_size", type=int, default=256,
-                    help="splitfuse block size")    
+                    help="splitfuse block size")
     parser.add_argument("--prompt_cache_strs", type=str, default=[], nargs='+',
                         help="""prompt cache strs""")
     parser.add_argument("--enable_multimodal", action='store_true',
@@ -376,10 +395,10 @@ def main():
                         help="return all prompt tokens logprobs")
     parser.add_argument("--long_truncation_mode", type=str, choices=[None, 'head', 'center'], default=None,
                         help="""use to select the handle way when input token len > max_req_input_len.
-                        None : raise Exception 
+                        None : raise Exception
                         head : remove some head tokens to make input token len <= max_req_input_len
                         center : remove some tokens in center loc to make input token len <= max_req_input_len""")
-    
+
     args = parser.parse_args()
 
     # 非splitfuse 模式，不支持 prompt cache 特性
@@ -388,7 +407,7 @@ def main():
 
     assert args.max_req_input_len < args.max_req_total_len
     assert args.max_req_total_len <= args.max_total_token_num
-    
+
     if not args.splitfuse_mode:
         # 普通模式下
         if args.batch_max_tokens is None:
@@ -432,7 +451,7 @@ def main():
         httpserver_port=httpserver_port,
         enable_multimodal=args.enable_multimodal,
     )
-    
+
     from .detokenization.manager import start_detokenization_process
     start_submodule_processes(start_funcs=[start_router_process, start_detokenization_process],
                             start_args=[(args, router_port, detokenization_port, model_rpc_ports),
@@ -452,6 +471,7 @@ def main():
         log_level="debug",
         timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
         loop="uvloop",
+        backlog=65535,
     )
 
 

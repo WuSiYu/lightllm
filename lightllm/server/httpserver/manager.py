@@ -22,9 +22,12 @@ class HttpServerManager:
         enable_multimodal,
     ):
         self.args = args
-        context = zmq.asyncio.Context(2)
+        context = zmq.asyncio.Context(4)
         self.send_to_router = context.socket(zmq.PUSH)
         self.send_to_router.connect(f"tcp://127.0.0.1:{router_port}")
+
+        self.recv_from_router = context.socket(zmq.PULL)
+        self.recv_from_router.bind(f"tcp://127.0.0.1:{router_port+999}")    # FIXME
 
         self.enable_multimodal = enable_multimodal
         if self.enable_multimodal:
@@ -34,7 +37,7 @@ class HttpServerManager:
 
         self.recv_from_detokenization = context.socket(zmq.PULL)
         self.recv_from_detokenization.bind(f"tcp://127.0.0.1:{httpserver_port}")
-        
+
         self.tokenizer = get_tokenizer(
             args.model_dir, args.tokenizer_mode, trust_remote_code=args.trust_remote_code
         )
@@ -47,7 +50,7 @@ class HttpServerManager:
 
         self._init_prompt_cache()
         return
-    
+
     def _init_prompt_cache(self):
         """
         初始化 prompt cache 特性, 这个地方的id 分配要于 router 中 的id 分配对齐
@@ -61,7 +64,7 @@ class HttpServerManager:
                 self.prompt_cache_reqs.append((id, prompt_ids))
                 id -= 1
         return
-    
+
     def _find_prompt_cache_req(self, token_ids):
         prompt_cache_len = 0
         prompt_cache_req_id = None
@@ -106,6 +109,7 @@ class HttpServerManager:
                     self.cache_client.root.release(img.uuid)
 
     async def generate(self, prompt, sampling_params, request_id, multimodal_params):
+        req_arrived_time = time.time()
         if self.enable_multimodal:
             assert (
                 len(multimodal_params.images) <= self.args.cache_capacity
@@ -141,20 +145,24 @@ class HttpServerManager:
             raise ValueError(
                 f"the req token total len + 1 (input len + output len + 1) is too long > max_total_token_num:{self.total_token_num}"
             )
-        
+
         sampling_params.stop_sentences_to_token_ids(self.tokenizer)
 
         req_status = ReqStatus(request_id, multimodal_params)
         event = req_status.event
         self.req_id_to_out_inf[request_id] = req_status
+        print(f"added req #{request_id} in httpserver @ {time.time()}")
 
         # 寻找是否有可用的prompt cache 可用
         prompt_cache_len, prompt_cache_req_id = self._find_prompt_cache_req(prompt_ids)
-  
+
         if self.enable_multimodal:
             self.send_to_visual.send_pyobj((prompt_ids, sampling_params, multimodal_params, request_id, prompt_cache_len, prompt_cache_req_id))
         else:
-            self.send_to_router.send_pyobj((prompt_ids, sampling_params, multimodal_params, request_id, prompt_cache_len, prompt_cache_req_id))
+            self.send_to_router.send_pyobj((prompt_ids, sampling_params, multimodal_params, request_id, req_arrived_time, prompt_cache_len, prompt_cache_req_id))
+
+        # await asyncio.sleep(0)
+        print(f"req #{request_id} sent to router (visual) @ {time.time()}")
 
         while True:
             try:
@@ -203,15 +211,37 @@ class HttpServerManager:
             for req_id, text, metadata, finish_status in recv_ans.reqs_infs:
                 finish_status = FinishStatus(finish_status)
                 try:
-                    if not finish_status.is_aborted():
+                    if finish_status != FinishStatus.FINISHED_ABORT:
+                        # also for SLA_ABORT
                         req_status : ReqStatus = self.req_id_to_out_inf[req_id]
-                        async with req_status.lock: 
+                        async with req_status.lock:
                             req_status.out_token_info_list.append((text, metadata, finish_status))
                             req_status.event.set()
                     else:
                         del self.req_id_to_out_inf[req_id]
                 except:
                     pass
+        return
+
+    async def handle_loop_abort(self):
+        while True:
+            recv_ans: AbortReq = await self.recv_from_router.recv_pyobj()
+            assert isinstance(
+                recv_ans, AbortReq
+            ), f"error recv type {type(recv_ans)}"
+            # print(f"handle_loop_abort recv {recv_ans.req_id = }")
+
+            try:
+                req_id = recv_ans.req_id
+                req_status : ReqStatus = self.req_id_to_out_inf[req_id]
+                if self.enable_multimodal:
+                    self.send_to_visual.send_pyobj(recv_ans)
+                async with req_status.lock:
+                    req_status.out_token_info_list.append((None, {}, FinishStatus.FINISHED_SLA_ABORT))
+                    req_status.event.set()
+            except KeyError as e:
+                print(f"INFO: req #{req_id} not found: {e}, may already aborted")
+
         return
 
 class ReqStatus:

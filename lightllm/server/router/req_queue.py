@@ -29,22 +29,22 @@ class ReqQueue:
         # 当使用 prompt cache 特性时的维护变量
         self.prompt_cache_used_tokens = prompt_cache_used_tokens
         self.prompt_cache_req_num = prompt_cache_req_num
-        
+
     def append(self, req):
         self.waiting_req_list.append(req)
         return
-    
+
     def back_to_wait_list(self, req_list:List[Req]):
         for req in req_list:
             if req.req_status in [ReqRunStatus.PAUSED_AND_KVKEEP, ReqRunStatus.PAUSED_AND_OFFLOAD]:
                 self.pause_req_dict[req.request_id] = req
         self.waiting_req_list = req_list + self.waiting_req_list
         self.recalcu_pause_req_used_tokens()
-        return 
+        return
 
     def _init_cache_list(self, current_batch:Batch, is_busy):
         self.cache_pause_reqs_used_tokens = self.pause_req_used_tokens
-        self.cache_pause_reqs_num = len(self.pause_req_dict) 
+        self.cache_pause_reqs_num = len(self.pause_req_dict)
         if current_batch is not None:
             self.cache_len_list = [req.get_tuple_tokens(is_busy, self.router_max_new_token_len) for req in current_batch.reqs]
         else:
@@ -54,13 +54,13 @@ class ReqQueue:
     def _can_add_new_req(self, req:Req, is_busy):
         self.cache_len_list.append(req.get_tuple_tokens(is_busy, self.router_max_new_token_len)) # hard to analysis
         self.cache_len_list.sort(key=lambda x: -x[1])
-        
+
         left_out_len_array = np.array([e[1] for e in self.cache_len_list])
         # assert left_out_len_array.min() >= 0
         has_run_len_array = np.array([e[0] for e in self.cache_len_list])
         cum_run_len_array = np.cumsum(has_run_len_array)
         size_array = np.arange(1, len(self.cache_len_list) + 1, 1)
-        
+
         need_max_token_num = (left_out_len_array * size_array + cum_run_len_array).max()
         if req.req_status in [ReqRunStatus.PAUSED_AND_KVKEEP, ReqRunStatus.PAUSED_AND_OFFLOAD]:
             self.cache_pause_reqs_used_tokens -= req.get_used_tokens()
@@ -73,7 +73,7 @@ class ReqQueue:
             return True
         else:
             return False
-    
+
     #@calculate_time(show=True, min_cost_ms=10)
     def generate_new_batch(self, current_batch:Batch):
 
@@ -84,11 +84,11 @@ class ReqQueue:
         req_is_full = exist_req_num >= self.running_max_req_size
         if req_is_full:
             return None
-        
+
         # 计算当前所有的token使用量，包括当前使用和暂停的
         cur_all_used_tokens = 0 if current_batch is None else current_batch.batch_used_tokens
         cur_all_used_tokens += self.recalcu_pause_req_used_tokens() + self.prompt_cache_used_tokens
-        
+
         # 判断当前服务是否处于token使用率过高的状态，过高的情况下，调度要偏向保守
         cur_token_ratio = cur_all_used_tokens / self.max_total_tokens
         is_busy = cur_token_ratio >= self.router_token_ratio
@@ -100,14 +100,14 @@ class ReqQueue:
             cur_batch_decode_need_tokens = 0
         else:
             cur_batch_decode_need_tokens = 0 if current_batch is None else current_batch.batch_decode_need_tokens
-        
+
         self._init_cache_list(current_batch, is_busy)
         can_run_list = []
         new_batch_first_router_need_tokens = 0 # 主要是对 prefill 或者 splitfuse 大块计算时候的限制
         aborted_count = 0
         for req in self.waiting_req_list:
-            if req.finish_status.is_aborted() and req.req_status == ReqRunStatus.WAIT_IN_QUEUE: 
-                # 由于管理的复杂性，只有没有被调度运行过的请求可以因为abort直接在队列中忽略掉. 
+            if req.finish_status.is_aborted() and req.req_status == ReqRunStatus.WAIT_IN_QUEUE:
+                # 由于管理的复杂性，只有没有被调度运行过的请求可以因为abort直接在队列中忽略掉.
                 # 暂停的请求需要恢复后，由 router manager 部分来过滤。暂时保持这种处理方法, 否则会导致管理token的泄漏
                 aborted_count += 1
                 continue
@@ -128,7 +128,7 @@ class ReqQueue:
             return new_batch
         else:
             return None
-        
+
     def recalcu_pause_req_used_tokens(self):
         used_tokens = 0
         for req_id, req_obj in self.pause_req_dict.items():

@@ -230,12 +230,16 @@ class RouterManager:
         await self._init_batch(batch)
         if not self.is_splitfuse_mode:
             # 在 非 splitfuse 模式下，才需要真的执行 prefill 的操作。
+            pts = time.time()
             rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
             ans = await asyncio.gather(*rets)
             if self.world_size != 1:
                 req_to_out_status = obtain(ans[0])
             else:
                 req_to_out_status = ans[0]
+            pte = time.time()
+
+            print(f"pperf: prefill {batch.input_tokens()} tokens {pte - pts}")
 
             self._update_out_status_to_batch(batch, req_to_out_status)
             self._mark_running_req_sla_violent(batch)
@@ -388,7 +392,7 @@ class RouterManager:
 
     def _filter_waiting_req_sla_violent(self):
         DEADLINE = 10 - 2    # TODO: FIXME: TEMP
-        n_abort = 0
+        aborted_reqs = set()
         for req in self.req_queue.waiting_req_list:
             if req.req_status == ReqRunStatus.WAIT_IN_QUEUE:
                 if time.time() - req.req_arrived_time > DEADLINE:
@@ -400,20 +404,24 @@ class RouterManager:
                     abort_req = AbortReq(req.request_id)
                     self.send_to_httpserver.send_pyobj(abort_req)
                     self.send_to_detokenization.send_pyobj(abort_req)
-                    n_abort += 1
+                    aborted_reqs.add(req.request_id)
                 else:
                     break   # assert waiting_req_list is ordered by created time
-        if n_abort:
-            self.req_queue.waiting_req_list = self.req_queue.waiting_req_list[n_abort:]
+        if aborted_reqs:
+            self.req_queue.waiting_req_list = [x for x in self.req_queue.waiting_req_list if x.request_id not in aborted_reqs]
 
     def _mark_running_req_sla_violent(self, batch: Batch):
-        DEADLINE = 1 - 0.001    # TODO: FIXME: TEMP
+        DEADLINE = 2 - 0.01    # TODO: FIXME: TEMP
         for req in batch.reqs:
             if req.last_token_timestamp:
                 # not first token
-                if time.time() - req.last_token_timestamp > DEADLINE:
-                    print(f"REQ #{req.request_id} SLA TPOT violent abort: {DEADLINE = }, passed = {time.time() - req.last_token_timestamp}")
-                    req.finish_status = FinishStatus.FINISHED_SLA_ABORT
+                if req.req_status == ReqRunStatus.RUNNING:
+                    if time.time() - req.last_token_timestamp > DEADLINE:
+                        print(f"REQ #{req.request_id} SLA TPOT violent abort: {DEADLINE = }, passed = {time.time() - req.last_token_timestamp}")
+                        req.finish_status = FinishStatus.FINISHED_SLA_ABORT
+                elif req.req_status in (ReqRunStatus.PAUSED_AND_KVKEEP, ReqRunStatus.PAUSED_AND_OFFLOAD):
+                    pass    # TODO
+
             # else:
             #     # this is first token
             #     req.last_token_timestamp = time.time()

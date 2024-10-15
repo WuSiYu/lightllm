@@ -398,6 +398,10 @@ def main():
                         None : raise Exception
                         head : remove some head tokens to make input token len <= max_req_input_len
                         center : remove some tokens in center loc to make input token len <= max_req_input_len""")
+    parser.add_argument("--router_sla_abort_ttft", type=float, default=8,
+                        help="""10 - 2 (prefill time)""")
+    parser.add_argument("--router_sla_abort_tpot", type=float, default=1.5-0.01,
+                        help="""1.5 - 0.01 (network jitter)""")
 
     args = parser.parse_args()
 

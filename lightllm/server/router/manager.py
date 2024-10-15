@@ -391,7 +391,7 @@ class RouterManager:
         return
 
     def _filter_waiting_req_sla_violent(self):
-        DEADLINE = 10 - 2    # TODO: FIXME: TEMP
+        DEADLINE = self.args.router_sla_abort_ttft    # TODO: FIXME: TEMP
         aborted_reqs = set()
         for req in self.req_queue.waiting_req_list:
             if req.req_status == ReqRunStatus.WAIT_IN_QUEUE:
@@ -411,7 +411,7 @@ class RouterManager:
             self.req_queue.waiting_req_list = [x for x in self.req_queue.waiting_req_list if x.request_id not in aborted_reqs]
 
     def _mark_running_req_sla_violent(self, batch: Batch):
-        DEADLINE = 2 - 0.01    # TODO: FIXME: TEMP
+        DEADLINE = self.args.router_sla_abort_tpot    # TODO: FIXME: TEMP
         for req in batch.reqs:
             if req.last_token_timestamp:
                 # not first token

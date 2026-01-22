@@ -2,6 +2,8 @@ import os
 import torch
 import threading
 from typing import Optional, Tuple, List, Dict, Any, Union
+
+from lightllm.utils.profiler import PerfCounter
 from .base_weight import BaseWeight
 from lightllm.utils.dist_utils import get_current_rank_in_dp, get_current_device_id
 from lightllm.common.quantization import Quantcfg
@@ -101,6 +103,7 @@ class FusedMoeWeightTP(BaseWeight):
         self.w2 = [None, None]  # weight, weight_scale
         self.lock = threading.Lock()
 
+    @PerfCounter(type="BLOCK")
     def experts(self, input_tensor, router_logits, top_k, renormalize, use_grouped_topk, topk_group, num_expert_group):
         from lightllm.common.fused_moe.topk_select import select_experts
 

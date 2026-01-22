@@ -10,6 +10,7 @@ from lightllm.common.basemodel.layer_weights.meta_weights.base_weight import Bas
 from lightllm.common.quantization import Quantcfg
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.profiler import PerfCounter
 from .mm_slicer import SliceMixinTpl
 
 logger = init_logger(__name__)
@@ -118,6 +119,7 @@ class MMWeightTpl(BaseWeightTpl):
 
         self.load_finished: bool = False
 
+    @PerfCounter(type="GEMM_OP")
     def mm(
         self, input_tensor: torch.Tensor, out: Optional[torch.Tensor] = None, use_custom_tensor_mananger: bool = True
     ) -> torch.Tensor:
@@ -133,6 +135,7 @@ class MMWeightTpl(BaseWeightTpl):
                 out = g_cache_manager.alloc_tensor(shape, dtype, device=device)
             else:
                 out = torch.empty(shape, dtype=dtype, device=device)
+        self.mm.record_shape(m=input_tensor.shape[0], k=input_tensor.shape[1], n=self.mm_param.weight.shape[1])
         if self.mm_param.bias is None:
             return torch.mm(input_tensor, self.mm_param.weight, out=out)
         return torch.addmm(self.mm_param.bias, input_tensor, self.mm_param.weight, out=out)
@@ -363,6 +366,7 @@ class BMMWeightTpl(MMWeightTpl):
     ) -> torch.Tensor:
         raise RuntimeError("use bmm not mm")
 
+    @PerfCounter(type="GEMM_OP")
     def bmm(
         self, input_tensor: torch.Tensor, out: Optional[torch.Tensor] = None, use_custom_tensor_mananger: bool = True
     ) -> torch.Tensor:
@@ -376,6 +380,9 @@ class BMMWeightTpl(MMWeightTpl):
                 out = g_cache_manager.alloc_tensor(shape, dtype, device=device)
             else:
                 out = torch.empty(shape, dtype=dtype, device=device)
+        self.bmm.record_shape(
+            m=input_tensor.shape[0], k=input_tensor.shape[1], n=self.mm_param.weight.shape[2]
+        )
         if self.mm_param.bias is None:
             return torch.bmm(input_tensor, fpweight, out=out)
         return torch.addbmm(self.mm_param.bias, input_tensor, fpweight, out=out)

@@ -8,6 +8,7 @@ from lightllm.models.llama.triton_kernel.silu_and_mul import silu_and_mul_fwd
 from lightllm.models.qwen3.triton_kernel.qk_norm import qk_rmsnorm_forward
 from functools import partial
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.profiler import PerfCounter
 
 logger = init_logger(__name__)
 
@@ -18,6 +19,7 @@ class Qwen3TransformerLayerInfer(LlamaTransformerLayerInfer):
         self.head_dim_ = network_config["head_dim"]
         return
 
+    @PerfCounter(type="BLOCK")
     def _get_qkv(
         self,
         input: torch.Tensor,

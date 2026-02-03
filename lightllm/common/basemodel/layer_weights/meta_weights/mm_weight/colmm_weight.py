@@ -38,3 +38,27 @@ class COLMMWeight(MMWeightTpl):
         self.param_slicer = get_col_slice_mixin(
             self.quant_method.method_name, tp_rank=self.tp_rank_, tp_world_size=self.tp_world_size_
         )
+
+    def _to_gpu_device(self):
+        super()._to_gpu_device()
+
+        from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient, TensorServer
+        if TensorClient():
+            self.mm_param.weight, meta = TensorClient().get_tensor(self.weight_names[0])    # replace weight with shared weight to free GPU memory
+            print(f"[TensorClient] loaded weight: {self.weight_names[0]} tp_rank: {meta['tp_rank']} tp_world_size: {meta['tp_world_size']}")
+            print(f"(ours: tp_rank: {self.tp_rank_} tp_world_size: {self.tp_world_size_})")
+            assert meta["tp_world_size"] < self.tp_world_size_ and self.tp_world_size_ % meta["tp_world_size"] == 0, \
+                f"shared_weight tp_world_size not align: master={meta['tp_world_size']} vs slave={self.tp_world_size_}"
+            tp_sub_partation_world_size = self.tp_world_size_ // meta["tp_world_size"]
+            assert self.tp_rank_ // tp_sub_partation_world_size == meta["tp_rank"], \
+                f"shared_weight master tp_rank not correct: wanted {self.tp_rank_ // tp_sub_partation_world_size}, master has {meta['tp_rank']}"
+
+            tp_sub_partation_rank = self.tp_rank_ % tp_sub_partation_world_size
+            tp_sub_partation_size = self.mm_param.weight.shape[1] // tp_sub_partation_world_size
+            self.mm_param.weight = self.mm_param.weight[:, tp_sub_partation_size * tp_sub_partation_rank : tp_sub_partation_size * (tp_sub_partation_rank + 1)]
+
+        else:
+            if TensorServer():
+                meta = dict(tp_rank=self.tp_rank_, tp_world_size=self.tp_world_size_)
+                TensorServer().register(self.weight_names[0], self.mm_param.weight, meta)
+

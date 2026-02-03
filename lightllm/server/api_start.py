@@ -257,6 +257,18 @@ def normal_or_p_d_start(args):
     if args.run_mode == "decode":
         args.router_max_wait_tokens = 0
 
+    if args.shared_weight is not None:
+        logger.info(f"shared_weight enabled: {args.shared_weight} mode")
+        assert args.run_mode == "prefill", "shared_weight mode only support prefill run_mode"
+        if args.shared_weight == "master":
+            from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorServer
+            TensorServer().start(port=args.shared_weight_rpyc_port)
+        elif args.shared_weight == "slave":
+            from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient
+            TensorClient().connect(port=args.shared_weight_rpyc_port)
+        else:
+            raise ValueError(f"Invalid shared_weight mode: {args.shared_weight}")
+
     send_and_receive_node_ip(args)  # 多机用于收发node ip
     # dp 必须 > 1
     if args.enable_dp_prompt_cache_fetch and args.dp <= 1:

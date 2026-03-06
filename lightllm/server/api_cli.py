@@ -75,10 +75,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="shared model with multiple instance in same GPU, only for prefill"
     )
     parser.add_argument(
-        "--shared_weight_master_port",
+        "--shared_weight_master_port_start",
         type=int,
         default=None,
-        help="The port used by the master instance (smallest tp_size) to share weights with slave instances.",
+        help="The start port of range (port ~ port+tp_size-1) used by the master instance (smallest tp_size) to share weights with slave instances.",
     )
 
     parser.add_argument(

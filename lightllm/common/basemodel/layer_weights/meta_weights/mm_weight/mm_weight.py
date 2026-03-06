@@ -128,14 +128,34 @@ class MMWeightTpl(BaseWeightTpl):
                 input_tensor, self.mm_param, out, use_custom_tensor_mananger=use_custom_tensor_mananger
             )
         if out is None:
-            shape = (input_tensor.shape[0], self.mm_param.weight.shape[1])
+            out_dim_n = self.mm_param.weight.numel() // self.mm_param.weight.shape[-2] # weight shape is (out_dim, in_dim) or (num_part, out_dim, in_dim)
+            shape = (input_tensor.shape[0], out_dim_n)
             dtype = input_tensor.dtype
             device = input_tensor.device
             if use_custom_tensor_mananger:
                 out = g_cache_manager.alloc_tensor(shape, dtype, device=device)
             else:
                 out = torch.empty(shape, dtype=dtype, device=device)
-        self.mm.record_shape(m=input_tensor.shape[0], k=input_tensor.shape[1], n=self.mm_param.weight.shape[1])
+        self.mm.record_shape(m=input_tensor.shape[0], k=input_tensor.shape[1], n=out_dim_n)
+
+        # print(f"{input_tensor.shape=}, {self.mm_param.weight.shape=}, {out.shape=}")
+        if self.mm_param.weight.ndim == 3:
+            # non-contiguous weights
+            seq_len = input_tensor.shape[0]
+            num_part = self.mm_param.weight.shape[0]
+            sub_out_dim = self.mm_param.weight.shape[2]
+            out_view = out.view(seq_len, num_part, sub_out_dim)
+            # out_view = out.view(seq_len, num_part, -1)
+
+            for i in range(num_part):
+                sub_w = self.mm_param.weight[i]
+                sub_out = out_view[:, i, :]
+                torch.mm(input_tensor, sub_w, out=sub_out)
+
+            if self.mm_param.bias is not None:
+                out += self.mm_param.bias
+            return out
+
         if self.mm_param.bias is None:
             return torch.mm(input_tensor, self.mm_param.weight, out=out)
         return torch.addmm(self.mm_param.bias, input_tensor, self.mm_param.weight, out=out)

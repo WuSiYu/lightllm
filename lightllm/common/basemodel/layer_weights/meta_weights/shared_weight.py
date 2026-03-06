@@ -5,6 +5,8 @@ import socket
 from rpyc.utils.server import ThreadedServer
 from typing import Dict, Any, Tuple, Optional
 
+from lightllm.utils.dist_utils import get_current_device_id
+
 
 # helper: singleton decorator
 def singleton(cls):
@@ -100,14 +102,14 @@ class TensorServer:
 
         # Factory to pass the registry to the service
         class BoundService(TensorShareService):
-            def __init__(self_service, conn):
+            def __init__(self_service):
                 super().__init__(self._registry)
 
         self._rpyc_server = ThreadedServer(
             BoundService,
             port=port,
             hostname=host,
-            protocol_config={"allow_public_attrs": True, "allow_all_attrs": True}
+            protocol_config={"allow_pickle": True}
         )
 
         self._server_thread = threading.Thread(target=self._rpyc_server.start, daemon=True)
@@ -125,7 +127,9 @@ class TensorServer:
 
         # Ensure contiguous memory layout for simpler reconstruction
         if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
+            print(f"[TensorServer] Warning: Tensor '{tensor_id}' is not contiguous.")
+            print(f"{tensor.stride()=}, {tensor.storage_offset()=}, {tensor.shape=}")
+            # tensor = tensor.contiguous()
 
         self._registry[tensor_id] = {
             'tensor': tensor,
@@ -155,11 +159,7 @@ class TensorClient:
             return
 
         # Increase generic timeout/max header for large metadata if necessary
-        self._conn = rpyc.connect(
-            host,
-            port,
-            config={"allow_public_attrs": True, "allow_all_attrs": True}
-        )
+        self._conn = rpyc.connect(host, port, config={"allow_pickle": True})
         print(f"[TensorClient] Connected to {host}:{port}")
 
     def get_tensor(self, tensor_id: str) -> Tuple[Optional[torch.Tensor], Optional[Dict]]:
@@ -177,33 +177,27 @@ class TensorClient:
         if remote_data is None:
             return None, None
 
-        # Convert netref to local dict if necessary (usually handled by rpyc auto-proxy,
-        # but creating a local copy is safer for the reconstruction step)
-        if hasattr(remote_data, '__dict__') or isinstance(remote_data, object):
-            # If it's a netref, accessing items fetches them
-            pass
+        remote_data = rpyc.utils.classic.obtain(remote_data)
+
+        for key in remote_data:
+            print(f"[TensorClient] remote_data key: {key:20}, value: {remote_data[key]}")
 
         ipc_handle = remote_data['ipc_handle']
-        device_idx = remote_data['device']
         shape = remote_data['shape']
         stride = remote_data['stride']
         dtype = remote_data['dtype']
         storage_offset = remote_data['storage_offset']
-        storage_size_elements = remote_data['storage_size_elements']
         user_meta = remote_data['user_meta']
 
         # 2. Reconstruct the Storage from the IPC handle
-        # This attaches to the existing GPU memory allocation
+        # Because of CUDA_VISIBLE_DEVICES, remote device_idx is not reliably
+        device_idx = get_current_device_id()
         device = torch.device(f"cuda:{device_idx}")
 
         # PyTorch Internal API to rebuild storage from IPC handle
         # format: _new_shared_cuda(device, handle, size_in_elements, view_offset_bytes=0)
         # Note: API requirements vary slightly by PyTorch version, this is standard for 1.13+ / 2.0+
-        new_storage = torch.UntypedStorage._new_shared_cuda(
-            device,
-            ipc_handle,
-            storage_size_elements
-        )
+        new_storage = torch.UntypedStorage._new_shared_cuda(device_idx, *ipc_handle[1:])
 
         # 3. Create the Tensor View
         # We create an empty tensor and set its data to point to the shared storage

@@ -115,6 +115,9 @@ class HttpServerManagerForPDMaster:
         origin_sampling_params = SamplingParams.from_buffer_copy(sampling_params)
         origin_group_request_id = self.id_gen.generate_id()
         max_new_tokens_list = self._split_max_new_tokens(max_new_tokens=origin_sampling_params.max_new_tokens)
+        block_group_request_id = None
+        p_node = None
+        d_node = None
 
         try:
             # 记录请求到达的相关信息
@@ -166,13 +169,16 @@ class HttpServerManagerForPDMaster:
         except BaseException as e:
             logger.error(f"has exception {str(e)}")
             try:
-                await self.abort(block_group_request_id, p_node=p_node, d_node=d_node)
+                if block_group_request_id is not None:
+                    await self.abort(block_group_request_id, p_node=p_node, d_node=d_node)
             except:
-                await self.abort(block_group_request_id)
+                if block_group_request_id is not None:
+                    await self.abort(block_group_request_id)
             raise e
 
         finally:
-            await self.remove_req(block_group_request_id)
+            if block_group_request_id is not None:
+                await self.remove_req(block_group_request_id)
         return
 
     async def _log_req_header(self, request: Request, group_request_id: int):
@@ -209,6 +215,8 @@ class HttpServerManagerForPDMaster:
             "ip": d_start_args["host"],
             "rpyc_port": d_start_args["pd_decode_rpyc_port"],
             "max_new_tokens": sampling_params.max_new_tokens - 1,
+            "tp_in_node": d_start_args["tp"] // d_start_args["nnodes"],
+            "tp_total": d_start_args["tp"],
         }
 
         old_max_new_tokens = sampling_params.max_new_tokens

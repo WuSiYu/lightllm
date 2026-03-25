@@ -2,7 +2,8 @@ import torch
 import torch.distributed as dist
 import rpyc
 import time
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Set
+import copy
 from rpyc.utils.classic import obtain
 from .decode_impl import DecodeNode
 from lightllm.common.basemodel.infer_lock import acquire_lock_until_ready, release_acquired_lock, g_router_lock
@@ -20,6 +21,10 @@ class PDDecodeInferRpcServer(rpyc.Service):
         self.device_id = self.backend.current_device_id
         self.dp_rank_in_node = self.backend.dp_rank_in_node
         self.is_master_in_dp = self.backend.is_master_in_dp
+        self.req_shared_alloc_cache: Dict[int, Tuple[KVMoveTask, object, List[int]]] = {}
+        self.req_shard_cache_keys: Dict[int, Set[Union[int, Tuple[int, int]]]] = {}
+        self.req_put_progress: Dict[int, Dict[str, object]] = {}
+        self.req_failed_released: Set[int] = set()
         return
 
     def on_connect(self, conn):
@@ -69,6 +74,22 @@ class PDDecodeInferRpcServer(rpyc.Service):
         return
 
     def _alloc_to_frozen_some_tokens(self, move_task: KVMoveTask):
+        cache_key = move_task.task_cache_key()
+        if cache_key in g_kv_move_task_cache:
+            return g_kv_move_task_cache[cache_key][0].decode_token_indexes
+
+        shard_total = int(getattr(move_task, "shard_total", 1))
+        shard_id = int(getattr(move_task, "shard_id", 0))
+        req_id = move_task.group_request_id
+
+        if shard_total > 1 and req_id in self.req_shared_alloc_cache:
+            shared_move_task, tree_node, fused_token_indexes = self.req_shared_alloc_cache[req_id]
+            move_task.decode_token_indexes = shared_move_task.decode_token_indexes
+            move_task.move_kv_len = shared_move_task.move_kv_len
+            g_kv_move_task_cache[cache_key] = (move_task, tree_node, fused_token_indexes)
+            self.req_shard_cache_keys.setdefault(req_id, set()).add(cache_key)
+            return move_task.decode_token_indexes
+
         is_ok = self.judge_token_is_ok(len(move_task.input_tokens), move_task.decode_node.max_new_tokens)
         if not is_ok:
             if self.is_master_in_dp:
@@ -108,7 +129,12 @@ class PDDecodeInferRpcServer(rpyc.Service):
         move_task.decode_token_indexes = alloc_token_indexes
         move_task.move_kv_len = need_len
 
-        g_kv_move_task_cache[move_task.group_request_id] = (move_task, tree_node, fused_token_indexes)
+        g_kv_move_task_cache[cache_key] = (move_task, tree_node, fused_token_indexes)
+        if shard_total > 1:
+            shared_task = copy.copy(move_task)
+            self.req_shared_alloc_cache[req_id] = (shared_task, tree_node, fused_token_indexes)
+            self.req_shard_cache_keys.setdefault(req_id, set()).add(cache_key)
+            self.req_failed_released.discard(req_id)
         return move_task.decode_token_indexes
 
     # 返回 None 代表服务繁忙已经无法调度新的请求进入了
@@ -126,8 +152,38 @@ class PDDecodeInferRpcServer(rpyc.Service):
         finally:
             release_acquired_lock()
 
-    def _put_kv_received_to_radix_cache(self, group_req_id: int):
-        move_task, tree_node, fused_token_indexes = g_kv_move_task_cache.pop(group_req_id)
+    def _put_kv_received_to_radix_cache(self, req_cache_key: Union[int, Tuple[int, int]]):
+        cache_value = g_kv_move_task_cache.pop(req_cache_key, None)
+        if cache_value is None:
+            return
+
+        move_task, tree_node, fused_token_indexes = cache_value
+        shard_total = int(getattr(move_task, "shard_total", 1))
+        shard_id = int(getattr(move_task, "shard_id", 0))
+
+        if shard_total > 1:
+            req_id = move_task.group_request_id
+            progress = self.req_put_progress.get(req_id, None)
+            if progress is None:
+                progress = {"total": shard_total, "done": set(), "payload": (move_task, tree_node, fused_token_indexes)}
+                self.req_put_progress[req_id] = progress
+            else:
+                progress["total"] = max(int(progress["total"]), shard_total)
+                if progress.get("payload", None) is None:
+                    progress["payload"] = (move_task, tree_node, fused_token_indexes)
+            progress["done"].add(shard_id)
+
+            if len(progress["done"]) < int(progress["total"]):
+                return
+
+            move_task, tree_node, fused_token_indexes = progress["payload"]
+            self.req_put_progress.pop(req_id, None)
+            self.req_shared_alloc_cache.pop(req_id, None)
+            for key in self.req_shard_cache_keys.pop(req_id, set()):
+                g_kv_move_task_cache.pop(key, None)
+            self.req_failed_released.discard(req_id)
+
+        group_req_id = move_task.group_request_id
         radix_cache = self.backend.radix_cache
         key = torch.tensor(move_task.input_tokens, dtype=torch.int64, device="cpu")
         value = torch.tensor(fused_token_indexes + move_task.decode_token_indexes, dtype=torch.int64, device="cpu")
@@ -142,27 +198,43 @@ class PDDecodeInferRpcServer(rpyc.Service):
         g_success_kv_move_task_cache[group_req_id] = (move_task, tree_node, time.time())
         return
 
-    def exposed_put_kv_received_to_radix_cache(self, group_req_ids: List[int]):
-        group_req_ids = obtain(group_req_ids)
+    def exposed_put_kv_received_to_radix_cache(self, req_cache_keys: List[Union[int, Tuple[int, int]]]):
+        req_cache_keys = obtain(req_cache_keys)
         acquire_lock_until_ready(self.backend.lock_nccl_group)
-        for group_req_id in group_req_ids:
-            self._put_kv_received_to_radix_cache(group_req_id)
+        for req_cache_key in req_cache_keys:
+            self._put_kv_received_to_radix_cache(req_cache_key)
         release_acquired_lock()
         return
 
-    def _fail_to_realese_forzen_tokens(self, group_req_id: int):
-        move_task, tree_node, fused_token_indexes = g_kv_move_task_cache.pop(group_req_id)
+    def _fail_to_realese_forzen_tokens(self, req_cache_key: Union[int, Tuple[int, int]]):
+        cache_value = g_kv_move_task_cache.pop(req_cache_key, None)
+        if cache_value is None:
+            return
+
+        move_task, tree_node, fused_token_indexes = cache_value
+        shard_total = int(getattr(move_task, "shard_total", 1))
+        req_id = move_task.group_request_id
+
+        if shard_total > 1:
+            if req_id in self.req_failed_released:
+                return
+            self.req_failed_released.add(req_id)
+            for key in self.req_shard_cache_keys.pop(req_id, set()):
+                g_kv_move_task_cache.pop(key, None)
+            self.req_put_progress.pop(req_id, None)
+            self.req_shared_alloc_cache.pop(req_id, None)
+
         value = torch.tensor(move_task.decode_token_indexes, dtype=torch.int64, device="cpu")
         self.backend.model.mem_manager.free(value)
         self.backend.radix_cache.dec_node_ref_counter(tree_node)
         self.recover_frozen_token(len(move_task.input_tokens), move_task.decode_node.max_new_tokens)
         return
 
-    def exposed_fail_to_realese_forzen_tokens(self, group_req_ids: List[int]):
-        group_req_ids = obtain(group_req_ids)
+    def exposed_fail_to_realese_forzen_tokens(self, req_cache_keys: List[Union[int, Tuple[int, int]]]):
+        req_cache_keys = obtain(req_cache_keys)
         acquire_lock_until_ready(self.backend.lock_nccl_group)
-        for group_req_id in group_req_ids:
-            self._fail_to_realese_forzen_tokens(group_req_id)
+        for req_cache_key in req_cache_keys:
+            self._fail_to_realese_forzen_tokens(req_cache_key)
         release_acquired_lock()
         return
 

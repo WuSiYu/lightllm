@@ -79,7 +79,31 @@ class DecodeKVMoveManager(rpyc.Service):
             self.kv_trans_processes[device_id] = KVTransProcess()
             assert self.kv_trans_processes[device_id].init_all(device_id, self)
 
+        # Shared shard progress across all connect objects in this decode process.
+        self.req_shard_progress = {}
+        self.req_shard_progress_lock = threading.Lock()
+
         return
+
+    def should_up_status(self, task: KVMoveTask) -> bool:
+        shard_total = int(getattr(task, "shard_total", 1))
+        shard_id = int(getattr(task, "shard_id", 0))
+        if shard_total <= 1:
+            return True
+
+        req_id = task.group_request_id
+        with self.req_shard_progress_lock:
+            progress = self.req_shard_progress.get(req_id, None)
+            if progress is None:
+                progress = {"total": shard_total, "done": set()}
+                self.req_shard_progress[req_id] = progress
+            else:
+                progress["total"] = max(int(progress["total"]), shard_total)
+            progress["done"].add(shard_id)
+            if len(progress["done"]) >= int(progress["total"]):
+                self.req_shard_progress.pop(req_id, None)
+                return True
+            return False
 
     # ==================================================================================
     # _dp_alloc_to_frozen_some_tokens
@@ -122,7 +146,7 @@ class DecodeKVMoveManager(rpyc.Service):
                 conns = self.infer_rpyc_objs[conn_start:conn_end]
                 for conn in conns:
                     futures.append(
-                        rpyc.async_(conn.put_kv_received_to_radix_cache)([task.group_request_id for task in _tasks])
+                        rpyc.async_(conn.put_kv_received_to_radix_cache)([task.task_cache_key() for task in _tasks])
                     )
             asyncio.run(self.wait_all_future_finish(futures))
         return
@@ -139,7 +163,7 @@ class DecodeKVMoveManager(rpyc.Service):
                 conns = self.infer_rpyc_objs[conn_start:conn_end]
                 for conn in conns:
                     futures.append(
-                        rpyc.async_(conn.fail_to_realese_forzen_tokens)([task.group_request_id for task in _tasks])
+                        rpyc.async_(conn.fail_to_realese_forzen_tokens)([task.task_cache_key() for task in _tasks])
                     )
             asyncio.run(self.wait_all_future_finish(futures))
         return
@@ -152,6 +176,20 @@ class DecodeKVMoveManager(rpyc.Service):
                 futures.append(rpyc.async_(conn.unfrozen_time_out_reqs_tokens)())
             asyncio.run(self.wait_all_future_finish(futures))
         return
+
+    def _split_by_transfer_signature(self, tasks: List[KVMoveTask]) -> List[List[KVMoveTask]]:
+        groups = {}
+        for task in tasks:
+            sig = (
+                int(getattr(task, "prefill_tp_in_node", 1) or 1),
+                int(getattr(task, "decode_tp_in_node", 1) or 1),
+                int(getattr(task, "shard_total", 1) or 1),
+                int(getattr(task, "shard_id", 0) or 0),
+            )
+            if sig not in groups:
+                groups[sig] = []
+            groups[sig].append(task)
+        return list(groups.values())
 
     # ==================================================================================
     # put_to_fail_release_task_queue 将因为一些原因失败，需要释放锁定的kv资源的请求放入到
@@ -207,20 +245,40 @@ class DecodeKVMoveManager(rpyc.Service):
         return
 
     def exposed_build_trans_connect(
-        self, prefill_node_id, pd_prefill_nccl_ip, pd_prefill_nccl_port, prefill_node_max_kv_trans_num, connect_id
+        self,
+        prefill_node_id,
+        pd_prefill_nccl_ip,
+        pd_prefill_nccl_port,
+        prefill_node_max_kv_trans_num,
+        connect_id,
+        prefill_tp_in_node=None,
+        decode_tp_in_node=None,
     ):
         prefill_node_id, pd_prefill_nccl_ip, pd_prefill_nccl_port, prefill_node_max_kv_trans_num = list(
             map(obtain, [prefill_node_id, pd_prefill_nccl_ip, pd_prefill_nccl_port, prefill_node_max_kv_trans_num])
         )
         connect_id = obtain(connect_id)
+        prefill_tp_in_node = obtain(prefill_tp_in_node) if prefill_tp_in_node is not None else None
+        decode_tp_in_node = obtain(decode_tp_in_node) if decode_tp_in_node is not None else None
         thread_local_data.connect_id = connect_id
 
-        logger.info(f"build trans infos {prefill_node_id} {pd_prefill_nccl_ip} {pd_prefill_nccl_port} {connect_id}")
+        logger.info(
+            f"build trans infos {prefill_node_id} {pd_prefill_nccl_ip} {pd_prefill_nccl_port} {connect_id} "
+            f"prefill_tp_in_node={prefill_tp_in_node} decode_tp_in_node={decode_tp_in_node}"
+        )
 
         from .decode_trans_obj import KVTransConnectObj
 
         tran_obj = KVTransConnectObj()
-        tran_obj.create(connect_id, prefill_node_id, pd_prefill_nccl_ip, pd_prefill_nccl_port, self)
+        tran_obj.create(
+            connect_id,
+            prefill_node_id,
+            pd_prefill_nccl_ip,
+            pd_prefill_nccl_port,
+            prefill_tp_in_node,
+            decode_tp_in_node,
+            self,
+        )
         self.connect_id_to_trans_obj[connect_id] = tran_obj
         return min(prefill_node_max_kv_trans_num, self.args.max_total_token_num)
 
@@ -240,25 +298,27 @@ class DecodeKVMoveManager(rpyc.Service):
             for task in tasks:
                 test_dp_indexes = list(range(self.dp_size_in_node))
                 random.shuffle(test_dp_indexes)
-                id_to_test_range[task.group_request_id] = test_dp_indexes
+                id_to_test_range[task.task_cache_key()] = test_dp_indexes
 
             id_has_result = {}
             for test_index in range(self.dp_size_in_node):
                 dp_tasks = [[] for _ in range(self.dp_size_in_node)]
                 for task in tasks:
-                    if task.group_request_id not in id_has_result:
-                        test_dp_index = id_to_test_range[task.group_request_id][test_index]
+                    task_key = task.task_cache_key()
+                    if task_key not in id_has_result:
+                        test_dp_index = id_to_test_range[task_key][test_index]
                         dp_tasks[test_dp_index].append(task)
                 if not all(len(t) == 0 for t in dp_tasks):
                     dp_tasks_ans = self._dp_alloc_to_frozen_some_tokens(dp_tasks)
                     for dp_index in range(self.dp_size_in_node):
                         for task, decode_token_indexes in zip(dp_tasks[dp_index], dp_tasks_ans[dp_index]):
                             if decode_token_indexes is not None:
-                                id_has_result[task.group_request_id] = (dp_index, decode_token_indexes)
+                                id_has_result[task.task_cache_key()] = (dp_index, decode_token_indexes)
             for task in tasks:
-                if task.group_request_id in id_has_result:
-                    task.decode_dp_index = id_has_result[task.group_request_id][0]
-                    task.decode_token_indexes = id_has_result[task.group_request_id][1]
+                task_key = task.task_cache_key()
+                if task_key in id_has_result:
+                    task.decode_dp_index = id_has_result[task_key][0]
+                    task.decode_token_indexes = id_has_result[task_key][1]
                     task.move_kv_len = len(task.decode_token_indexes)
                     ans_list.append(task.move_kv_len)
                     alloc_tokened_tasks.append(task)
@@ -274,9 +334,10 @@ class DecodeKVMoveManager(rpyc.Service):
             raise e
 
         if alloc_tokened_tasks:
-            trans_obj.ready_to_move_queue.put(
-                alloc_tokened_tasks, error_handle_func=self.put_to_fail_release_task_queue
-            )
+            for grouped_tasks in self._split_by_transfer_signature(alloc_tokened_tasks):
+                trans_obj.ready_to_move_queue.put(
+                    grouped_tasks, error_handle_func=self.put_to_fail_release_task_queue
+                )
 
         return ans_list
 
@@ -354,7 +415,7 @@ class DecodeKVMoveManager(rpyc.Service):
         return
 
 
-def _init_env(args, info_queue: mp.Queue, event: mp.Event):
+def _init_env(args, info_queue: mp.Queue, event):
     import lightllm.utils.rpyc_fix_utils as _
 
     # 注册graceful 退出的处理

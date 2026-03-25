@@ -1,5 +1,7 @@
 import re
 import os
+import time
+import threading
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -23,6 +25,65 @@ from filelock import FileLock
 
 
 logger = init_logger(__name__)
+
+
+class _PDKVPerfMetric:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_log_ts = time.time()
+        self._log_interval_s = 5.0
+        self._stats = {
+            "send_sym_calls": 0,
+            "send_asym_calls": 0,
+            "recv_sym_calls": 0,
+            "recv_asym_calls": 0,
+            "send_tokens": 0,
+            "recv_tokens": 0,
+            "send_bytes": 0,
+            "recv_bytes": 0,
+            "send_broadcast_ops": 0,
+            "recv_broadcast_ops": 0,
+            "send_prepare_ms": 0.0,
+            "send_reshard_ms": 0.0,
+            "send_nccl_ms": 0.0,
+            "send_total_ms": 0.0,
+            "recv_nccl_ms": 0.0,
+            "recv_write_ms": 0.0,
+            "recv_total_ms": 0.0,
+        }
+
+    def add(self, **kwargs):
+        with self._lock:
+            for key, value in kwargs.items():
+                if key in self._stats:
+                    self._stats[key] += value
+            self._maybe_log_locked()
+
+    def _maybe_log_locked(self):
+        now = time.time()
+        if now - self._last_log_ts < self._log_interval_s:
+            return
+        s = self._stats
+        interval = now - self._last_log_ts
+        self._last_log_ts = now
+        logger.info(
+            "pd_kv_perf "
+            f"window_s={interval:.2f} "
+            f"send_sym_calls={s['send_sym_calls']} send_asym_calls={s['send_asym_calls']} "
+            f"recv_sym_calls={s['recv_sym_calls']} recv_asym_calls={s['recv_asym_calls']} "
+            f"send_tokens={s['send_tokens']} recv_tokens={s['recv_tokens']} "
+            f"send_bytes={s['send_bytes']} recv_bytes={s['recv_bytes']} "
+            f"send_broadcast_ops={s['send_broadcast_ops']} recv_broadcast_ops={s['recv_broadcast_ops']} "
+            f"send_prepare_ms={s['send_prepare_ms']:.3f} send_reshard_ms={s['send_reshard_ms']:.3f} "
+            f"send_nccl_ms={s['send_nccl_ms']:.3f} send_total_ms={s['send_total_ms']:.3f} "
+            f"recv_nccl_ms={s['recv_nccl_ms']:.3f} recv_write_ms={s['recv_write_ms']:.3f} "
+            f"recv_total_ms={s['recv_total_ms']:.3f}"
+        )
+        for key in self._stats:
+            self._stats[key] = 0 if not isinstance(self._stats[key], float) else 0.0
+
+
+_pd_kv_perf_metric = _PDKVPerfMetric()
 
 
 class MemoryManager:
@@ -202,6 +263,7 @@ class MemoryManager:
         nccl_comm: PyNcclCommunicator,
     ):
         assert dp_size_in_node == 1
+        total_start = time.perf_counter()
 
         # 先将数据发送到指定的一张卡上的buffer，再发送。
 
@@ -210,23 +272,189 @@ class MemoryManager:
             if task.move_kv_len != 0:
                 move_token_indexes.extend(task.prefill_token_indexes[-task.move_kv_len :])
 
+        if len(move_token_indexes) == 0:
+            return
+
+        src_tp_in_node = len(mem_managers)
+        dst_tp_in_node = move_tasks[0].decode_tp_in_node if move_tasks[0].decode_tp_in_node is not None else src_tp_in_node
+        token_num = len(move_token_indexes)
+        move_size = self.token_dim_size * token_num
+        token_indexes_by_device = {}
+        for mem in mem_managers:
+            dev_idx = mem.kv_buffer.device.index
+            if dev_idx not in token_indexes_by_device:
+                token_indexes_by_device[dev_idx] = torch.tensor(
+                    move_token_indexes, dtype=torch.int64, device=mem.kv_buffer.device
+                )
+
+        # fast path: keep old rank-to-rank behavior for symmetric topology.
+        if src_tp_in_node == dst_tp_in_node:
+            cur_device_index = self.kv_buffer.get_device()
+            cur_mem = mem_managers[cur_device_index]
+            remote_move_buffer_views = {
+                i: cur_mem.kv_move_buffer.view(-1)[0:move_size].view(1, token_num, 2 * mem.head_num, self.head_dim)
+                for i, mem in enumerate(mem_managers)
+                if i != cur_device_index
+            }
+            prepare_ms = 0.0
+            nccl_ms = 0.0
+            bcast_ops = 0
+            for i, mem in enumerate(mem_managers):
+                for layer_index in range(mem.layer_num):
+                    t0 = time.perf_counter()
+                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                    if i == cur_device_index:
+                        move_buffer = mem._get_kv_move_data(token_indexes, layer_index)
+                        prepare_ms += (time.perf_counter() - t0) * 1000.0
+                        t1 = time.perf_counter()
+                        nccl_comm.send(move_buffer, dst=1)
+                        nccl_ms += (time.perf_counter() - t1) * 1000.0
+                    else:
+                        src_slice = mem.kv_buffer[layer_index : layer_index + 1, token_indexes, :, :]
+                        t1 = time.perf_counter()
+                        new_move_buffer = remote_move_buffer_views[i]
+                        new_move_buffer.copy_(src_slice, non_blocking=False)
+                        bcast_ops += 1
+                        prepare_ms += (time.perf_counter() - t0) * 1000.0
+                        t2 = time.perf_counter()
+                        nccl_comm.send(new_move_buffer, dst=1)
+                        nccl_ms += (time.perf_counter() - t2) * 1000.0
+            total_ms = (time.perf_counter() - total_start) * 1000.0
+            send_bytes = (
+                len(move_token_indexes)
+                * mem_managers[0].layer_num
+                * (2 * mem_managers[0].head_num * src_tp_in_node)
+                * self.head_dim
+                * torch._utils._element_size(self.dtype)
+            )
+            _pd_kv_perf_metric.add(
+                send_sym_calls=1,
+                send_tokens=len(move_token_indexes),
+                send_bytes=send_bytes,
+                send_broadcast_ops=bcast_ops,
+                send_prepare_ms=prepare_ms,
+                send_nccl_ms=nccl_ms,
+                send_total_ms=total_ms,
+            )
+            return
+
+        # asymmetric path: re-shard kv by global head dimension and send by decode tp layout.
         cur_device_index = self.kv_buffer.get_device()
         cur_mem = mem_managers[cur_device_index]
-        for i, mem in enumerate(mem_managers):
-            for layer_index in range(mem.layer_num):
-                move_buffer = mem._get_kv_move_data(move_token_indexes, layer_index)
-                if i == cur_device_index:
-                    nccl_comm.send(move_buffer, dst=1)
-                else:
-                    move_size = move_buffer.numel()
-                    new_move_buffer = cur_mem.kv_move_buffer.view(-1)[0:move_size].view(move_buffer.shape)
-                    from torch.cuda import comm
+        # Use dedicated per-source staging tensors to avoid alias overwrite across source ranks.
+        remote_move_buffer_views = {
+            i: torch.empty((1, token_num, 2 * mem.head_num, self.head_dim), dtype=self.dtype, device=cur_mem.kv_buffer.device)
+            for i, mem in enumerate(mem_managers)
+            if i != cur_device_index
+        }
 
-                    comm.broadcast(move_buffer, out=[new_move_buffer])
-                    nccl_comm.send(new_move_buffer, dst=1)
+        src_head_num = mem_managers[0].head_num
+        total_head_num = src_head_num * src_tp_in_node
+        if total_head_num % dst_tp_in_node != 0:
+            raise ValueError(
+                f"Unsupported asymmetric tp layout: total_head_num={total_head_num}, "
+                f"dst_tp_in_node={dst_tp_in_node}"
+            )
+        dst_head_num = total_head_num // dst_tp_in_node
+        shard_total = int(getattr(move_tasks[0], "shard_total", 1))
+        shard_id = int(getattr(move_tasks[0], "shard_id", 0))
+        if shard_total > 1:
+            shard_total = min(shard_total, dst_tp_in_node)
+            base = dst_tp_in_node // shard_total
+            rem = dst_tp_in_node % shard_total
+            start_rank = shard_id * base + min(shard_id, rem)
+            rank_num = base + (1 if shard_id < rem else 0)
+            active_dst_ranks = list(range(start_rank, start_rank + rank_num))
+        else:
+            active_dst_ranks = list(range(dst_tp_in_node))
+        if len(active_dst_ranks) == 0:
+            return
+        prepare_ms = 0.0
+        reshard_ms = 0.0
+        nccl_ms = 0.0
+        bcast_ops = 0
+        send_pack_buffer = torch.empty(
+            (1, token_num, 2 * dst_head_num, self.head_dim), dtype=self.dtype, device=cur_mem.kv_buffer.device
+        )
+
+        for layer_index in range(mem_managers[0].layer_num):
+            src_buffers = []
+            for i, mem in enumerate(mem_managers):
+                t0 = time.perf_counter()
+                token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                if i != cur_device_index:
+                    src_slice = mem.kv_buffer[layer_index : layer_index + 1, token_indexes, :, :]
+                    new_move_buffer = remote_move_buffer_views[i]
+                    new_move_buffer.copy_(src_slice, non_blocking=False)
+                    move_buffer = new_move_buffer
+                    bcast_ops += 1
+                else:
+                    move_buffer = mem._get_kv_move_data(token_indexes, layer_index)
+
+                prepare_ms += (time.perf_counter() - t0) * 1000.0
+
+                src_buffers.append(move_buffer)
+
+            if len(src_buffers) != src_tp_in_node:
+                raise ValueError(f"Unexpected src buffer num: got {len(src_buffers)} expect {src_tp_in_node}")
+
+            for dst_rank in active_dst_ranks:
+                start = dst_rank * dst_head_num
+                end = start + dst_head_num
+                t4 = time.perf_counter()
+                packed_head_num = 0
+                for src_rank, src_buffer in enumerate(src_buffers):
+                    src_start = src_rank * src_head_num
+                    src_end = src_start + src_head_num
+                    overlap_start = max(start, src_start)
+                    overlap_end = min(end, src_end)
+                    if overlap_start >= overlap_end:
+                        continue
+                    local_start = overlap_start - src_start
+                    local_end = overlap_end - src_start
+                    copy_len = local_end - local_start
+                    send_pack_buffer[:, :, packed_head_num : packed_head_num + copy_len, :].copy_(
+                        src_buffer[:, :, local_start:local_end, :], non_blocking=False
+                    )
+                    send_pack_buffer[
+                        :, :, dst_head_num + packed_head_num : dst_head_num + packed_head_num + copy_len, :
+                    ].copy_(src_buffer[:, :, src_head_num + local_start : src_head_num + local_end, :], non_blocking=False)
+                    packed_head_num += copy_len
+
+                if packed_head_num != dst_head_num:
+                    raise ValueError(
+                        f"Invalid overlap while resharding: dst_rank={dst_rank}, start={start}, end={end}, "
+                        f"packed_head_num={packed_head_num}, dst_head_num={dst_head_num}, "
+                        f"src_head_num={src_head_num}, src_tp_in_node={src_tp_in_node}"
+                    )
+                reshard_ms += (time.perf_counter() - t4) * 1000.0
+                expected_shape = (1, token_num, 2 * dst_head_num, self.head_dim)
+                if send_pack_buffer.shape != expected_shape:
+                    raise ValueError(f"send buffer shape mismatch: got {send_pack_buffer.shape}, want {expected_shape}")
+                t5 = time.perf_counter()
+                nccl_comm.send(send_pack_buffer, dst=1)
+                nccl_ms += (time.perf_counter() - t5) * 1000.0
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+        send_bytes = (
+            len(move_token_indexes)
+            * mem_managers[0].layer_num
+            * (2 * dst_head_num * len(active_dst_ranks))
+            * self.head_dim
+            * torch._utils._element_size(self.dtype)
+        )
+        _pd_kv_perf_metric.add(
+            send_asym_calls=1,
+            send_tokens=len(move_token_indexes),
+            send_bytes=send_bytes,
+            send_broadcast_ops=bcast_ops,
+            send_prepare_ms=prepare_ms,
+            send_reshard_ms=reshard_ms,
+            send_nccl_ms=nccl_ms,
+            send_total_ms=total_ms,
+        )
         return
 
-    def _get_kv_move_data(self, token_indexes: List[int], layer_index: int):
+    def _get_kv_move_data(self, token_indexes: Union[List[int], torch.Tensor], layer_index: int):
         move_size = self.token_dim_size * len(token_indexes)
         move_buffer = self.kv_move_buffer.view(-1)[0:move_size].view(
             1, len(token_indexes), 2 * self.head_num, self.head_dim
@@ -242,6 +470,7 @@ class MemoryManager:
         nccl_comm: PyNcclCommunicator,
     ):
         assert dp_size_in_node == 1
+        total_start = time.perf_counter()
 
         # 先将数据接受到指定的一张卡上的buffer，再复制到其他的卡上。
 
@@ -250,21 +479,141 @@ class MemoryManager:
             if task.move_kv_len != 0:
                 move_token_indexes.extend(task.decode_token_indexes[-task.move_kv_len :])
 
+        if len(move_token_indexes) == 0:
+            return
+
+        token_indexes_by_device = {}
+        for mem in mem_managers:
+            dev_idx = mem.kv_buffer.device.index
+            if dev_idx not in token_indexes_by_device:
+                token_indexes_by_device[dev_idx] = torch.tensor(
+                    move_token_indexes, dtype=torch.int64, device=mem.kv_buffer.device
+                )
+
+        decode_tp_in_node = move_tasks[0].decode_tp_in_node if move_tasks[0].decode_tp_in_node is not None else len(mem_managers)
+        prefill_tp_in_node = move_tasks[0].prefill_tp_in_node if move_tasks[0].prefill_tp_in_node is not None else decode_tp_in_node
+        if decode_tp_in_node != len(mem_managers):
+            raise ValueError(
+                f"Decode tp topology mismatch: task decode_tp_in_node={decode_tp_in_node}, "
+                f"local mem_managers={len(mem_managers)}"
+            )
+
+        if move_tasks[0].move_kv_len != 0:
+            logger.info(
+                f"pd receive kv topology prefill_tp_in_node={prefill_tp_in_node} "
+                f"decode_tp_in_node={decode_tp_in_node} token_num={len(move_token_indexes)}"
+            )
+
         cur_device_index = self.kv_buffer.get_device()
         token_num = len(move_token_indexes)
         move_size = self.token_dim_size * token_num
         recive_buffer = self.kv_move_buffer.view(-1)[0:move_size].view(1, token_num, 2 * self.head_num, self.head_dim)
-        for i, mem in enumerate(mem_managers):
-            for layer_index in range(mem.layer_num):
-                nccl_comm.recv(recive_buffer, src=0)
-                if i == cur_device_index:
-                    mem._write_kv_move_data(move_token_indexes, recive_buffer, layer_index)
-                else:
-                    new_recive_buffer = mem.kv_move_buffer.view(-1)[0:move_size].view(recive_buffer.shape)
-                    from torch.cuda import comm
+        expected_shape = (1, token_num, 2 * self.head_num, self.head_dim)
+        remote_recv_buffer_views = {
+            i: torch.empty(recive_buffer.shape, dtype=self.dtype, device=mem.kv_buffer.device)
+            for i, mem in enumerate(mem_managers)
+            if i != cur_device_index
+        }
 
-                    comm.broadcast(recive_buffer, out=[new_recive_buffer])
-                    mem._write_kv_move_data(move_token_indexes, new_recive_buffer, layer_index)
+        if prefill_tp_in_node == decode_tp_in_node:
+            recv_nccl_ms = 0.0
+            recv_write_ms = 0.0
+            bcast_ops = 0
+            for i, mem in enumerate(mem_managers):
+                for layer_index in range(mem.layer_num):
+                    t0 = time.perf_counter()
+                    nccl_comm.recv(recive_buffer, src=0)
+                    recv_nccl_ms += (time.perf_counter() - t0) * 1000.0
+                    if recive_buffer.shape != expected_shape:
+                        raise ValueError(f"Unexpected recv buffer shape {recive_buffer.shape}, expect {expected_shape}")
+                    if i == cur_device_index:
+                        t1 = time.perf_counter()
+                        token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                        mem._write_kv_move_data(token_indexes, recive_buffer, layer_index)
+                        recv_write_ms += (time.perf_counter() - t1) * 1000.0
+                    else:
+                        new_recive_buffer = remote_recv_buffer_views[i]
+                        t1 = time.perf_counter()
+                        new_recive_buffer.copy_(recive_buffer, non_blocking=False)
+                        bcast_ops += 1
+                        token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                        mem._write_kv_move_data(token_indexes, new_recive_buffer, layer_index)
+                        recv_write_ms += (time.perf_counter() - t1) * 1000.0
+            total_ms = (time.perf_counter() - total_start) * 1000.0
+            recv_bytes = (
+                len(move_token_indexes)
+                * mem_managers[0].layer_num
+                * (2 * self.head_num * decode_tp_in_node)
+                * self.head_dim
+                * torch._utils._element_size(self.dtype)
+            )
+            _pd_kv_perf_metric.add(
+                recv_sym_calls=1,
+                recv_tokens=len(move_token_indexes),
+                recv_bytes=recv_bytes,
+                recv_broadcast_ops=bcast_ops,
+                recv_nccl_ms=recv_nccl_ms,
+                recv_write_ms=recv_write_ms,
+                recv_total_ms=total_ms,
+            )
+            return
+
+        # For asymmetric topology, recv order must match sender: layer-major then dst-rank-major.
+        shard_total = int(getattr(move_tasks[0], "shard_total", 1))
+        shard_id = int(getattr(move_tasks[0], "shard_id", 0))
+        if shard_total > 1:
+            shard_total = min(shard_total, decode_tp_in_node)
+            base = decode_tp_in_node // shard_total
+            rem = decode_tp_in_node % shard_total
+            start_rank = shard_id * base + min(shard_id, rem)
+            rank_num = base + (1 if shard_id < rem else 0)
+            active_dst_ranks = list(range(start_rank, start_rank + rank_num))
+        else:
+            active_dst_ranks = list(range(decode_tp_in_node))
+        if len(active_dst_ranks) == 0:
+            return
+
+        recv_nccl_ms = 0.0
+        recv_write_ms = 0.0
+        bcast_ops = 0
+        for layer_index in range(mem_managers[0].layer_num):
+            for i in active_dst_ranks:
+                mem = mem_managers[i]
+                t0 = time.perf_counter()
+                nccl_comm.recv(recive_buffer, src=0)
+                recv_nccl_ms += (time.perf_counter() - t0) * 1000.0
+                if recive_buffer.shape != expected_shape:
+                    raise ValueError(f"Unexpected recv buffer shape {recive_buffer.shape}, expect {expected_shape}")
+                if i == cur_device_index:
+                    t1 = time.perf_counter()
+                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                    mem._write_kv_move_data(token_indexes, recive_buffer, layer_index)
+                    recv_write_ms += (time.perf_counter() - t1) * 1000.0
+                else:
+                    new_recive_buffer = remote_recv_buffer_views[i]
+                    t1 = time.perf_counter()
+                    new_recive_buffer.copy_(recive_buffer, non_blocking=False)
+                    bcast_ops += 1
+                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                    mem._write_kv_move_data(token_indexes, new_recive_buffer, layer_index)
+                    recv_write_ms += (time.perf_counter() - t1) * 1000.0
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+        recv_bytes = (
+            len(move_token_indexes)
+            * mem_managers[0].layer_num
+            * (2 * self.head_num * len(active_dst_ranks))
+            * self.head_dim
+            * torch._utils._element_size(self.dtype)
+        )
+        _pd_kv_perf_metric.add(
+            recv_asym_calls=1,
+            recv_tokens=len(move_token_indexes),
+            recv_bytes=recv_bytes,
+            recv_broadcast_ops=bcast_ops,
+            recv_nccl_ms=recv_nccl_ms,
+            recv_write_ms=recv_write_ms,
+            recv_total_ms=total_ms,
+        )
         return
 
     def _write_kv_move_data(self, token_indexes: torch.Tensor, buffer_tensor: torch.Tensor, layer_index):

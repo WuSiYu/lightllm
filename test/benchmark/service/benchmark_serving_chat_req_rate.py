@@ -22,18 +22,19 @@ from collections import namedtuple
 import dataclasses
 import datetime
 import json
+import os
 from queue import Empty, Queue
 import random
 import sys
 import threading
 import time
+import uuid
+import warnings
 from typing import AsyncGenerator, Dict, List, Literal, NamedTuple, Tuple, Union
 
 import aiohttp
 import numpy as np
 from transformers import PreTrainedTokenizerBase
-from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
-
 from transformers import (AutoTokenizer, PreTrainedTokenizer,
                           PreTrainedTokenizerFast)
 
@@ -66,6 +67,8 @@ def gen_prompt_from_conversation(conversation: List[Dict[str, str]]):
 _mid_start_times = []
 _mid_end_times = []
 _mid_end_rates = []
+FAILED_REQUESTS = 0
+MAX_REQ_TOTAL_TOKENS = 16000
 
 def get_tokenizer(
     tokenizer_name: str,
@@ -116,6 +119,86 @@ class Request(NamedTuple):
     prompt_len: int
     dataset_output_len: int
     chat_rounds: int
+    timestamp: float = -1.0
+
+
+def _build_user_content_by_token_budget(input_tokens: int) -> str:
+    user_tokens = max(4, input_tokens - 64)
+    return ("token " * user_tokens).strip()
+
+
+def sample_requests_from_servegen(args) -> List[Request]:
+    if args.request_rate == float("inf") or args.request_rate <= 0:
+        raise ValueError("For --dataset-type servegen, --request-rate must be a finite positive number.")
+
+    try:
+        from servegen import Category
+        from servegen.clientpool import ClientPool
+        from servegen.construct import generate_workload
+        from servegen.utils import get_constant_rate_fn
+    except ImportError:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+        servegen_root = os.path.join(repo_root, "_", "ServeGen")
+        if servegen_root not in sys.path:
+            sys.path.insert(0, servegen_root)
+        from servegen import Category
+        from servegen.clientpool import ClientPool
+        from servegen.construct import generate_workload
+        from servegen.utils import get_constant_rate_fn
+
+    duration = 300
+    pool = ClientPool(Category.LANGUAGE, "m-large")
+    rate_fn = get_constant_rate_fn(pool.span(0, duration), args.request_rate)
+    sg_requests = generate_workload(pool, rate_fn, duration=duration, seed=args.seed)
+
+    sampled_requests: List[Request] = []
+    dropped_too_long = 0
+    for req in sg_requests:
+        input_tokens = max(4, int(req.data.get("input_tokens", 16)))
+        output_tokens = max(4, int(req.data.get("output_tokens", 16)))
+        if input_tokens + output_tokens > MAX_REQ_TOTAL_TOKENS:
+            dropped_too_long += 1
+            continue
+
+        system_prompt = ""
+        if args.bypass_cache:
+            nonce = uuid.uuid4().hex
+            system_prompt = f"{nonce} ( <-- cache_bypass, ignore it ) {system_prompt}"
+
+        prompts = [
+            dict(role="system", content=system_prompt),
+            dict(role="user", content=_build_user_content_by_token_budget(input_tokens)),
+        ]
+        sampled_requests.append(
+            Request(
+                prompts=prompts,
+                prompt_len=input_tokens,
+                dataset_output_len=output_tokens,
+                chat_rounds=1,
+                timestamp=float(req.timestamp),
+            )
+        )
+
+    print("done generating ServeGen workload")
+    print(f"servegen duration: {duration}s")
+    print(f"servegen generated requests: {len(sampled_requests)}")
+    print(f"servegen dropped requests (> {MAX_REQ_TOTAL_TOKENS} total tokens): {dropped_too_long}")
+    if sampled_requests:
+        avg_in = sum(x.prompt_len for x in sampled_requests) / len(sampled_requests)
+        avg_out = sum(x.dataset_output_len for x in sampled_requests) / len(sampled_requests)
+        p_lens = [x.prompt_len for x in sampled_requests]
+        o_lens = [x.dataset_output_len for x in sampled_requests]
+        p50_in = np.percentile(p_lens, 50)
+        p50_out = np.percentile(o_lens, 50)
+        p90_in = np.percentile(p_lens, 90)
+        p90_out = np.percentile(o_lens, 90)
+        p95_in = np.percentile(p_lens, 95)
+        p95_out = np.percentile(o_lens, 95)
+        p99_in = np.percentile(p_lens, 99)
+        p99_out = np.percentile(o_lens, 99)
+        print(f"servegen avg / p50 / p90 / p95 / p99 input tokens: {avg_in:.2f} / {p50_in:.2f} / {p90_in:.2f} / {p95_in:.2f} / {p99_in:.2f}")
+        print(f"servegen avg / p50 / p90 / p95 / p99 output tokens: {avg_out:.2f} / {p50_out:.2f} / {p90_out:.2f} / {p95_out:.2f} / {p99_out:.2f}")
+    return sampled_requests
 
 def sample_requests(
     dataset_path: str,
@@ -157,6 +240,9 @@ def sample_requests(
                 role = 'user' if conversations[i]['from'] == 'human' else 'assistant',
                 content = conversations[i]['value'],
             ))
+        if args.bypass_cache:
+            nonce = uuid.uuid4().hex
+            prompt_list[0]["content"] = f"{nonce} ( <-- cache_bypass, ignore it ) {prompt_list[0]['content']}"
         output = conversations[rounds_used*2-1]["value"]
         dataset_.append((prompt_list, output, rounds_used))
     dataset = dataset_
@@ -190,6 +276,9 @@ def sample_requests(
         if prompt_len < 4 or dataset_output_len < 4:
             # Prune too short sequences.
             continue
+        if prompt_len + dataset_output_len > MAX_REQ_TOTAL_TOKENS:
+            # Prune too long sequences.
+            continue
         if force_long:
             if prompt_len > 2048 or dataset_output_len < 512:
                 # Prune too short/long sequences.
@@ -215,15 +304,28 @@ def sample_requests(
 async def get_request(
     input_requests: List[Request],
     request_rate: float,
+    follow_request_timestamp: bool = False,
 ) -> AsyncGenerator[Tuple[int, Request], None]:
     input_requests = iter(input_requests)
     t_start = time.time()
+    first_request_ts = None
     for i, request in enumerate(input_requests):
+        if follow_request_timestamp:
+            if first_request_ts is None:
+                first_request_ts = request.timestamp
+            target_elapsed = request.timestamp - first_request_ts
+            now_elapsed = time.time() - t_start
+            wait_time = target_elapsed - now_elapsed
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
 
         yield i, request
 
         if (i+1) % 100 == 0:
             print(f"{i+1} requests sent @ T+{time.time() - t_start:.2f}s")
+
+        if follow_request_timestamp:
+            continue
 
         if request_rate == float("inf"):
             # If the request rate is infinity, then we don't need to wait.
@@ -242,6 +344,7 @@ async def send_request(
     mode: Literal['known_output_len', 'unknown_output_len'],
     i: int,
 ) -> None:
+    global FAILED_REQUESTS
     headers = {'Content-Type': 'application/json', 'Connection': 'keep-alive', "User-Agent": "Benchmark Client"}
     url = f'http://{ADDR}:{PORT}/generate_stream'
 
@@ -271,35 +374,37 @@ async def send_request(
 
     request_start_time = time.time()
     timeout = aiohttp.ClientTimeout(total=24 * 3600, connect=24 * 3600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            last_time = request_start_time
-            async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
-                chunks = []
-                latencies = []
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                last_time = request_start_time
+                async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"bad http status: {response.status}")
 
-                try:
+                    chunks = []
+                    latencies = []
+
                     async for chunk, _ in response.content.iter_chunks():
                         time_now = time.time()
                         chunks.append(chunk)
                         # print(chunk)
                         latencies.append(time_now - last_time)
                         last_time = time_now
-                except aiohttp.client_exceptions.ClientPayloadError as e:
-                    tokenizer = get_tokenizer(args.tokenizer, "slow")
-                    print("error on req:", i, "chunks:", chunks, "prompt_len:", len(tokenizer([prompt_str]).input_ids[0]), 'e:', e)
-                    print("req:", req_json)
-                    sys.exit(1)
 
-            output_len = len(chunks)
-            chunks = [json.loads(s.strip()[len('data:'):].strip()) for s in chunks]
+                output_len = len(chunks)
+                chunks = [json.loads(s.strip()[len('data:'):].strip()) for s in chunks]
 
-            output_str = ''.join(c['token']['text'] for c in chunks)
-            # print('_'*10)
-            # print("req:", req_json)
-            # print("output:", output_str)
-            # print("latencies:", ' '.join(f'{x:.5f}' for x in latencies))
-            break
+                output_str = ''.join(c['token']['text'] for c in chunks)
+                # print('_'*10)
+                # print("req:", req_json)
+                # print("output:", output_str)
+                # print("latencies:", ' '.join(f'{x:.5f}' for x in latencies))
+                break
+    except Exception as e:
+        FAILED_REQUESTS += 1
+        print(f"request failed: req_id={i}, prompt_len={prompt_len}, dataset_output_len={dataset_output_len}, err={repr(e)}")
+        return
 
     request_end_time = time.time()
     request_latency = request_end_time - request_start_time
@@ -406,28 +511,52 @@ async def benchmark(
     input_requests: List[Request],
     request_rate: float,
     mode: Literal['known_output_len', 'unknown_output_len'] = 'unknown_output_len',
+    follow_request_timestamp: bool = False,
 ) -> None:
     tasks: List[asyncio.Task] = []
-    async for i, request in get_request(input_requests, request_rate):
-        task = asyncio.create_task(send_request(*request, mode, i))
+    async for i, request in get_request(input_requests, request_rate, follow_request_timestamp=follow_request_timestamp):
+        task = asyncio.create_task(
+            send_request(
+                request.prompts,
+                request.prompt_len,
+                request.dataset_output_len,
+                request.chat_rounds,
+                mode,
+                i,
+            )
+        )
         tasks.append(task)
     await asyncio.gather(*tasks)
 
 
 def main(args: argparse.Namespace):
-    global RESULTS
+    global RESULTS, FAILED_REQUESTS
     print(args)
+    FAILED_REQUESTS = 0
+
+    os.makedirs(args.dump_dir, exist_ok=True)
+
+    def resolve_dump_path(path: Union[str, None]) -> Union[str, None]:
+        if path is None:
+            return None
+        if os.path.isabs(path):
+            return path
+        return os.path.join(args.dump_dir, path)
 
     if not args.use_existing_dump:
         mode = args.mode
         random.seed(args.seed)
         np.random.seed(args.seed)
-        tokenizer = get_tokenizer(args.tokenizer, "slow")
-        input_requests = sample_requests(args.dataset, args.num_prompts, args.max_round, tokenizer, args)
+        if args.dataset_type == 'servegen':
+            input_requests = sample_requests_from_servegen(args)
+        else:
+            tokenizer = get_tokenizer(args.tokenizer, "slow")
+            input_requests = sample_requests(args.dataset, args.num_prompts, args.max_round, tokenizer, args)
 
         if args.use_output_length_record:
-            print(f"loading output_length from {args.use_output_length_record}")
-            with open(args.use_output_length_record) as f:
+            use_output_length_record = resolve_dump_path(args.use_output_length_record)
+            print(f"loading output_length from {use_output_length_record}")
+            with open(use_output_length_record) as f:
                 lens = json.load(f)
             assert len(lens) == len(input_requests)
             for i in range(len(lens)):
@@ -436,34 +565,41 @@ def main(args: argparse.Namespace):
         benchmark_start_time = time.time()
         _mid_end_times.append(benchmark_start_time)
         print(f"\nrunning (mode={mode})...")
-        asyncio.run(benchmark(input_requests, args.request_rate, mode=mode))
+        asyncio.run(benchmark(
+            input_requests,
+            args.request_rate,
+            mode=mode,
+            follow_request_timestamp=(args.dataset_type == 'servegen')
+        ))
         benchmark_end_time = time.time()
         benchmark_time = benchmark_end_time - benchmark_start_time
 
         # save results
         is_trim = "_trim" if args.trim_bootstrap_and_trailing else ""
         date = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-        result_dump_filename = f"bench_{date}__n{args.num_prompts}_rate{args.request_rate}{is_trim}.json"
+        result_dump_filename = os.path.join(args.dump_dir, f"bench_{date}__n{len(input_requests)}_rate{args.request_rate}{is_trim}.json")
         data = dict(args=vars(args), results=[dataclasses.asdict(r) for r in RESULTS])
         with open(result_dump_filename, 'w') as f:
             json.dump(data, f)
             print("benchmark results saved to", result_dump_filename)
 
         if args.record_output_length:
-            print(f"writing output length to {args.record_output_length}")
+            record_output_length = resolve_dump_path(args.record_output_length)
+            print(f"writing output length to {record_output_length}")
             lens = [x.output_len for x in RESULTS]
-            with open(args.record_output_length, 'w') as f:
+            with open(record_output_length, 'w') as f:
                 json.dump(lens, f)
-            print(f"writing prompt length to {args.record_output_length}.prompt.json")
+            print(f"writing prompt length to {record_output_length}.prompt.json")
             lens = [x.prompt_len for x in RESULTS]
-            with open(args.record_output_length+'.prompt.json', 'w') as f:
+            with open(record_output_length+'.prompt.json', 'w') as f:
                 json.dump(lens, f)
 
     else:
         # use-existing-dump
-        with open(args.use_existing_dump) as f:
+        use_existing_dump = resolve_dump_path(args.use_existing_dump)
+        with open(use_existing_dump) as f:
             previous_data = json.load(f)
-            print(f"use previous dump {args.use_existing_dump}")
+            print(f"use previous dump {use_existing_dump}")
             print(f"args {previous_data['args']}")
             RESULTS = [Results(**x) for x in previous_data['results']]
 
@@ -485,7 +621,15 @@ def main(args: argparse.Namespace):
     actual_totol_tokens = sum(x.prompt_len + x.output_len for x in RESULTS)
 
     print()
+    print(f"Number of failed requests: {FAILED_REQUESTS}")
+    print(f"Number of successful requests: {len(RESULTS)}")
     print(f"Number of requests for statistic: {len(RESULTS)}")
+
+    if len(RESULTS) == 0:
+        print("No successful requests, skip latency/throughput statistics.")
+        return
+
+    print()
     print(f"Number of prompt_tokens: {prompt_tokens} (avg {prompt_tokens / len(RESULTS)} tokens/req)")
     print(f"Number of output_tokens: {output_tokens} (avg {output_tokens / len(RESULTS)} tokens/req)")
     print(f"Number of total_tokens: {actual_totol_tokens} (avg {actual_totol_tokens / len(RESULTS)} tokens/req) (for reference: dataset total_tokens {dataset_total_tokens})")
@@ -526,13 +670,15 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark the online serving throughput.")
+    parser.add_argument("--dataset-type", choices=["sharegpt", "servegen"], default="sharegpt",
+                        help="dataset source type: sharegpt(need --dataset) or servegen(no --dataset needed).")
     parser.add_argument("--addr", type=str, default="127.0.0.1",
                         help="server addr.")
     parser.add_argument("--port", type=str, default="8000",
                         help="server port.")
-    parser.add_argument("--dataset", type=str, required=True,
+    parser.add_argument("--dataset", type=str,
                         help="Path to the dataset.")
-    parser.add_argument("--tokenizer", type=str, required=True,
+    parser.add_argument("--tokenizer", type=str,
                         help="Name or path of the tokenizer.")
     parser.add_argument("--request-rate", type=float, default=float("inf"),
                         help="Request rate (requests per second). If this is inf (or 0), then all requests are sent at time 0. Otherwise, we use Poisson process to synthesize the request arrival times.")
@@ -540,6 +686,8 @@ if __name__ == "__main__":
                     help="Number of prompts (requests) to process.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mode", choices=['known_output_len', 'unknown_output_len'], default='known_output_len')
+    parser.add_argument("--dump-dir", type=str, default="./_/", help="directory for benchmark dump files, will be created automatically if not exists")
+    parser.add_argument("--bypass-cache", action='store_true', help="add random string to prompt's beginning to bypass cache")
     parser.add_argument("--max-round", type=int, default=99999, help="max chat rounds (1 round = 1 ask + 1 ans) for request")
     parser.add_argument("--record-output-length", help="record request output length to file, for unknown_output_len mode only")
     parser.add_argument("--use-output-length-record", help="use request output length from the record file, for known_output_len mode only, the --num-prompts and --seed must same with the record runs")
@@ -549,6 +697,8 @@ if __name__ == "__main__":
     parser.add_argument("--long-out-3x", action='store_true', help="set max_new_token to 3x of dataset output length, so use with known_output_len mode")
     parser.add_argument("--use-existing-dump", default=None, help="don't run the benchmark, use the existed benckmark dump from previous runs")
     args = parser.parse_args()
+    if args.bypass_cache and args.mode == 'unknown_output_len':
+        raise UserWarning("use bypass-cache in unknown_output_len mode may break the model's response pattern and cause the output length very different from the dataset output length, which may make the benchmark results less meaningful")
     if args.request_rate == 0:
         print("treat --request-rate 0 as inf")
         args.request_rate = float("inf")
@@ -556,8 +706,32 @@ if __name__ == "__main__":
         assert args.mode == 'unknown_output_len', "see help"
     if args.use_output_length_record:
         assert args.mode == 'known_output_len', "see help"
-    assert args.num_prompts % 100 == 0, "--num-prompts should be n * 100"
-    if args.trim_bootstrap_and_trailing:
+
+    if args.dataset_type == 'servegen':
+        if args.dataset:
+            warnings.warn("--dataset is ignored when --dataset-type=servegen")
+        if args.tokenizer:
+            warnings.warn("--tokenizer is ignored when --dataset-type=servegen")
+        if args.num_prompts != 2000:
+            warnings.warn("--num-prompts is ignored when --dataset-type=servegen (request count comes from ServeGen workload)")
+        if args.max_round != 99999:
+            warnings.warn("--max-round is ignored when --dataset-type=servegen")
+        if args.long:
+            warnings.warn("--long is ignored when --dataset-type=servegen")
+        if args.long_1500:
+            warnings.warn("--long-1500 is ignored when --dataset-type=servegen")
+        if args.long_out_3x:
+            warnings.warn("--long-out-3x is ignored when --dataset-type=servegen")
+
+    if args.dataset_type != 'servegen':
+        assert args.dataset, "--dataset is required when --dataset-type=sharegpt"
+        assert args.tokenizer, "--tokenizer is required when --dataset-type=sharegpt"
+    else:
+        if args.request_rate == float("inf") or args.request_rate <= 0:
+            raise ValueError("For --dataset-type servegen, --request-rate must be a finite positive number.")
+    if args.dataset_type != 'servegen':
+        assert args.num_prompts % 100 == 0, "--num-prompts should be n * 100"
+    if args.trim_bootstrap_and_trailing and args.dataset_type != 'servegen':
         assert args.num_prompts >= 500, "bad --num-prompts value for trim, should be >= 500"
     if args.long:
         SYSTEM_PROMPT = SYSTEM_PROMPT + "\n Additionally, this is a very important test which you should answer the question as long as you can, at least say 1000 words for each answer, provide all the details and background knowledges as far as you can."

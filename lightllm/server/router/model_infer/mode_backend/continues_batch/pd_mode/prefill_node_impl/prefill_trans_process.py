@@ -20,6 +20,14 @@ from lightllm.utils.envs_utils import get_unique_server_name
 logger = init_logger(__name__)
 
 
+def _can_use_p2p_for_tasks(move_tasks: List[KVMoveTask], mem_managers: List[MemoryManager]) -> bool:
+    if not kv_trans_use_p2p() or len(move_tasks) == 0:
+        return False
+    src_tp = move_tasks[0].prefill_tp_in_node if move_tasks[0].prefill_tp_in_node is not None else len(mem_managers)
+    dst_tp = move_tasks[0].decode_tp_in_node if move_tasks[0].decode_tp_in_node is not None else len(mem_managers)
+    return src_tp == dst_tp == len(mem_managers)
+
+
 def _handle_kvmove_task(
     move_tasks: List[KVMoveTask],
     task_out_queue: mp.Queue,
@@ -35,7 +43,7 @@ def _handle_kvmove_task(
         if total_move_kv_len != 0:
             logger.info(f"trans start: {move_tasks[0].to_prefill_log_info()}")
             cur_mem = mem_managers[device_index]
-            if kv_trans_use_p2p():
+            if _can_use_p2p_for_tasks(move_tasks, mem_managers):
                 cur_mem.send_to_decode_node_p2p(
                     move_tasks, mem_managers, dp_size_in_node, connect_id_to_comm[connect_id]
                 )
@@ -43,9 +51,20 @@ def _handle_kvmove_task(
                 cur_mem.send_to_decode_node(move_tasks, mem_managers, dp_size_in_node, connect_id_to_comm[connect_id])
             logger.info(f"trans finished: {move_tasks[0].to_prefill_log_info()} move len: {total_move_kv_len}")
         torch.cuda.synchronize()
+        path_tag = "p2p" if _can_use_p2p_for_tasks(move_tasks, mem_managers) else (
+            "sym" if move_tasks[0].prefill_tp_in_node == move_tasks[0].decode_tp_in_node else "asym"
+        )
+        cost_s = time.time() - start
+        tps = (total_move_kv_len / cost_s) if cost_s > 0 else 0.0
         logger.info(
             f"trans cost time: {(time.time() - start)},"
             f"move_total_kv_len: {total_move_kv_len}, {move_tasks[0].to_prefill_log_info()}"
+        )
+        logger.info(
+            f"pd_trans_perf role=prefill path={path_tag} "
+            f"prefill_tp_in_node={move_tasks[0].prefill_tp_in_node} decode_tp_in_node={move_tasks[0].decode_tp_in_node} "
+            f"move_total_kv_len={total_move_kv_len} cost_s={cost_s:.6f} kv_tokens_per_s={tps:.2f} "
+            f"ms_per_kv_token={(cost_s * 1000.0 / max(total_move_kv_len, 1)):.6f}"
         )
         task_out_queue.put("ok")
     except BaseException as e:

@@ -28,20 +28,23 @@ class PDPrefillInferRpcServer(rpyc.Service):
     def exposed_remove_req_refs_from_prompt_cache(self, group_req_ids: List[int]):
         group_req_ids = obtain(group_req_ids)
         acquire_lock_until_ready(self.backend.lock_nccl_group)
-        for group_req_id in group_req_ids:
-            if group_req_id in g_kv_move_task_cache:
-                task, share_node = g_kv_move_task_cache.pop(group_req_id)
-                if share_node is not None:
-                    self.backend.radix_cache.dec_node_ref_counter(share_node)
-                # 减少日志数量
-                if self.is_master_in_dp:
-                    logger.info(f"unfrozen tokens for req id: {group_req_id}")
+        try:
+            for group_req_id in group_req_ids:
+                task = None
+                if group_req_id in g_kv_move_task_cache:
+                    task, share_node = g_kv_move_task_cache.pop(group_req_id)
+                    if share_node is not None:
+                        self.backend.radix_cache.dec_node_ref_counter(share_node)
+                    # 减少日志数量
+                    if self.is_master_in_dp:
+                        logger.info(f"unfrozen tokens for req id: {group_req_id}")
 
-            # 更新调度元数据
-            if self.is_master_in_dp:
-                with g_router_lock.obj:
-                    self.backend.shared_token_load.add_frozened_token_count(
-                        -len(task.input_tokens), self.dp_rank_in_node
-                    )
-        release_acquired_lock()
+                # 仅在真实释放到缓存引用时，更新调度元数据。
+                if self.is_master_in_dp and task is not None:
+                    with g_router_lock.obj:
+                        self.backend.shared_token_load.add_frozened_token_count(
+                            -len(task.input_tokens), self.dp_rank_in_node
+                        )
+        finally:
+            release_acquired_lock()
         return

@@ -115,6 +115,9 @@ class DecodeNodeInfo:
     ip: str
     rpyc_port: str
     max_new_tokens: int
+    # tp in current node, used by normal pd path to decide symmetric/asymmetric kv transfer.
+    tp_in_node: int = 1
+    tp_total: int = 1
 
 
 @dataclass
@@ -128,6 +131,9 @@ class PDTransJoinInfo:
     # 用于标识一次唯一的连接，prefill_id 和 decode_id 相同时，可能因为网络原因重连，为了更好的区分
     # 一次连接，使用一个 uuid 为其标识
     connect_id: str
+    # topology metadata for normal pd asymmetric tp transfer.
+    prefill_tp_in_node: int = 1
+    decode_tp_in_node: int = 1
 
 
 @dataclass
@@ -154,6 +160,14 @@ class KVMoveTask:
     prefill_dp_index: int
     decode_dp_index: int
     pd_master_node_id: int
+    # topology metadata for normal pd asymmetric tp transfer.
+    prefill_tp_in_node: int = 1
+    decode_tp_in_node: int = 1
+    # Optional sharding metadata for one logical request split into multiple transport shards.
+    shard_total: int = 1
+    shard_id: int = 0
+    # Optional routing key for stable multi-connection hashing; defaults to group_request_id when 0.
+    route_key: int = 0
     mark_start_time: float = None
     # 标记任务使用某个连接id进行传输
     connect_id: str = None
@@ -179,6 +193,11 @@ class KVMoveTask:
         return log + f" connect_id: {self.connect_id}"
 
     def id(self):
+        return self.group_request_id
+
+    def task_cache_key(self):
+        if int(getattr(self, "shard_total", 1)) > 1:
+            return (self.group_request_id, int(getattr(self, "shard_id", 0)))
         return self.group_request_id
 
     def get_cost_time(self):

@@ -41,14 +41,22 @@ class KVTransConnectObj:
     # ==================================================================================
 
     def create(
-        self, decode_node_id: int, decode_node_ip: str, decode_node_rpyc_port: int, manager: "PrefillKVMoveManager"
+        self,
+        decode_node_id: int,
+        decode_node_ip: str,
+        decode_node_rpyc_port: int,
+        decode_tp_in_node: int,
+        manager: "PrefillKVMoveManager",
+        preferred_device_index: int = None,
     ):
-        device_index = manager.get_next_device_index()  # 分配使用的显卡index
+        device_index = preferred_device_index if preferred_device_index is not None else manager.get_next_device_index()
         self.kv_trans_process = manager.kv_trans_processes[device_index]
         prefill_node_id = manager.args.pd_node_id
         self.connect_id = str(uuid.uuid4())
         self.decode_node_id = decode_node_id
         self.prefill_node_id = prefill_node_id
+        self.prefill_tp_in_node = manager.node_world_size
+        self.decode_tp_in_node = decode_tp_in_node
         self.device_index = device_index
         self.manager = manager
         self.timer_checker = TimeChecker(6)
@@ -75,6 +83,8 @@ class KVTransConnectObj:
                     decode_id=decode_node_id,
                     decode_device_id=-1,
                     connect_id=self.connect_id,
+                    prefill_tp_in_node=self.prefill_tp_in_node,
+                    decode_tp_in_node=self.decode_tp_in_node,
                 )
             )
 
@@ -86,6 +96,8 @@ class KVTransConnectObj:
                     self.kv_trans_process.kv_trans_port,
                     manager.args.max_total_token_num,
                     self.connect_id,
+                    self.prefill_tp_in_node,
+                    self.decode_tp_in_node,
                 )
             )
             self.max_kv_trans_token_num = max_kv_trans_token_num
@@ -118,6 +130,20 @@ class KVTransConnectObj:
             else:
                 break
         return ans_list
+
+    def _split_by_transfer_signature(self, tasks: List[KVMoveTask]) -> List[List[KVMoveTask]]:
+        groups = {}
+        for task in tasks:
+            sig = (
+                int(getattr(task, "prefill_tp_in_node", 1) or 1),
+                int(getattr(task, "decode_tp_in_node", 1) or 1),
+                int(getattr(task, "shard_total", 1) or 1),
+                int(getattr(task, "shard_id", 0) or 0),
+            )
+            if sig not in groups:
+                groups[sig] = []
+            groups[sig].append(task)
+        return list(groups.values())
 
     # ==================================================================================
     # 与 decode 节点进行元数据交互，申请锁定资源准备进行kv的传输
@@ -166,9 +192,10 @@ class KVTransConnectObj:
                         logger.info(f"prefill node kv move task req_id: {move_task.id()} not send, decode is busy")
 
                 if ok_trans_list:
-                    self.ready_kv_trans_task_queue.put(
-                        ok_trans_list, error_handle_func=self.manager.put_to_release_task_queue
-                    )
+                    for grouped_tasks in self._split_by_transfer_signature(ok_trans_list):
+                        self.ready_kv_trans_task_queue.put(
+                            grouped_tasks, error_handle_func=self.manager.put_to_release_task_queue
+                        )
 
             except BaseException as e:
                 logger.exception(str(e))
@@ -185,6 +212,15 @@ class KVTransConnectObj:
     # ==================================================================================
     # 将准备好 kv 传输的请求进行 kv 传输
     # ==================================================================================
+
+    def _can_run_without_global_lock(self, move_tasks: List[KVMoveTask]) -> bool:
+        if len(move_tasks) == 0:
+            return False
+        src_tp = int(getattr(move_tasks[0], "prefill_tp_in_node", self.manager.node_world_size) or self.manager.node_world_size)
+        dst_tp = int(getattr(move_tasks[0], "decode_tp_in_node", self.manager.node_world_size) or self.manager.node_world_size)
+        if src_tp != dst_tp:
+            return True
+        return kv_trans_use_p2p() and src_tp == dst_tp == self.manager.node_world_size
     def _transfer_kv(self, move_tasks: List[KVMoveTask]):
         with self.kv_trans_process.device_lock:
             clear_queue(self.kv_trans_process.task_out_queue)
@@ -224,7 +260,7 @@ class KVTransConnectObj:
                         f"queue time {move_task.get_cost_time()} s "
                     )
 
-                if not kv_trans_use_p2p():
+                if not self._can_run_without_global_lock(move_tasks):
                     with self.manager.kv_trans_lock:
                         self._transfer_kv(move_tasks)
                 else:
@@ -323,6 +359,8 @@ class KVTransConnectObj:
         log += f"decode_node_id: {self.decode_node_id} "
         log += f"prefill_node_id: {self.prefill_node_id} "
         log += f"device_index: {self.device_index} "
+        log += f"prefill_tp_in_node: {self.prefill_tp_in_node} "
+        log += f"decode_tp_in_node: {self.decode_tp_in_node} "
         return log
 
 

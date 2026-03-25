@@ -6,13 +6,13 @@ import os
 import gc
 import signal
 import copy
-import numpy as np
 import psutil
 import threading
 import inspect
 import collections
 import setproctitle
 from typing import List, Dict, Union
+import zlib
 from lightllm.utils.log_utils import init_logger
 from .prefill_infer_rpyc import PDPrefillInferRpcServer
 import torch.multiprocessing as mp
@@ -45,6 +45,9 @@ class PrefillKVMoveManager:
         from .prefill_trans_obj import KVTransConnectObj
 
         self.connect_id_to_trans_obj: Dict[str, KVTransConnectObj] = {}
+        # route_key -> {slot_id: connect_id}
+        self.route_slot_to_connect_id: Dict[tuple, Dict[int, str]] = {}
+        self.decode_node_rr_cursor: Dict[tuple, int] = {}
 
         for port in self.args.pd_node_infer_rpyc_ports:
             socket_path = f"/tmp/{get_unique_server_name()}_prefill_node_infer_rpyc_{port}"
@@ -174,7 +177,17 @@ class PrefillKVMoveManager:
         counts = [0 for _ in range(self.node_world_size)]
         for obj in self.connect_id_to_trans_obj.values():
             counts[obj.device_index] += 1
-        device_index = int(np.argmin(counts))
+        min_count = min(counts)
+        candidate_indexes = [i for i, c in enumerate(counts) if c == min_count]
+        # Break ties by rotating from a moving cursor to avoid long-term bias to low device ids.
+        start = self.decode_node_rr_cursor.get((-1, -1), 0) % self.node_world_size
+        device_index = candidate_indexes[0]
+        for offset in range(self.node_world_size):
+            idx = (start + offset) % self.node_world_size
+            if idx in candidate_indexes:
+                device_index = idx
+                break
+        self.decode_node_rr_cursor[(-1, -1)] = (device_index + 1) % self.node_world_size
         return device_index
 
     def remove_trans_obj(self, connect_id):
@@ -187,18 +200,36 @@ class PrefillKVMoveManager:
 
     def __get_trans_obj(self, task: KVMoveTask):
         self.__remove_dead_trans_obj()
-        # 如果已经存在连接对象，直接返回
-        for obj in self.connect_id_to_trans_obj.values():
-            if obj.decode_node_id == task.decode_node.node_id:
-                return obj
+        route_key = (task.decode_node.node_id, int(task.decode_tp_in_node))
+        route_slot_num = max(1, min(self.node_world_size, int(task.decode_tp_in_node)))
+        req_key = task.route_key if getattr(task, "route_key", 0) != 0 else task.group_request_id
+        if isinstance(req_key, int):
+            slot_id = req_key % route_slot_num
+        else:
+            slot_id = zlib.adler32(str(req_key).encode("utf-8")) % route_slot_num
 
-        # 如果不存在连接对象，创建新的连接对象
+        if route_key not in self.route_slot_to_connect_id:
+            self.route_slot_to_connect_id[route_key] = {}
+
+        slot_connect_ids = self.route_slot_to_connect_id[route_key]
+        connect_id = slot_connect_ids.get(slot_id, None)
+        if connect_id is not None and connect_id in self.connect_id_to_trans_obj:
+            return self.connect_id_to_trans_obj[connect_id]
+
         gc.collect()
         from .prefill_trans_obj import KVTransConnectObj
 
         trans_obj = KVTransConnectObj()
-        trans_obj.create(task.decode_node.node_id, task.decode_node.ip, task.decode_node.rpyc_port, self)
+        trans_obj.create(
+            task.decode_node.node_id,
+            task.decode_node.ip,
+            task.decode_node.rpyc_port,
+            task.decode_tp_in_node,
+            self,
+            preferred_device_index=(slot_id % self.node_world_size),
+        )
         self.connect_id_to_trans_obj[trans_obj.connect_id] = trans_obj
+        slot_connect_ids[slot_id] = trans_obj.connect_id
         return trans_obj
 
     def __remove_dead_trans_obj(self):
@@ -211,11 +242,21 @@ class PrefillKVMoveManager:
             self.connect_id_to_trans_obj.pop(connect_id, None)
 
         if del_connect_ids:
+            del_connect_ids_set = set(del_connect_ids)
+            for route_key in list(self.route_slot_to_connect_id.keys()):
+                slot_map = self.route_slot_to_connect_id[route_key]
+                for slot_id in list(slot_map.keys()):
+                    if slot_map[slot_id] in del_connect_ids_set:
+                        slot_map.pop(slot_id, None)
+                if len(slot_map) == 0:
+                    self.route_slot_to_connect_id.pop(route_key, None)
+
+        if del_connect_ids:
             gc.collect()
         return
 
 
-def _init_env(args, info_queue: mp.Queue, event: mp.Event):
+def _init_env(args, info_queue: mp.Queue, event):
     import lightllm.utils.rpyc_fix_utils as _
 
     # 注册graceful 退出的处理

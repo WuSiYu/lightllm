@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import copy
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -95,7 +96,7 @@ class ChunckedPrefillForPrefillNode(ChunkedPrefillBackend):
                     assert len(key) == len(value)
                     # 将下面的请求放入到任务队列中, 注意要使用raidx cache 返回的value
                     decode_node_info = DecodeNodeInfo(**req.shm_req.sample_params.move_kv_to_decode_node.to_dict())
-                    task = KVMoveTask(
+                    base_task = KVMoveTask(
                         group_request_id=req.shm_req.group_req_id,
                         input_tokens=key.tolist(),
                         prefill_token_indexes=value.tolist(),
@@ -106,13 +107,30 @@ class ChunckedPrefillForPrefillNode(ChunkedPrefillBackend):
                         prefill_dp_index=self.dp_rank_in_node,
                         decode_dp_index=None,
                         pd_master_node_id=req.shm_req.sample_params.pd_master_node_id.get(),
+                        prefill_tp_in_node=self.node_world_size,
+                        decode_tp_in_node=decode_node_info.tp_in_node,
                         mark_start_time=time.time(),
                     )
-                    g_kv_move_task_cache[task.group_request_id] = (task, share_node)
+                    g_kv_move_task_cache[base_task.group_request_id] = (base_task, share_node)
+
+                    # For asymmetric topology, split one logical request into multiple transport shards.
+                    decode_tp_in_node = int(decode_node_info.tp_in_node) if decode_node_info.tp_in_node is not None else 1
+                    shard_total = 1
+                    if int(self.node_world_size) != decode_tp_in_node and decode_tp_in_node > 1:
+                        shard_total = max(1, min(int(self.node_world_size), decode_tp_in_node))
+
+                    shard_tasks = []
+                    for shard_id in range(shard_total):
+                        shard_task = copy.copy(base_task)
+                        shard_task.shard_total = shard_total
+                        shard_task.shard_id = shard_id
+                        shard_task.route_key = int(base_task.group_request_id) * 131 + shard_id
+                        shard_tasks.append(shard_task)
 
                     # 注意兼容纯 tp 和 tp dp 混合模式的逻辑
                     if self.is_master_in_dp:
-                        self.info_queue.put(task)
+                        for shard_task in shard_tasks:
+                            self.info_queue.put(shard_task)
         except BaseException as e:
             logger.exception(str(e))
         g_infer_state_lock.release()

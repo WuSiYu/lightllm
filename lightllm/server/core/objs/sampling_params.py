@@ -248,6 +248,8 @@ class DecodeNode(ctypes.Structure):
         ("ip", ctypes.c_int32 * 4),
         ("rpyc_port", ctypes.c_int),
         ("max_new_tokens", ctypes.c_int),
+        ("tp_in_node", ctypes.c_int),
+        ("tp_total", ctypes.c_int),
     ]
 
     def initialize(self, data_dict):
@@ -266,6 +268,8 @@ class DecodeNode(ctypes.Structure):
 
         self.rpyc_port = data_dict["rpyc_port"]
         self.max_new_tokens = data_dict["max_new_tokens"]
+        self.tp_in_node = data_dict.get("tp_in_node", 1)
+        self.tp_total = data_dict.get("tp_total", 1)
 
     def to_dict(self):
         if not self.exists:
@@ -275,6 +279,8 @@ class DecodeNode(ctypes.Structure):
             "ip": ".".join(str(self.ip[i]) for i in range(4)),
             "rpyc_port": self.rpyc_port,
             "max_new_tokens": self.max_new_tokens,
+            "tp_in_node": self.tp_in_node,
+            "tp_total": self.tp_total,
         }
 
 

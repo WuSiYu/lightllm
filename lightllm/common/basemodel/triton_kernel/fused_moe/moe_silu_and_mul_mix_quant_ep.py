@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 from lightllm.utils.profiler import PerfCounter
-from .moe_silu_and_mul_config import MoeSiluAndMulKernelConfig
+# from .moe_silu_and_mul_config import MoeSiluAndMulKernelConfig
 
 
 @triton.jit

@@ -4,7 +4,7 @@ import triton.language as tl
 from typing import Dict
 
 from lightllm.utils.profiler import PerfCounter
-from .moe_sum_recude_config import MoeSumReduceKernelConfig
+# from .moe_sum_recude_config import MoeSumReduceKernelConfig
 from typing import Any, Callable, Dict, Optional, Tuple
 from lightllm.common.triton_utils.autotuner import autotune
 

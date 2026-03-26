@@ -341,12 +341,6 @@ class MemoryManager:
         # asymmetric path: re-shard kv by global head dimension and send by decode tp layout.
         cur_device_index = self.kv_buffer.get_device()
         cur_mem = mem_managers[cur_device_index]
-        # Use dedicated per-source staging tensors to avoid alias overwrite across source ranks.
-        remote_move_buffer_views = {
-            i: torch.empty((1, token_num, 2 * mem.head_num, self.head_dim), dtype=self.dtype, device=cur_mem.kv_buffer.device)
-            for i, mem in enumerate(mem_managers)
-            if i != cur_device_index
-        }
 
         src_head_num = mem_managers[0].head_num
         total_head_num = src_head_num * src_tp_in_node
@@ -369,71 +363,101 @@ class MemoryManager:
             active_dst_ranks = list(range(dst_tp_in_node))
         if len(active_dst_ranks) == 0:
             return
-        prepare_ms = 0.0
-        reshard_ms = 0.0
-        nccl_ms = 0.0
-        bcast_ops = 0
+
+        # Pre-compute reshard plan: determine which src_ranks contribute to each
+        # dst_rank, and cache the head-overlap slicing parameters. This avoids
+        # recomputing overlaps in the O(layers * dst_ranks * src_ranks) inner loop
+        # and, critically, identifies which source ranks are actually needed so we
+        # skip expensive cross-GPU gathers for unused sources.
+        active_src_ranks = set()
+        # reshard_plan: list of (dst_rank, ops, expected_packed)
+        #   ops: list of (src_rank, local_start, local_end, copy_len, pack_offset)
+        reshard_plan = []
+        for dst_rank in active_dst_ranks:
+            global_start = dst_rank * dst_head_num
+            global_end = global_start + dst_head_num
+            ops = []
+            packed = 0
+            for src_rank in range(src_tp_in_node):
+                src_start = src_rank * src_head_num
+                src_end = src_start + src_head_num
+                overlap_start = max(global_start, src_start)
+                overlap_end = min(global_end, src_end)
+                if overlap_start >= overlap_end:
+                    continue
+                local_start = overlap_start - src_start
+                local_end = overlap_end - src_start
+                copy_len = local_end - local_start
+                ops.append((src_rank, local_start, local_end, copy_len, packed))
+                packed += copy_len
+                active_src_ranks.add(src_rank)
+            if packed != dst_head_num:
+                raise ValueError(
+                    f"Invalid overlap while resharding: dst_rank={dst_rank}, "
+                    f"packed_head_num={packed}, dst_head_num={dst_head_num}, "
+                    f"src_head_num={src_head_num}, src_tp_in_node={src_tp_in_node}"
+                )
+            reshard_plan.append((dst_rank, ops))
+
+        # Only allocate staging buffers for remote active source ranks (skip unused
+        # sources entirely — e.g. for tp2→tp4 shard_total=2, each shard only needs
+        # one of the two source ranks).
+        remote_staging = {
+            src_rank: torch.empty(
+                (1, token_num, 2 * src_head_num, self.head_dim),
+                dtype=self.dtype,
+                device=cur_mem.kv_buffer.device,
+            )
+            for src_rank in active_src_ranks
+            if src_rank != cur_device_index
+        }
+
         send_pack_buffer = torch.empty(
             (1, token_num, 2 * dst_head_num, self.head_dim), dtype=self.dtype, device=cur_mem.kv_buffer.device
         )
 
+        prepare_ms = 0.0
+        reshard_ms = 0.0
+        nccl_ms = 0.0
+        bcast_ops = 0
+
         for layer_index in range(mem_managers[0].layer_num):
-            src_buffers = []
-            for i, mem in enumerate(mem_managers):
-                t0 = time.perf_counter()
-                token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
-                if i != cur_device_index:
-                    src_slice = mem.kv_buffer[layer_index : layer_index + 1, token_indexes, :, :]
-                    new_move_buffer = remote_move_buffer_views[i]
-                    new_move_buffer.copy_(src_slice, non_blocking=False)
-                    move_buffer = new_move_buffer
-                    bcast_ops += 1
+            # Gather phase: only stage from active source ranks.
+            t_prep = time.perf_counter()
+            local_src_buffer = None
+            for src_rank in active_src_ranks:
+                if src_rank == cur_device_index:
+                    mem = mem_managers[src_rank]
+                    local_src_buffer = mem._get_kv_move_data(
+                        token_indexes_by_device[mem.kv_buffer.device.index], layer_index
+                    )
                 else:
-                    move_buffer = mem._get_kv_move_data(token_indexes, layer_index)
-
-                prepare_ms += (time.perf_counter() - t0) * 1000.0
-
-                src_buffers.append(move_buffer)
-
-            if len(src_buffers) != src_tp_in_node:
-                raise ValueError(f"Unexpected src buffer num: got {len(src_buffers)} expect {src_tp_in_node}")
-
-            for dst_rank in active_dst_ranks:
-                start = dst_rank * dst_head_num
-                end = start + dst_head_num
-                t4 = time.perf_counter()
-                packed_head_num = 0
-                for src_rank, src_buffer in enumerate(src_buffers):
-                    src_start = src_rank * src_head_num
-                    src_end = src_start + src_head_num
-                    overlap_start = max(start, src_start)
-                    overlap_end = min(end, src_end)
-                    if overlap_start >= overlap_end:
-                        continue
-                    local_start = overlap_start - src_start
-                    local_end = overlap_end - src_start
-                    copy_len = local_end - local_start
-                    send_pack_buffer[:, :, packed_head_num : packed_head_num + copy_len, :].copy_(
-                        src_buffer[:, :, local_start:local_end, :], non_blocking=False
+                    mem = mem_managers[src_rank]
+                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                    remote_staging[src_rank].copy_(
+                        mem.kv_buffer[layer_index : layer_index + 1, token_indexes, :, :],
+                        non_blocking=False,
                     )
-                    send_pack_buffer[
-                        :, :, dst_head_num + packed_head_num : dst_head_num + packed_head_num + copy_len, :
-                    ].copy_(src_buffer[:, :, src_head_num + local_start : src_head_num + local_end, :], non_blocking=False)
-                    packed_head_num += copy_len
+                    bcast_ops += 1
+            prepare_ms += (time.perf_counter() - t_prep) * 1000.0
 
-                if packed_head_num != dst_head_num:
-                    raise ValueError(
-                        f"Invalid overlap while resharding: dst_rank={dst_rank}, start={start}, end={end}, "
-                        f"packed_head_num={packed_head_num}, dst_head_num={dst_head_num}, "
-                        f"src_head_num={src_head_num}, src_tp_in_node={src_tp_in_node}"
+            # Reshard + send: pack heads for each dst_rank using pre-computed plan.
+            for dst_rank, ops in reshard_plan:
+                t_reshard = time.perf_counter()
+                for src_rank, ls, le, cl, ps in ops:
+                    src_buf = local_src_buffer if src_rank == cur_device_index else remote_staging[src_rank]
+                    send_pack_buffer[:, :, ps : ps + cl, :].copy_(
+                        src_buf[:, :, ls:le, :], non_blocking=False
                     )
-                reshard_ms += (time.perf_counter() - t4) * 1000.0
-                expected_shape = (1, token_num, 2 * dst_head_num, self.head_dim)
-                if send_pack_buffer.shape != expected_shape:
-                    raise ValueError(f"send buffer shape mismatch: got {send_pack_buffer.shape}, want {expected_shape}")
-                t5 = time.perf_counter()
+                    send_pack_buffer[:, :, dst_head_num + ps : dst_head_num + ps + cl, :].copy_(
+                        src_buf[:, :, src_head_num + ls : src_head_num + le, :], non_blocking=False
+                    )
+                reshard_ms += (time.perf_counter() - t_reshard) * 1000.0
+
+                t_nccl = time.perf_counter()
                 nccl_comm.send(send_pack_buffer, dst=1)
-                nccl_ms += (time.perf_counter() - t5) * 1000.0
+                nccl_ms += (time.perf_counter() - t_nccl) * 1000.0
+
         total_ms = (time.perf_counter() - total_start) * 1000.0
         send_bytes = (
             len(move_token_indexes)
@@ -573,30 +597,32 @@ class MemoryManager:
         if len(active_dst_ranks) == 0:
             return
 
+        # Pre-compute per-rank write targets to avoid dict lookups and conditionals
+        # in the O(layers * active_dst_ranks) inner loop.
+        recv_rank_info = []  # [(mem, token_indexes, is_local, remote_buf)]
+        for i in active_dst_ranks:
+            mem = mem_managers[i]
+            tidx = token_indexes_by_device[mem.kv_buffer.device.index]
+            is_local = i == cur_device_index
+            remote_buf = None if is_local else remote_recv_buffer_views[i]
+            recv_rank_info.append((mem, tidx, is_local, remote_buf))
+
         recv_nccl_ms = 0.0
         recv_write_ms = 0.0
         bcast_ops = 0
         for layer_index in range(mem_managers[0].layer_num):
-            for i in active_dst_ranks:
-                mem = mem_managers[i]
+            for mem, tidx, is_local, remote_buf in recv_rank_info:
                 t0 = time.perf_counter()
                 nccl_comm.recv(recive_buffer, src=0)
                 recv_nccl_ms += (time.perf_counter() - t0) * 1000.0
-                if recive_buffer.shape != expected_shape:
-                    raise ValueError(f"Unexpected recv buffer shape {recive_buffer.shape}, expect {expected_shape}")
-                if i == cur_device_index:
-                    t1 = time.perf_counter()
-                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
-                    mem._write_kv_move_data(token_indexes, recive_buffer, layer_index)
-                    recv_write_ms += (time.perf_counter() - t1) * 1000.0
+                t1 = time.perf_counter()
+                if is_local:
+                    mem._write_kv_move_data(tidx, recive_buffer, layer_index)
                 else:
-                    new_recive_buffer = remote_recv_buffer_views[i]
-                    t1 = time.perf_counter()
-                    new_recive_buffer.copy_(recive_buffer, non_blocking=False)
+                    remote_buf.copy_(recive_buffer, non_blocking=False)
                     bcast_ops += 1
-                    token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
-                    mem._write_kv_move_data(token_indexes, new_recive_buffer, layer_index)
-                    recv_write_ms += (time.perf_counter() - t1) * 1000.0
+                    mem._write_kv_move_data(tidx, remote_buf, layer_index)
+                recv_write_ms += (time.perf_counter() - t1) * 1000.0
         total_ms = (time.perf_counter() - total_start) * 1000.0
         recv_bytes = (
             len(move_token_indexes)

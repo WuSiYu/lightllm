@@ -179,6 +179,15 @@ def get_current_device_id():
     return int(get_environ("LIGHTLLM_CURRENT_DEVICE_ID"))
 
 
+def get_physical_device_id():
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    cuda_device_id = get_current_device_id()
+    if cuda_visible:
+        devices = [int(d.strip()) for d in cuda_visible.split(",")]
+        return devices[cuda_device_id]
+    return cuda_device_id
+
+
 def set_current_rank_in_node(rank: int):
     set_environ("LIGHTLLM_CURRENT_RANK_IN_NODE", rank)
 

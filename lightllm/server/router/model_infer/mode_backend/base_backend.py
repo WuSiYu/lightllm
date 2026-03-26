@@ -142,11 +142,13 @@ class ModeBackend:
 
         if self.args.shared_weight == "master":
             from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorServer
-            port = self.args.shared_weight_master_port_start + get_current_device_id()
+            from lightllm.utils.dist_utils import get_physical_device_id
+            port = self.args.shared_weight_master_port_start + get_physical_device_id()
             TensorServer().start(port=port)
         elif self.args.shared_weight == "slave":
             from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient
-            port = self.args.shared_weight_master_port_start + get_current_device_id()
+            from lightllm.utils.dist_utils import get_physical_device_id
+            port = self.args.shared_weight_master_port_start + get_physical_device_id()
             TensorClient().connect(port=port)
         else:
             assert self.args.shared_weight is None, f"unknown shared_weight mode: {self.args.shared_weight}"

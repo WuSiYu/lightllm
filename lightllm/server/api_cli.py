@@ -46,8 +46,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--select_p_d_node_strategy",
         type=str,
         default="round_robin",
-        choices=["random", "round_robin", "adaptive_load"],
-        help="pd master use this strategy to select p d node, can be round_robin, random or adaptive_load",
+        choices=["random", "round_robin", "adaptive_load", "flex_tp"],
+        help="pd master use this strategy to select p d node, can be round_robin, random, adaptive_load or flex_tp",
+    )
+    parser.add_argument(
+        "--flex_tp_threshold",
+        type=int,
+        default=8000,
+        help="flex_tp mode: requests with input_token_num > threshold are routed to large TP nodes",
     )
     parser.add_argument(
         "--config_server_host",

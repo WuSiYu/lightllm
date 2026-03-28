@@ -1,0 +1,61 @@
+import argparse
+import uuid
+import requests
+import json
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Send a long text to LLM for summarization")
+    parser.add_argument("file", help="Path to the text file to summarize")
+    parser.add_argument("--host", default=None, help="Server host (default: hostname -i)")
+    parser.add_argument("--port", type=int, default=60011, help="Server port (default: 60011)")
+    parser.add_argument("--max-new-tokens", type=int, default=200, help="Max new tokens (default: 200)")
+    args = parser.parse_args()
+
+    with open(args.file, "r") as f:
+        content = f.read()
+
+    nonce = uuid.uuid4().hex
+    system_prompt = f"{nonce} ( <-- cache_bypass, ignore it ), You are a helpful assistant for code or document summarization."
+
+    prompt = f"{system_prompt}\n\n请用50字总结以下内容：\n\n{content}\n\n总结："
+
+    if args.host is None:
+        import subprocess
+        args.host = subprocess.check_output(["hostname", "-i"]).decode().strip()
+
+    url = f"http://{args.host}:{args.port}/generate"
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": args.max_new_tokens,
+            "frequency_penalty": 1,
+        },
+    }
+
+    print(f"Sending request to {url}")
+    print(f"Prompt length: {len(prompt)} chars")
+
+    start = time.time()
+    resp = requests.post(url, json=payload)
+    elapsed = time.time() - start
+
+    resp.raise_for_status()
+    result = resp.json()
+
+    generated = result["generated_text"]
+    if isinstance(generated, list):
+        generated = generated[0]
+
+    print(f"\n--- Result ---")
+    print(generated)
+    print(f"\n--- Stats ---")
+    print(f"Prompt tokens: {result.get('prompt_tokens', 'N/A')}")
+    print(f"Output tokens: {result.get('count_output_tokens', 'N/A')}")
+    print(f"Finish reason: {result.get('finish_reason', 'N/A')}")
+    print(f"Time: {elapsed:.2f}s")
+
+
+if __name__ == "__main__":
+    main()

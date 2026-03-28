@@ -105,6 +105,8 @@ class TpPartBaseModel:
         self._init_quant()
 
         self._init_weights()
+        self._load_hf_weights()
+        self._share_weights()
         self._init_mem_manager()
         self._init_kv_move_buffer()
         self._check_mem_size()
@@ -112,7 +114,6 @@ class TpPartBaseModel:
         self._init_infer_layer()
         self._init_some_value()
         self._init_custom()
-        self._load_hf_weights()
         # wait必须在init cudagraph 之前，避免错误捕获
         self._wait_other_modules_ready()
 
@@ -178,6 +179,15 @@ class TpPartBaseModel:
         return
 
     def _load_hf_weights(self):
+        from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient
+
+        if TensorClient():
+            # Slave mode: skip loading from disk — weights will be replaced by
+            # shared IPC tensors in _share_weights(). This avoids unnecessary
+            # disk I/O and reduces peak GPU memory.
+            logger.info("shared_weight (slave): skipping disk weight loading")
+            return
+
         load_hf_weights(
             self.data_type,
             weight_dir=self.weight_dir_,
@@ -187,6 +197,34 @@ class TpPartBaseModel:
         )
         self.pre_post_weight.verify_load()
         [weight.verify_load() for weight in self.trans_layers_weight]
+        return
+
+    def _share_weights(self):
+        from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorServer, TensorClient
+
+        if not TensorServer() and not TensorClient():
+            return
+
+        from lightllm.common.basemodel.layer_weights.meta_weights.base_weight import BaseWeight
+
+        def _invoke_to_gpu_device(layer_weight):
+            for attr_name in dir(layer_weight):
+                attr = getattr(layer_weight, attr_name, None)
+                if isinstance(attr, BaseWeight):
+                    attr._to_gpu_device()
+
+        # Master: register all weights, then slave can fetch them
+        # Slave: replace local weights with shared weights from master
+        _invoke_to_gpu_device(self.pre_post_weight)
+        for layer in self.trans_layers_weight:
+            _invoke_to_gpu_device(layer)
+
+        # Free original weight memory on slave
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        mode = "master" if TensorServer() else "slave"
+        logger.info(f"shared_weight ({mode}): _share_weights() completed")
         return
 
     def _init_mem_manager(self):

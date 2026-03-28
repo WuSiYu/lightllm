@@ -70,6 +70,18 @@ _mid_end_rates = []
 FAILED_REQUESTS = 0
 MAX_REQ_TOTAL_TOKENS = 16000
 
+# Predefined simple mixed uniform distributions for --dataset-type simple.X
+# Each entry is a list of components: {weight, input_range (min,max), output_range (min,max)}
+SIMPLE_DATASETS = {
+    "1": [
+        {"weight": 1.0, "input_range": (100, 1000),   "output_range": (50, 500)},
+    ],
+    "2": [
+        {"weight": 0.97, "input_range": (100, 1000),   "output_range": (50, 500)},
+        {"weight": 0.03, "input_range": (1000, 20000), "output_range": (50, 500)},
+    ],
+}
+
 def get_tokenizer(
     tokenizer_name: str,
     tokenizer_mode: str = "auto",
@@ -147,7 +159,7 @@ def sample_requests_from_servegen(args) -> List[Request]:
         from servegen.utils import get_constant_rate_fn
 
     duration = 300
-    pool = ClientPool(Category.LANGUAGE, "m-large")
+    pool = ClientPool(Category.LANGUAGE, args.servegen_mode)
     rate_fn = get_constant_rate_fn(pool.span(0, duration), args.request_rate)
     sg_requests = generate_workload(pool, rate_fn, duration=duration, seed=args.seed)
 
@@ -199,6 +211,49 @@ def sample_requests_from_servegen(args) -> List[Request]:
         print(f"servegen avg / p50 / p90 / p95 / p99 input tokens: {avg_in:.2f} / {p50_in:.2f} / {p90_in:.2f} / {p95_in:.2f} / {p99_in:.2f}")
         print(f"servegen avg / p50 / p90 / p95 / p99 output tokens: {avg_out:.2f} / {p50_out:.2f} / {p90_out:.2f} / {p95_out:.2f} / {p99_out:.2f}")
     return sampled_requests
+
+def sample_requests_simple(args) -> List[Request]:
+    dataset_id = args.dataset_type.split(".", 1)[1]
+    if dataset_id not in SIMPLE_DATASETS:
+        raise ValueError(
+            f"Unknown simple dataset '{args.dataset_type}'. "
+            f"Available: {', '.join('simple.' + k for k in SIMPLE_DATASETS)}"
+        )
+
+    config = SIMPLE_DATASETS[dataset_id]
+    weights = [c["weight"] for c in config]
+
+    sampled_requests: List[Request] = []
+    for _ in range(args.num_prompts):
+        comp = random.choices(config, weights=weights, k=1)[0]
+        input_len = random.randint(*comp["input_range"])
+        output_len = random.randint(*comp["output_range"])
+
+        system_prompt = ""
+        if args.bypass_cache:
+            nonce = uuid.uuid4().hex
+            system_prompt = f"{nonce} ( <-- cache_bypass, ignore it )"
+
+        prompts = [
+            dict(role="system", content=system_prompt),
+            dict(role="user", content=_build_user_content_by_token_budget(input_len)),
+        ]
+        sampled_requests.append(Request(
+            prompts=prompts,
+            prompt_len=input_len,
+            dataset_output_len=output_len,
+            chat_rounds=1,
+        ))
+
+    print(f"Generated {len(sampled_requests)} simple requests (dataset_type={args.dataset_type})")
+    for idx, c in enumerate(config):
+        print(f"  component {idx}: weight={c['weight']}, input=[{c['input_range'][0]},{c['input_range'][1]}], output=[{c['output_range'][0]},{c['output_range'][1]}]")
+    p_lens = [r.prompt_len for r in sampled_requests]
+    o_lens = [r.dataset_output_len for r in sampled_requests]
+    print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p99={np.percentile(p_lens,99):.1f}")
+    print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p99={np.percentile(o_lens,99):.1f}")
+    return sampled_requests
+
 
 def sample_requests(
     dataset_path: str,
@@ -305,6 +360,7 @@ async def get_request(
     input_requests: List[Request],
     request_rate: float,
     follow_request_timestamp: bool = False,
+    fixed_interval: bool = False,
 ) -> AsyncGenerator[Tuple[int, Request], None]:
     input_requests = iter(input_requests)
     t_start = time.time()
@@ -330,8 +386,12 @@ async def get_request(
         if request_rate == float("inf"):
             # If the request rate is infinity, then we don't need to wait.
             continue
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        if fixed_interval:
+            # Fixed (constant) interval between requests.
+            interval = 1.0 / request_rate
+        else:
+            # Sample the request interval from the exponential distribution.
+            interval = np.random.exponential(1.0 / request_rate)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -512,9 +572,10 @@ async def benchmark(
     request_rate: float,
     mode: Literal['known_output_len', 'unknown_output_len'] = 'unknown_output_len',
     follow_request_timestamp: bool = False,
+    fixed_interval: bool = False,
 ) -> None:
     tasks: List[asyncio.Task] = []
-    async for i, request in get_request(input_requests, request_rate, follow_request_timestamp=follow_request_timestamp):
+    async for i, request in get_request(input_requests, request_rate, follow_request_timestamp=follow_request_timestamp, fixed_interval=fixed_interval):
         task = asyncio.create_task(
             send_request(
                 request.prompts,
@@ -549,6 +610,8 @@ def main(args: argparse.Namespace):
         np.random.seed(args.seed)
         if args.dataset_type == 'servegen':
             input_requests = sample_requests_from_servegen(args)
+        elif args.dataset_type.startswith('simple.'):
+            input_requests = sample_requests_simple(args)
         else:
             tokenizer = get_tokenizer(args.tokenizer, "slow")
             input_requests = sample_requests(args.dataset, args.num_prompts, args.max_round, tokenizer, args)
@@ -569,7 +632,8 @@ def main(args: argparse.Namespace):
             input_requests,
             args.request_rate,
             mode=mode,
-            follow_request_timestamp=(args.dataset_type == 'servegen')
+            follow_request_timestamp=(args.dataset_type == 'servegen'),
+            fixed_interval=args.dataset_type.startswith('simple.'),
         ))
         benchmark_end_time = time.time()
         benchmark_time = benchmark_end_time - benchmark_start_time
@@ -670,8 +734,18 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark the online serving throughput.")
-    parser.add_argument("--dataset-type", choices=["sharegpt", "servegen"], default="sharegpt",
-                        help="dataset source type: sharegpt(need --dataset) or servegen(no --dataset needed).")
+    parser.add_argument("--dataset-type", type=str, default="sharegpt",
+                        help=(
+                            "dataset source type: "
+                            "sharegpt (need --dataset/--tokenizer), "
+                            "servegen (no --dataset needed), "
+                            "simple.N (predefined synthetic distributions, no --dataset/--tokenizer needed). "
+                            f"Available simple types: {', '.join('simple.' + k for k in SIMPLE_DATASETS)}. "
+                            "simple.1=100%% [100,1000]in [50,500]out; "
+                            "simple.2=80%% [100,1000]in [50,500]out + 20%% [1000,40000]in [50,500]out. "
+                            "simple types use fixed (constant) request intervals instead of Poisson."
+                        ))
+    parser.add_argument("--servegen-mode", default="m-large", help="ServeGen mode, only work when --dataset-type=servegen, see ServeGen repo for details.")
     parser.add_argument("--addr", type=str, default="127.0.0.1",
                         help="server addr.")
     parser.add_argument("--port", type=str, default="8000",
@@ -707,6 +781,15 @@ if __name__ == "__main__":
     if args.use_output_length_record:
         assert args.mode == 'known_output_len', "see help"
 
+    _is_simple = args.dataset_type.startswith('simple.')
+    if _is_simple:
+        _simple_id = args.dataset_type.split(".", 1)[1]
+        if _simple_id not in SIMPLE_DATASETS:
+            raise ValueError(
+                f"Unknown simple dataset '{args.dataset_type}'. "
+                f"Available: {', '.join('simple.' + k for k in SIMPLE_DATASETS)}"
+            )
+
     if args.dataset_type == 'servegen':
         if args.dataset:
             warnings.warn("--dataset is ignored when --dataset-type=servegen")
@@ -722,11 +805,24 @@ if __name__ == "__main__":
             warnings.warn("--long-1500 is ignored when --dataset-type=servegen")
         if args.long_out_3x:
             warnings.warn("--long-out-3x is ignored when --dataset-type=servegen")
+    elif _is_simple:
+        if args.dataset:
+            warnings.warn(f"--dataset is ignored when --dataset-type={args.dataset_type}")
+        if args.tokenizer:
+            warnings.warn(f"--tokenizer is ignored when --dataset-type={args.dataset_type}")
+        if args.max_round != 99999:
+            warnings.warn(f"--max-round is ignored when --dataset-type={args.dataset_type}")
+        if args.long:
+            warnings.warn(f"--long is ignored when --dataset-type={args.dataset_type}")
+        if args.long_1500:
+            warnings.warn(f"--long-1500 is ignored when --dataset-type={args.dataset_type}")
+        if args.long_out_3x:
+            warnings.warn(f"--long-out-3x is ignored when --dataset-type={args.dataset_type}")
 
-    if args.dataset_type != 'servegen':
+    if args.dataset_type not in ('servegen',) and not _is_simple:
         assert args.dataset, "--dataset is required when --dataset-type=sharegpt"
         assert args.tokenizer, "--tokenizer is required when --dataset-type=sharegpt"
-    else:
+    elif args.dataset_type == 'servegen':
         if args.request_rate == float("inf") or args.request_rate <= 0:
             raise ValueError("For --dataset-type servegen, --request-rate must be a finite positive number.")
     if args.dataset_type != 'servegen':

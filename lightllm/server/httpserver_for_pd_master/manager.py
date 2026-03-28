@@ -84,9 +84,15 @@ class HttpServerManagerForPDMaster:
         return len(prompt_ids) + image_tokens + img_count + audio_tokens + audio_count
 
     async def select_p_d_node(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams, multimodal_params: MultimodalParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        multimodal_params: MultimodalParams,
+        input_token_num: Optional[int] = None,
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
-        return self.pd_manager.select_p_d_node(prompt, sampling_params, multimodal_params)
+        return await self.pd_manager.select_p_d_node(
+            prompt, sampling_params, multimodal_params, input_token_num=input_token_num
+        )
 
     async def generate(
         self,
@@ -118,6 +124,8 @@ class HttpServerManagerForPDMaster:
         block_group_request_id = None
         p_node = None
         d_node = None
+        # flex TP: 追踪 prefill GPU 释放通知是否已发出（由 fetch_stream/fetch_nixl_stream 触发）
+        self._flex_tp_notified = False
 
         try:
             # 记录请求到达的相关信息
@@ -128,7 +136,9 @@ class HttpServerManagerForPDMaster:
                 "lightllm_request_max_new_tokens", origin_sampling_params.max_new_tokens
             )
 
-            p_node, d_node = await self.select_p_d_node(prompt, origin_sampling_params, multimodal_params)
+            p_node, d_node = await self.select_p_d_node(
+                prompt, origin_sampling_params, multimodal_params, input_token_num=input_token_num
+            )
 
             history_gen_token_strs = []
 
@@ -168,6 +178,10 @@ class HttpServerManagerForPDMaster:
 
         except BaseException as e:
             logger.error(f"has exception {str(e)}")
+            # flex TP: 如果 prefill 通知还未发出（异常发生在第一个 token 之前），安全兜底释放
+            if not self._flex_tp_notified:
+                await self.pd_manager.notify_flex_tp_request_done(p_node)
+                self._flex_tp_notified = True
             try:
                 if block_group_request_id is not None:
                     await self.abort(block_group_request_id, p_node=p_node, d_node=d_node)
@@ -245,6 +259,10 @@ class HttpServerManagerForPDMaster:
                     yield sub_req_id, request_output, metadata, finish_status
                 break
 
+        # prefill 计算已完成（第一个 token 已返回），通知 flex TP 调度器释放 GPU
+        await self.pd_manager.notify_flex_tp_request_done(p_node)
+        self._flex_tp_notified = True
+
         # 如果只需要一个输出 token，prefill 完就直接结束掉吧
         if old_max_new_tokens == 1:
             return
@@ -308,6 +326,10 @@ class HttpServerManagerForPDMaster:
 
         prompt_ids = nixl_np_up_prompt_ids_event.prompt_ids
         logger.info(f"group_request_id: {group_request_id} get np up prompt ids len {len(prompt_ids)}")
+
+        # prefill 计算已完成（prompt_ids 已上报），通知 flex TP 调度器释放 GPU
+        await self.pd_manager.notify_flex_tp_request_done(p_node)
+        self._flex_tp_notified = True
 
         sampling_params.max_new_tokens = old_max_new_tokens
         await d_node.websocket.send_bytes(
@@ -564,7 +586,11 @@ class PDManager:
         self.prefill_nodes: List[PD_Client_Obj] = []
         self.decode_nodes: List[PD_Client_Obj] = []
         self.url_to_pd_nodes: Dict[str, PD_Client_Obj] = {}
-        self.selector = create_selector(args.select_p_d_node_strategy, self)
+        self.selector = create_selector(
+            args.select_p_d_node_strategy,
+            self,
+            flex_tp_threshold=getattr(args, "flex_tp_threshold", 8000),
+        )
         return
 
     def register_pd(self, pd_info_json, websocket):
@@ -626,8 +652,24 @@ class PDManager:
             logger.warning(f"udpate node load info failed, load_info: {load_info} error: {str(e)}")
         return
 
-    def select_p_d_node(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams, multimodal_params: MultimodalParams
+    async def select_p_d_node(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        multimodal_params: MultimodalParams,
+        input_token_num: Optional[int] = None,
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
-        p_node, d_node = self.selector.select_p_d_node(prompt, sampling_params, multimodal_params)
-        return p_node, d_node
+        from .pd_selector.flex_tp_selector import FlexTPSelector
+
+        if isinstance(self.selector, FlexTPSelector):
+            return await self.selector.async_select_p_d_node(
+                prompt, sampling_params, multimodal_params, input_token_num=input_token_num
+            )
+        return self.selector.select_p_d_node(prompt, sampling_params, multimodal_params)
+
+    async def notify_flex_tp_request_done(self, p_node: Optional[PD_Client_Obj]):
+        """通知 flex TP 选择器请求已完成，用于更新在途请求计数"""
+        from .pd_selector.flex_tp_selector import FlexTPSelector
+
+        if isinstance(self.selector, FlexTPSelector) and p_node is not None:
+            await self.selector.notify_request_done(p_node)

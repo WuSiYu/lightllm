@@ -21,6 +21,11 @@ class BaseWeight(ABC):
     def verify_load(self) -> bool:
         pass
 
+    def _to_gpu_device(self):
+        """Hook called after weights are loaded to enable shared weight replacement.
+        Master registers tensors; slave replaces local weights with shared IPC tensors."""
+        pass
+
 
 class BaseWeightTpl(BaseWeight):
     def __init__(self, tp_rank: int = None, tp_world_size: int = None, data_type: torch.dtype = None):

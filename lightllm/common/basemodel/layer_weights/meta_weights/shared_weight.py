@@ -162,6 +162,24 @@ class TensorClient:
         self._conn = rpyc.connect(host, port, config={"allow_pickle": True})
         print(f"[TensorClient] Connected to {host}:{port}")
 
+    def get_tensor_blocking(self, tensor_id: str, timeout: float = 120.0, interval: float = 0.5) -> Tuple[torch.Tensor, Dict]:
+        """
+        Fetches the tensor handle from server, retrying until available or timeout.
+        Used to handle race condition where slave fetches before master registers.
+        """
+        import time
+        deadline = time.monotonic() + timeout
+        while True:
+            tensor, meta = self.get_tensor(tensor_id)
+            if tensor is not None:
+                return tensor, meta
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"[TensorClient] Timed out waiting for tensor '{tensor_id}' "
+                    f"after {timeout}s. Master may not have registered it yet."
+                )
+            time.sleep(interval)
+
     def get_tensor(self, tensor_id: str) -> Tuple[Optional[torch.Tensor], Optional[Dict]]:
         """
         Fetches the tensor handle from server and reconstructs the tensor

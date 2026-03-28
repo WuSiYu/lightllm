@@ -58,10 +58,32 @@ class MMWeightTpl(BaseWeightTpl):
     def mm(
         self, input_tensor: torch.Tensor, out: Optional[torch.Tensor] = None, use_custom_tensor_mananger: bool = True
     ) -> torch.Tensor:
+        # Handle 3D weights (from flex TP shared weight, non-contiguous multi-weight)
+        # Layout: (num_part, in_dim, out_dim_per_part) — each sub-weight is (in_dim, out_dim)
+        if self.mm_param.weight.ndim == 3:
+            seq_len = input_tensor.shape[0]
+            num_part = self.mm_param.weight.shape[0]
+            sub_out_dim = self.mm_param.weight.shape[2]
+            out_dim_n = num_part * sub_out_dim
+            self.mm.record_shape(m=seq_len, k=input_tensor.shape[1], n=out_dim_n)
+            if out is None:
+                shape = (seq_len, out_dim_n)
+                dtype = input_tensor.dtype
+                device = input_tensor.device
+                if use_custom_tensor_mananger:
+                    out = g_cache_manager.alloc_tensor(shape, dtype, device=device)
+                else:
+                    out = torch.empty(shape, dtype=dtype, device=device)
+            out_view = out.view(seq_len, num_part, sub_out_dim)
+            for i in range(num_part):
+                sub_w = self.mm_param.weight[i]
+                sub_out = out_view[:, i, :]
+                torch.mm(input_tensor, sub_w, out=sub_out)
+            if self.bias is not None:
+                out += self.bias
+            return out
+
         self.mm.record_shape(m=input_tensor.shape[0], k=input_tensor.shape[1], n=self.mm_param.weight.shape[1])
-        # return self.quant_method.apply(
-        #     input_tensor, self.mm_param, out, use_custom_tensor_mananger=use_custom_tensor_mananger, bias=self.bias
-        # )
         if self.quant_method is not None:
             return self.quant_method.apply(
                 input_tensor, self.mm_param, out, use_custom_tensor_mananger=use_custom_tensor_mananger
@@ -91,13 +113,13 @@ class MMWeightTpl(BaseWeightTpl):
                 sub_out = out_view[:, i, :]
                 torch.mm(input_tensor, sub_w, out=sub_out)
 
-            if self.mm_param.bias is not None:
-                out += self.mm_param.bias
+            if self.bias is not None:
+                out += self.bias
             return out
 
-        if self.mm_param.bias is None:
+        if self.bias is None:
             return torch.mm(input_tensor, self.mm_param.weight, out=out)
-        return torch.addmm(self.mm_param.bias, input_tensor, self.mm_param.weight, out=out)
+        return torch.addmm(self.bias, input_tensor, self.mm_param.weight, out=out)
 
     def gen_weight_quant_param_names(self):
         self.quanted_weight_names = [None] * len(self.weight_names)

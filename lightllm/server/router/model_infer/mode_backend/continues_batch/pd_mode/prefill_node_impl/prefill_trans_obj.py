@@ -15,7 +15,6 @@ from ..task_queue import TaskQueue
 from lightllm.utils.device_utils import kv_trans_use_p2p
 from lightllm.utils.time_utils import TimeChecker
 from .prefill_kv_move_manager import PrefillKVMoveManager
-from lightllm.utils.net_utils import find_available_port
 from ..utils import join_if_alive, clear_queue
 
 logger = init_logger(__name__)
@@ -379,7 +378,6 @@ class KVTransProcess:
         self.device_lock = threading.Lock()
         self.task_in_queue = mp.Queue()
         self.task_out_queue = mp.Queue()
-        self.kv_trans_port = find_available_port(manager.args.pd_p_allowed_port_min, manager.args.pd_p_allowed_port_max)
 
         try:
             from .prefill_trans_process import start_prefill_trans_process
@@ -387,12 +385,16 @@ class KVTransProcess:
             self.process = start_prefill_trans_process(
                 manager.args,
                 manager.host_ip,
-                self.kv_trans_port,
+                manager.args.pd_p_allowed_port_min,
+                manager.args.pd_p_allowed_port_max,
                 device_id,
                 self.task_in_queue,
                 self.task_out_queue,
             )
-            assert self.task_out_queue.get(timeout=30) == "proc_start"
+            proc_start_msg = self.task_out_queue.get(timeout=30)
+            assert proc_start_msg[0] == "proc_start"
+            self.kv_trans_port = proc_start_msg[1]
+            logger.info(f"prefill trans process for device {device_id} allocated port {self.kv_trans_port}")
             assert self.task_out_queue.get(timeout=60) == "get_mem_managers_ok"
 
             return True

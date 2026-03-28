@@ -36,10 +36,12 @@ def alloc_can_use_port(min_port, max_port):
 
 def find_available_port(start_port, end_port):
     for port in range(start_port, end_port + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            result = sock.connect_ex(("localhost", port))
-            if result != 0:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", port))
                 return port
+        except OSError:
+            continue
     return None
 
 

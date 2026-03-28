@@ -4,7 +4,7 @@ from typing import Dict, Optional
 from .base_weight import BaseWeightTpl
 from .platform_op import PlatformAwareOp
 from lightllm.common.basemodel.triton_kernel.embedding import embedding as embedding_kernel
-from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp
+from lightllm.utils.dist_utils import get_dp_world_size, get_current_rank_in_dp, get_current_device_id
 
 
 class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
@@ -36,6 +36,42 @@ class EmbeddingWeight(BaseWeightTpl, PlatformAwareOp):
         ), f"loaded weight vocab_size: {loaded_vocab_size} != expected vocab_size: {self.vocab_size}"
         self.weight.copy_(t_weight[self.tp_vocab_start_id : self.tp_vocab_end_id, :].to(self.data_type_))
         self.weight.load_ok = True
+
+    def _to_gpu_device(self):
+        super()._to_gpu_device()
+
+        from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient, TensorServer
+        if TensorClient():
+            original_shape = self.weight.shape
+            weight, meta = TensorClient().get_tensor_blocking(self.weight_name)
+
+            assert self.tp_world_size_ % meta["tp_world_size"] == 0, \
+                f"shared_weight tp_world_size not align: master={meta['tp_world_size']} vs slave={self.tp_world_size_}"
+
+            if meta["tp_world_size"] == self.tp_world_size_:
+                assert meta["tp_rank"] == self.tp_rank_
+                self.weight = weight
+            else:
+                # Embedding is row-partitioned by vocab, need to slice
+                assert meta["tp_world_size"] < self.tp_world_size_
+                tp_sub_partation_world_size = self.tp_world_size_ // meta["tp_world_size"]
+                assert self.tp_rank_ // tp_sub_partation_world_size == meta["tp_rank"]
+                tp_sub_partation_rank = self.tp_rank_ % tp_sub_partation_world_size
+
+                master_vocab_size = weight.shape[0]
+                slice_size = master_vocab_size // tp_sub_partation_world_size
+                start = slice_size * tp_sub_partation_rank
+                end = slice_size * (tp_sub_partation_rank + 1)
+                # Row slice is contiguous, zero-copy
+                self.weight = weight[start:end]
+
+            assert self.weight.shape == original_shape, \
+                f"shared weight shape mismatch: expected {original_shape}, got {self.weight.shape}"
+            self.weight.load_ok = True
+
+        elif TensorServer():
+            meta = dict(tp_rank=self.tp_rank_, tp_world_size=self.tp_world_size_)
+            TensorServer().register(self.weight_name, self.weight, meta)
 
     def verify_load(self):
         return self.weight.load_ok
@@ -101,6 +137,15 @@ class LMHeadWeight(EmbeddingWeight):
             self.weight = self._embedding_weight.weight
             return
         super()._create_weight()
+
+    def _to_gpu_device(self):
+        if self._embedding_weight is not None:
+            # tie_word_embeddings: weight is shared with embedding, which already handled sharing.
+            # Re-sync our reference to the (possibly replaced) embedding weight.
+            self.weight = self._embedding_weight.weight
+            return
+        # Not tied: use parent EmbeddingWeight logic with our own weight_name
+        super()._to_gpu_device()
 
     def load_hf_weights(self, weights: Dict[str, torch.Tensor]):
         # When set tile_embedding=True, no need to load - EmbeddingWeight already loaded it

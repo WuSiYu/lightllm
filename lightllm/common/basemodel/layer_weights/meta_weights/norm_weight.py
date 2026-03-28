@@ -25,6 +25,18 @@ class RMSNormWeight(BaseWeightTpl, PlatformAwareOp):
             self.weight.copy_(weights[self.weight_name])
             self.weight.load_ok = True
 
+    def _to_gpu_device(self):
+        super()._to_gpu_device()
+
+        from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient, TensorServer
+        if TensorClient():
+            weight, meta = TensorClient().get_tensor_blocking(self.weight_name)
+            # Norm weights have no TP partition, direct zero-copy
+            self.weight = weight
+            self.weight.load_ok = True
+        elif TensorServer():
+            TensorServer().register(self.weight_name, self.weight, meta={})
+
     def verify_load(self):
         return self.weight.load_ok
 

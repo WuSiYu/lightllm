@@ -3,6 +3,7 @@ from lightllm.common.basemodel.layer_weights.meta_weights.mm_weight.mm_weight im
     MMWeightTpl,
 )
 from lightllm.common.quantization import Quantcfg
+from lightllm.common.quantization.no_quant import NoQuantization
 from lightllm.utils.dist_utils import get_current_device_id
 from lightllm.common.quantization.quantize_method import QuantizationMethod
 from typing import Dict, List, Optional, Union
@@ -44,53 +45,55 @@ class COLMMWeight(MMWeightTpl):
 
         from lightllm.common.basemodel.layer_weights.meta_weights.shared_weight import TensorClient, TensorServer
         if TensorClient():
-            from lightllm.common.basemodel.layer_weights.meta_weights.mm_weight.rowmm_weight import buf_print
-            print = buf_print()
-
-            print("\n\n\n\nCOLMMWeight _to_gpu_device")
-            print(f"[TensorClient].{get_current_device_id()} local weight {self.weight_names}[0] to replace ({self.mm_param.weight.shape}): {self.mm_param.weight}")
-
-            weight, meta = TensorClient().get_tensor(self.weight_names[0])    # replace weight with shared weight to free GPU memory
             original_shape = self.mm_param.weight.shape
-            remote_original_shape = weight.shape
-            print(f"[TensorClient].{get_current_device_id()} loaded weight: {self.weight_names[0]} tp_rank: {meta['tp_rank']} tp_world_size: {meta['tp_world_size']}")
-            print(f"[TensorClient].{get_current_device_id()} (ours: tp_rank: {self.tp_rank_} tp_world_size: {self.tp_world_size_})")
-            assert meta["tp_world_size"] < self.tp_world_size_ and self.tp_world_size_ % meta["tp_world_size"] == 0, \
-                f"[TensorClient].{get_current_device_id()} shared_weight tp_world_size not align: master={meta['tp_world_size']} vs slave={self.tp_world_size_}"
-            tp_sub_partation_world_size = self.tp_world_size_ // meta["tp_world_size"]
-            assert self.tp_rank_ // tp_sub_partation_world_size == meta["tp_rank"], \
-                f"[TensorClient].{get_current_device_id()} shared_weight master tp_rank not correct: wanted {self.tp_rank_ // tp_sub_partation_world_size}, master has {meta['tp_rank']}"
+            weight, meta = TensorClient().get_tensor_blocking(self.weight_names[0])
 
-            tp_sub_partation_rank = self.tp_rank_ % tp_sub_partation_world_size
-            transposed = self.quant_method is None  # FIXME: make it more robust
-            weight_comb_numbers = len(self.weight_names)
-            print(f"[TensorClient].{get_current_device_id()} {weight_comb_numbers=}, {transposed=}")
-            if transposed:
-                weight = weight.transpose(0, 1)
+            assert self.tp_world_size_ % meta["tp_world_size"] == 0, \
+                f"shared_weight tp_world_size not align: master={meta['tp_world_size']} vs slave={self.tp_world_size_}"
 
-            tp_sub_partation_size = weight.shape[1] // weight_comb_numbers // tp_sub_partation_world_size
-            print(f"[TensorClient].{get_current_device_id()} 0 {weight.shape=}")
-            weight = weight.view(weight.shape[0], weight_comb_numbers, -1)
-            print(f"[TensorClient].{get_current_device_id()} 1 {weight.shape=}")
-            weight = weight[:, :, tp_sub_partation_size * tp_sub_partation_rank : tp_sub_partation_size * (tp_sub_partation_rank + 1)]
-            print(f"[TensorClient].{get_current_device_id()} 2 {weight.shape=}")
-            weight = weight.view(weight.shape[0], -1)
+            if meta["tp_world_size"] == self.tp_world_size_:
+                # Same TP: zero-copy, use master's weight directly
+                assert meta["tp_rank"] == self.tp_rank_
+                self.mm_param.weight = weight
+            else:
+                # Flex TP: slave has finer partition, need to slice master's weight
+                assert meta["tp_world_size"] < self.tp_world_size_
+                tp_sub_partation_world_size = self.tp_world_size_ // meta["tp_world_size"]
+                assert self.tp_rank_ // tp_sub_partation_world_size == meta["tp_rank"], \
+                    f"shared_weight master tp_rank mismatch: wanted {self.tp_rank_ // tp_sub_partation_world_size}, got {meta['tp_rank']}"
 
-            if transposed:
-                weight = weight.transpose(0, 1)
-            self.mm_param.weight = weight   # replace it
-            print(f"[TensorClient].{get_current_device_id()} COLMMWeight {tp_sub_partation_rank=}, {tp_sub_partation_size=}, shape {remote_original_shape} -> {self.mm_param.weight.shape}")
+                tp_sub_partation_rank = self.tp_rank_ % tp_sub_partation_world_size
 
-            print(f"[TensorClient].{get_current_device_id()} replaced shared weight {self.weight_names}[0] ({self.mm_param.weight.shape}): {self.mm_param.weight}")
-            print(f"[TensorClient].{get_current_device_id()} {original_shape=}, {self.mm_param.weight.shape=}")
-            print(f"---\n")
-            print = print.flush()
-            assert self.mm_param.weight.shape == original_shape or self.mm_param.weight.shape == (weight_comb_numbers, original_shape[0], original_shape[1] // weight_comb_numbers), \
-                f"[TensorClient].{get_current_device_id()} shared weight shape mismatch: original {original_shape} vs shared {self.mm_param.weight.shape}"
+                # COLMMWeight partitions input dim (dim 1 for NoQuant layout (out, in))
+                # For quantized layout (in, out), transpose first to get (out, in)
+                transposed = not isinstance(self.quant_method, NoQuantization)
+                if transposed:
+                    weight = weight.transpose(0, 1)
 
+                # Slice along input dimension (dim 1)
+                in_dim = weight.shape[1]
+                tp_slice_size = in_dim // tp_sub_partation_world_size
+                start = tp_slice_size * tp_sub_partation_rank
+                end = tp_slice_size * (tp_sub_partation_rank + 1)
 
-        else:
-            if TensorServer():
-                meta = dict(tp_rank=self.tp_rank_, tp_world_size=self.tp_world_size_)
-                TensorServer().register(self.weight_names[0], self.mm_param.weight, meta)
+                # Column slice: non-contiguous 2D view, torch.mm supports non-contiguous tensors
+                weight = weight[:, start:end]
+
+                if transposed:
+                    weight = weight.transpose(0, 1)
+
+                self.mm_param.weight = weight
+
+            assert self.mm_param.weight.shape == original_shape, \
+                f"shared weight shape mismatch: expected {original_shape}, got {self.mm_param.weight.shape}"
+
+            # Rebuild mm_param_list to point to new weight (release references to old weight)
+            new_weights = torch.split(self.mm_param.weight, self.out_dims, dim=-2)
+            for i, wp in enumerate(self.mm_param_list):
+                wp.weight = new_weights[i]
+                wp.load_ok = [True, True, True]
+
+        elif TensorServer():
+            meta = dict(tp_rank=self.tp_rank_, tp_world_size=self.tp_world_size_)
+            TensorServer().register(self.weight_names[0], self.mm_param.weight, meta)
 

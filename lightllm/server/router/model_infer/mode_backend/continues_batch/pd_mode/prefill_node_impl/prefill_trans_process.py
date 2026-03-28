@@ -109,12 +109,14 @@ def _handle_decode_join(
 def _init_env(
     args,
     store_ip,
-    store_port,
+    port_min,
+    port_max,
     device_id,
     task_in_queue: mp.Queue,
     task_out_queue: mp.Queue,
 ):
     import os
+    from lightllm.utils.net_utils import find_available_port
 
     # os.environ["NCCL_DEBUG"] = "INFO"
     os.environ["NCCL_MAX_NCHANNELS"] = "2"
@@ -130,10 +132,13 @@ def _init_env(
     try:
         torch.cuda.set_device(device_id)
         graceful_registry(inspect.currentframe().f_code.co_name)
+        store_port = find_available_port(port_min, port_max)
+        if store_port is None:
+            raise RuntimeError(f"No available port found in range [{port_min}, {port_max}]")
         master_store = TCPStore(
             host_name=store_ip, port=store_port, is_master=True, use_libuv=True, timeout=timedelta(seconds=30)
         )
-        task_out_queue.put("proc_start")
+        task_out_queue.put(("proc_start", store_port))
 
         # 从共享内存读取所有rank的mem_manager
         node_world_size = args.tp // args.nnodes
@@ -169,12 +174,15 @@ def _init_env(
 def start_prefill_trans_process(
     args,
     store_ip,
-    store_port,
+    port_min,
+    port_max,
     device_id,
     task_in_queue: mp.Queue,
     task_out_queue: mp.Queue,
 ):
-    proc = mp.Process(target=_init_env, args=(args, store_ip, store_port, device_id, task_in_queue, task_out_queue))
+    proc = mp.Process(
+        target=_init_env, args=(args, store_ip, port_min, port_max, device_id, task_in_queue, task_out_queue)
+    )
     proc.start()
     assert proc.is_alive()
     logger.info(f"prefill trans kv process for device: {device_id} started!")

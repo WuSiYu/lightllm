@@ -73,12 +73,24 @@ MAX_REQ_TOTAL_TOKENS = 16000
 # Predefined simple mixed uniform distributions for --dataset-type simple.X
 # Each entry is a list of components: {weight, input_range (min,max), output_range (min,max)}
 SIMPLE_DATASETS = {
-    "1": [
+    "1-0": [
         {"weight": 1.0, "input_range": (100, 1000),   "output_range": (50, 500)},
     ],
-    "2": [
+    "1-3": [
         {"weight": 0.97, "input_range": (100, 1000),   "output_range": (50, 500)},
         {"weight": 0.03, "input_range": (1000, 20000), "output_range": (50, 500)},
+    ],
+    "1-10": [
+        {"weight": 0.90, "input_range": (100, 1000),   "output_range": (50, 500)},
+        {"weight": 0.10, "input_range": (1000, 20000), "output_range": (50, 500)},
+    ],
+    "1-5": [
+        {"weight": 0.95, "input_range": (100, 1000),   "output_range": (50, 500)},
+        {"weight": 0.05, "input_range": (1000, 20000), "output_range": (50, 500)},
+    ],
+    "1-20": [
+        {"weight": 0.80, "input_range": (100, 1000),   "output_range": (50, 500)},
+        {"weight": 0.20, "input_range": (1000, 20000), "output_range": (50, 500)},
     ],
 }
 

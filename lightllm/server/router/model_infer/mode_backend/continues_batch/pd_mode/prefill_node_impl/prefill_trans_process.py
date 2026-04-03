@@ -132,12 +132,29 @@ def _init_env(
     try:
         torch.cuda.set_device(device_id)
         graceful_registry(inspect.currentframe().f_code.co_name)
-        store_port = find_available_port(port_min, port_max)
-        if store_port is None:
-            raise RuntimeError(f"No available port found in range [{port_min}, {port_max}]")
-        master_store = TCPStore(
-            host_name=store_ip, port=store_port, is_master=True, use_libuv=True, timeout=timedelta(seconds=30)
-        )
+        # Retry to handle TOCTOU race: find_available_port may return a port that gets
+        # taken by another process (e.g. another shared_weight instance) before TCPStore binds.
+        master_store = None
+        store_port = None
+        _last_tried_port = port_min - 1
+        for _attempt in range(10):
+            store_port = find_available_port(max(port_min, _last_tried_port + 1), port_max)
+            if store_port is None:
+                # Wrap around and retry from the beginning
+                store_port = find_available_port(port_min, port_max)
+            if store_port is None:
+                raise RuntimeError(f"No available port found in range [{port_min}, {port_max}]")
+            _last_tried_port = store_port
+            try:
+                master_store = TCPStore(
+                    host_name=store_ip, port=store_port, is_master=True, use_libuv=True, timeout=timedelta(seconds=30)
+                )
+                break
+            except RuntimeError:
+                logger.warning(f"Port {store_port} bind failed (race), retrying...")
+                continue
+        if master_store is None:
+            raise RuntimeError(f"Failed to bind TCPStore after retries in port range [{port_min}, {port_max}]")
         task_out_queue.put(("proc_start", store_port))
 
         # 从共享内存读取所有rank的mem_manager

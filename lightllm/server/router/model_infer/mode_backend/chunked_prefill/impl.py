@@ -105,7 +105,9 @@ class ChunkedPrefillBackend(ModeBackend):
         event_pack: OverlapEventPack,
         prefill_reqs: List[InferReq],
     ):
+        t = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
         # 第一阶段: 模型推理
+        t[0].record()
         model_input, run_reqs = prepare_prefill_inputs(prefill_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
             model_output = self.model.forward(model_input)
@@ -122,12 +124,15 @@ class ChunkedPrefillBackend(ModeBackend):
             sync_event.record()
 
         # 第二阶段
+        t[1].record()
         event_pack.notify_post_handle_and_wait_pre_post_handle()
         update_packs = self._pre_post_handle(run_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
 
         # 第三阶段
+        t[2].record()
         event_pack.notify_forward_and_wait_post_handle()
         sync_event.synchronize()
+        t[3].record()
         self._post_handle(
             run_reqs=run_reqs,
             next_token_ids=next_token_ids_cpu,
@@ -138,6 +143,9 @@ class ChunkedPrefillBackend(ModeBackend):
         )
         # 第四阶段
         event_pack.notify_pre_post_handle()
+        t[4].record()
+        t[4].synchronize()
+        self.logger.info(f"PERF - prefill - bs {model_input.batch_size} token {model_input.total_token_num} (may chunked) latency {t[0].elapsed_time(t[4]):.6f}ms (model {t[0].elapsed_time(t[1]):.6f}ms post {t[1].elapsed_time(t[2]):.6f}ms + {t[2].elapsed_time(t[3]):.6f}ms + {t[3].elapsed_time(t[4]):.6f}ms)")
         return
 
     def decode_normal(

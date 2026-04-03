@@ -1,12 +1,16 @@
 """
-Flex TP Selector: 调度逻辑，用于支持不同 TP 数的 prefill 节点共享同一组 GPU（通过 --shared_weight）。
+Flex TP Selector: 支持不同 TP 数的 prefill 节点共享同一组 GPU（通过 --shared_weight）。
+
+基于 PD master 的请求级排他（drain 状态机）。
 
 核心功能：
 1. 自动识别共享 GPU 的 TP 组（FlexTPGroup）
 2. 基于请求长度的选择性调度：长请求 -> 大 TP，短请求 -> 小 TP
-3. 同 GPU 上多 TP 组的排他与抢占：默认运行小 TP，大 TP 请求到达时排空小 TP 后切换
 
-背景： 在PD分离模式中，Flex TP (--shared_weight) 是一种在同一组 GPU 上部署不同 TP 大小 prefill 节点的方式，适用于请求长度分布广泛的场景。通过在同一组GPU上运行多组不同TP大小的节点（例如2xTP2 + TP4），并使用权重共享避免额外显存开销，可以在一组GPU上无缝切换prefill TP数，让短请求以TP2 + DP2处理提高吞吐，而长请求则使用TP4降低延迟，从而提高资源利用率和响应速度。
+背景： 在PD分离模式中，Flex TP (--shared_weight) 是一种在同一组 GPU 上部署不同 TP 大小 prefill 节点的方式，
+适用于请求长度分布广泛的场景。通过在同一组GPU上运行多组不同TP大小的节点（例如2xTP2 + TP4），
+并使用权重共享避免额外显存开销，可以在一组GPU上无缝切换prefill TP数，
+让短请求以TP2 + DP2处理提高吞吐，而长请求则使用TP4降低延迟。
 """
 
 import asyncio
@@ -22,8 +26,13 @@ from .pd_selector import PDSelector
 logger = init_logger(__name__)
 
 
+# ===========================================================================
+#  FlexTPSelector: 请求级排他（drain 状态机），用于非 chunked prefill 模式
+# ===========================================================================
+
+
 class FlexTPGroup:
-    """表示一组共享同一批 GPU 的不同 TP 大小的 prefill 节点"""
+    """表示一组共享同一批 GPU 的不同 TP 大小的 prefill 节点（drain 模式）"""
 
     def __init__(self, group_id: str):
         self.group_id: str = group_id
@@ -35,9 +44,9 @@ class FlexTPGroup:
         # 状态机: "small_tp_active" -> "draining" -> "large_tp_active" -> "small_tp_active"
         self.state: str = "small_tp_active"
 
-        # 在途请求计数
-        self.inflight_small_tp: int = 0
-        self.inflight_large_tp: int = 0
+        # 每个节点的在途请求数和 token 数: node client_ip_port -> count
+        self.node_inflight_requests: Dict[str, int] = {}
+        self.node_inflight_tokens: Dict[str, int] = {}
         # 等待执行的大 TP 请求数（已决定走大 TP 但还在等 drain 完成）
         self.pending_large_tp: int = 0
         # 等待执行的小 TP 请求数（所有 group 都被大 TP 占据时排队等待）
@@ -46,22 +55,66 @@ class FlexTPGroup:
         # 用于状态变更通知的 asyncio.Condition
         self.condition: asyncio.Condition = asyncio.Condition()
 
+    def _sum_nodes(self, nodes: List[PD_Client_Obj], data: Dict[str, int]) -> int:
+        return sum(data.get(n.client_ip_port, 0) for n in nodes)
+
+    @property
+    def inflight_small_tp(self) -> int:
+        return self._sum_nodes(self.small_tp_nodes, self.node_inflight_requests)
+
+    @property
+    def inflight_large_tp(self) -> int:
+        return self._sum_nodes(self.large_tp_nodes, self.node_inflight_requests)
+
+    @property
+    def inflight_tokens_small_tp(self) -> int:
+        return self._sum_nodes(self.small_tp_nodes, self.node_inflight_tokens)
+
+    @property
+    def inflight_tokens_large_tp(self) -> int:
+        return self._sum_nodes(self.large_tp_nodes, self.node_inflight_tokens)
+
+    def add_inflight(self, node_key: str, token_num: int):
+        self.node_inflight_requests[node_key] = self.node_inflight_requests.get(node_key, 0) + 1
+        self.node_inflight_tokens[node_key] = self.node_inflight_tokens.get(node_key, 0) + token_num
+
+    def remove_inflight(self, node_key: str, token_num: int):
+        new_req = max(0, self.node_inflight_requests.get(node_key, 0) - 1)
+        self.node_inflight_requests[node_key] = new_req
+        if new_req == 0:
+            # 请求数归零时强制清零 token 数，防止累积漂移
+            self.node_inflight_tokens[node_key] = 0
+        else:
+            self.node_inflight_tokens[node_key] = max(0, self.node_inflight_tokens.get(node_key, 0) - token_num)
+
     def __repr__(self):
+        small_details = ", ".join(
+            f"{n.client_ip_port}={self.node_inflight_requests.get(n.client_ip_port, 0)}"
+            f"({self.node_inflight_tokens.get(n.client_ip_port, 0)}tok)"
+            for n in self.small_tp_nodes
+        )
+        large_details = ", ".join(
+            f"{n.client_ip_port}={self.node_inflight_requests.get(n.client_ip_port, 0)}"
+            f"({self.node_inflight_tokens.get(n.client_ip_port, 0)}tok)"
+            for n in self.large_tp_nodes
+        )
         return (
             f"FlexTPGroup(id={self.group_id}, state={self.state}, "
-            f"small_tp={self.small_tp_size}x{len(self.small_tp_nodes)}, "
-            f"large_tp={self.large_tp_size}x{len(self.large_tp_nodes)}, "
-            f"inflight_s={self.inflight_small_tp}, inflight_l={self.inflight_large_tp}, "
+            f"small_tp={self.small_tp_size}x{len(self.small_tp_nodes)} [{small_details}], "
+            f"large_tp={self.large_tp_size}x{len(self.large_tp_nodes)} [{large_details}], "
             f"pending_s={self.pending_small_tp}, pending_l={self.pending_large_tp})"
         )
 
 
 class FlexTPSelector(PDSelector):
     """
-    Flex TP 调度选择器。
+    Flex TP 调度选择器（请求级排他，drain 状态机）。
 
     调度策略：
     - input_token_num > length_threshold 的请求路由到大 TP 节点
+      - 特殊：length_threshold = 'smart' 模式:
+        - 通过SLO目标和延迟预测智能判断是否使用大 TP，而非固定阈值
+
     - 其余请求路由到小 TP 节点
     - 同一 FlexTPGroup 内，大小 TP 互斥执行：
       - 默认状态为 small_tp_active，小 TP 节点正常接收请求
@@ -149,16 +202,17 @@ class FlexTPSelector(PDSelector):
                 f"large_tp={max_tp} ({len(group.large_tp_nodes)} nodes)"
             )
 
-        # 保留已移除节点的映射，直到其所属 group 的 inflight 请求归零，
+        # 保留已移除节点的映射，直到该节点的 inflight 请求归零，
         # 避免 notify_request_done 找不到节点导致计数泄漏和死锁。
         for old_key, old_group in self.node_to_group.items():
             if old_key not in new_node_to_group:
-                if old_group.inflight_small_tp > 0 or old_group.inflight_large_tp > 0:
+                if old_group.node_inflight_requests.get(old_key, 0) > 0:
                     new_node_to_group[old_key] = old_group
                     new_node_is_large_tp[old_key] = self.node_is_large_tp.get(old_key, False)
                     logger.warning(
                         f"FlexTP: preserving stale mapping for {old_key} "
-                        f"(group {old_group.group_id}: {old_group})"
+                        f"(group {old_group.group_id}, node_inflight="
+                        f"{old_group.node_inflight_requests.get(old_key, 0)})"
                     )
 
         self.flex_groups = new_flex_groups
@@ -193,10 +247,11 @@ class FlexTPSelector(PDSelector):
             p_node = random.choice(self.prefill_nodes)
             return p_node, d_node
 
+        token_num = input_token_num or 0
         if use_large_tp:
-            p_node = await self._select_large_tp()
+            p_node = await self._select_large_tp(token_num)
         else:
-            p_node = await self._select_small_tp()
+            p_node = await self._select_small_tp(token_num)
 
         logger.info(
             f"FlexTP select: input_tokens={input_token_num}, use_large_tp={use_large_tp}, "
@@ -204,7 +259,7 @@ class FlexTPSelector(PDSelector):
         )
         return p_node, d_node
 
-    async def _select_large_tp(self) -> PD_Client_Obj:
+    async def _select_large_tp(self, input_token_num: int) -> PD_Client_Obj:
         """选择大 TP 节点，必要时触发排空小 TP 并等待"""
         # 选择一个有大 TP 节点的 group
         groups_with_large = [g for g in self.flex_groups.values() if g.large_tp_nodes]
@@ -213,34 +268,51 @@ class FlexTPSelector(PDSelector):
             logger.warning("FlexTP: no large TP nodes available, falling back")
             return random.choice(self.prefill_nodes)
 
-        # 选择 pending 最小的 group
-        group = min(groups_with_large, key=lambda g: g.pending_large_tp)
+        # 选择在途 token 数最少的 group（负载最低）
+        group = min(groups_with_large, key=lambda g: (g.inflight_tokens_large_tp, g.pending_large_tp))
 
         async with group.condition:
             group.pending_large_tp += 1
+            try:
+                # 如果当前是 small_tp_active，发起排空
+                if group.state == "small_tp_active":
+                    group.state = "draining"
+                    logger.info(f"FlexTP group [{group.group_id}]: draining small TP (inflight={group.inflight_small_tp})")
 
-            # 如果当前是 small_tp_active，发起排空
-            if group.state == "small_tp_active":
-                group.state = "draining"
-                logger.info(f"FlexTP group [{group.group_id}]: draining small TP (inflight={group.inflight_small_tp})")
+                # 等待所有小 TP 在途请求完成
+                while group.inflight_small_tp > 0:
+                    await group.condition.wait()
 
-            # 等待所有小 TP 在途请求完成
-            while group.inflight_small_tp > 0:
-                await group.condition.wait()
+                # 排空完成，切换到大 TP 运行态
+                group.state = "large_tp_active"
+                # 选择负载最低的大 TP 节点并记录 inflight
+                p_node = self._pick_least_loaded(group, group.large_tp_nodes)
+                group.add_inflight(p_node.client_ip_port, input_token_num)
+                group.pending_large_tp -= 1
+            except BaseException:
+                # 请求被取消（如客户端断连）时，回滚 pending 计数，必要时恢复状态
+                group.pending_large_tp -= 1
+                if group.pending_large_tp == 0 and group.inflight_large_tp == 0:
+                    group.state = "small_tp_active"
+                    group.condition.notify_all()
+                    logger.info(
+                        f"FlexTP group [{group.group_id}]: large TP request cancelled during drain, "
+                        f"resuming small TP"
+                    )
+                else:
+                    logger.info(
+                        f"FlexTP group [{group.group_id}]: large TP request cancelled during drain "
+                        f"(pending_l={group.pending_large_tp}, inflight_l={group.inflight_large_tp})"
+                    )
+                raise
 
-            # 排空完成，切换到大 TP 运行态
-            group.state = "large_tp_active"
-            group.inflight_large_tp += 1
-            group.pending_large_tp -= 1
-
-        p_node = self._pick_from_nodes(group.large_tp_nodes)
         logger.info(
             f"FlexTP group [{group.group_id}]: large TP request dispatched to {p_node.client_ip_port} "
-            f"(inflight_l={group.inflight_large_tp})"
+            f"(inflight_l={group.inflight_large_tp}, tokens_l={group.inflight_tokens_large_tp})"
         )
         return p_node
 
-    async def _select_small_tp(self) -> PD_Client_Obj:
+    async def _select_small_tp(self, input_token_num: int) -> PD_Client_Obj:
         """选择小 TP 节点，如果当前组正在排空或大 TP 运行中则等待"""
         # 优先选择处于 small_tp_active 状态的 group
         groups_with_small = [g for g in self.flex_groups.values() if g.small_tp_nodes]
@@ -250,10 +322,10 @@ class FlexTPSelector(PDSelector):
                 return random.choice(self.ungrouped_prefill_nodes)
             return random.choice(self.prefill_nodes)
 
-        # 找一个处于 small_tp_active 的 group
+        # 找一个处于 small_tp_active 的 group，选择在途 token 数最少的（负载最低）
         active_groups = [g for g in groups_with_small if g.state == "small_tp_active"]
         if active_groups:
-            group = random.choice(active_groups)
+            group = min(active_groups, key=lambda g: g.inflight_tokens_small_tp)
         else:
             # 所有 group 都在 draining 或 large_tp_active，选择最快恢复的 group 等待
             group = min(groups_with_small, key=lambda g: g.pending_large_tp)
@@ -265,18 +337,20 @@ class FlexTPSelector(PDSelector):
                 f"inflight_large={group.inflight_large_tp}). "
                 f"Continuous large TP traffic may starve small TP requests."
             )
-            async with group.condition:
-                while group.state != "small_tp_active":
-                    await group.condition.wait()
-            group.pending_small_tp -= 1
+            try:
+                async with group.condition:
+                    while group.state != "small_tp_active":
+                        await group.condition.wait()
+            finally:
+                group.pending_small_tp -= 1
 
-        # 直接增加计数（在 condition 外面即可，因为 asyncio 是单线程的）
-        group.inflight_small_tp += 1
-        p_node = self._pick_from_nodes(group.small_tp_nodes)
+        # 选择负载最低的小 TP 节点并记录 inflight（asyncio 单线程，无需锁）
+        p_node = self._pick_least_loaded(group, group.small_tp_nodes)
+        group.add_inflight(p_node.client_ip_port, input_token_num)
         return p_node
 
-    async def notify_request_done(self, p_node: PD_Client_Obj):
-        """请求完成后调用，更新在途计数并触发状态切换"""
+    async def notify_request_done(self, p_node: PD_Client_Obj, input_token_num: int = 0):
+        """请求完成后调用，更新在途计数和 token 数并触发状态切换"""
         if p_node is None:
             return
 
@@ -287,17 +361,14 @@ class FlexTPSelector(PDSelector):
         is_large = self.node_is_large_tp.get(p_node.client_ip_port, False)
 
         async with group.condition:
+            group.remove_inflight(p_node.client_ip_port, input_token_num)
             if is_large:
-                group.inflight_large_tp = max(0, group.inflight_large_tp - 1)
                 if group.inflight_large_tp == 0 and group.pending_large_tp == 0:
-                    # 所有大 TP 请求完成，恢复小 TP 运行
                     group.state = "small_tp_active"
                     group.condition.notify_all()
                     logger.info(f"FlexTP group [{group.group_id}]: large TP done, resuming small TP")
             else:
-                group.inflight_small_tp = max(0, group.inflight_small_tp - 1)
                 if group.inflight_small_tp == 0 and group.state == "draining":
-                    # 小 TP 排空完成，通知等待中的大 TP 请求
                     group.condition.notify_all()
                     logger.info(f"FlexTP group [{group.group_id}]: small TP drained (inflight=0)")
 
@@ -312,9 +383,9 @@ class FlexTPSelector(PDSelector):
         self._decode_rr_index += 1
         return d_node
 
-    def _pick_from_nodes(self, nodes: List[PD_Client_Obj]) -> PD_Client_Obj:
-        """轮询方式从给定节点列表中选择一个"""
-        return random.choice(nodes)
+    def _pick_least_loaded(self, group: FlexTPGroup, nodes: List[PD_Client_Obj]) -> PD_Client_Obj:
+        """选择负载最低（在途 token 数最少）的节点"""
+        return min(nodes, key=lambda n: group.node_inflight_tokens.get(n.client_ip_port, 0))
 
     def select_p_d_node(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams, multimodal_params: MultimodalParams

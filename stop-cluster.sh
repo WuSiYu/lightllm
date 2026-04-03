@@ -14,22 +14,21 @@ fi
 
 echo "🧹 正在清理可能残留的 LightLLM 进程，以释放显存和端口..."
 # 使用 pkill 根据命令行关键字精准匹配并击杀相关进程
-
 pkill -f "/opt/conda/bin/python"
 
 if [ $? -eq 0 ]; then
-    echo "✅ 发现并清理了残留的 LightLLM 进程。"
+    echo "try1: ✅ 发现并清理了残留的 LightLLM 进程。"
     sleep 1
     pkill -f "/opt/conda/bin/python"
 
     if [ $? -eq 0 ]; then
-        echo "依然存活"
+        echo "try2: 依然存活"
         sleep 1
         pkill -9 -f "/opt/conda/bin/python"
         if [ $? -eq 0 ]; then
-            echo "✅ 强制清理了残留的 LightLLM 进程。"
+            echo "try3: 依然存活，强制执行"
         else
-            echo "没有发现需要强制清理的残留进程。"
+            echo "已无残留"
         fi
     fi
 else
@@ -45,6 +44,9 @@ if [ $? -eq 0 ]; then
 else
     echo "没有发现需要清理的残留进程。"
 fi
+
+echo "🧹 停止 MPS daemon..."
+echo quit | nvidia-cuda-mps-control 2>/dev/null
 
 echo "🎉 集群清理工作全部完成！"
 

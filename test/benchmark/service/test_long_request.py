@@ -8,14 +8,16 @@ import time
 def main():
     parser = argparse.ArgumentParser(description="Send a long text to LLM for summarization")
     parser.add_argument("file", help="Path to the text file to summarize")
+    parser.add_argument("-t", "--file-repeat-times", type=int, default=1, help="Number of times to repeat the file content (default: 1)")
     parser.add_argument("--host", default=None, help="Server host (default: hostname -i)")
-    parser.add_argument("--port", type=int, default=60011, help="Server port (default: 60011)")
-    parser.add_argument("--max-new-tokens", type=int, default=200, help="Max new tokens (default: 200)")
+    parser.add_argument("-p", "--port", type=int, default=60011, help="Server port (default: 60011)")
+    parser.add_argument("-d", "--max-new-tokens", type=int, default=200, help="Max new tokens (default: 200)")
     args = parser.parse_args()
 
     with open(args.file, "r") as f:
         content = f.read()
 
+    content = content * args.file_repeat_times
     nonce = uuid.uuid4().hex
     system_prompt = f"{nonce} ( <-- cache_bypass, ignore it ), You are a helpful assistant for code or document summarization."
 

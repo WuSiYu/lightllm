@@ -46,7 +46,19 @@ while true; do
       echo -e "${BG_GREEN}                                    ${RESET}"
       echo -e "${BG_GREEN}                                    ${RESET}"
       echo ""
+
+      # bell
+      for i in {1..5}; do
+        echo -ne "\a"
+        sleep 0.2
+      done
     fi
+
+    # every 10 success, test long
+    if [ $SUCCESS -gt 0 ] && [ $((SUCCESS % 10)) -eq 0 ]; then
+      python test_long_request.py benchmark_serving_chat_req_rate.py -d 2 -t 4
+    fi
+
   else
     SUCCESS=0
     printf "\r\033[K  ${BOLD}#${ATTEMPT}${RESET} ${RED}FAIL${RESET} ${ELAPSED}ms [.....] waiting..."

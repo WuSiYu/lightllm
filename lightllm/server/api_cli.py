@@ -56,6 +56,13 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="flex_tp mode: requests with input_token_num > threshold are routed to large TP nodes",
     )
     parser.add_argument(
+        "--flex_tp_slo_ttft",
+        type=float,
+        default=None,
+        help="flex_tp mode: SLO TTFT target in seconds. When set, overrides --flex_tp_threshold; "
+             "selects the smallest TP that meets the SLO, or the lowest-TTFT TP if none meets it",
+    )
+    parser.add_argument(
         "--config_server_host",
         type=str,
         default=None,

@@ -1,4 +1,5 @@
 import argparse
+import random
 import uuid
 import requests
 import json
@@ -7,17 +8,24 @@ import time
 
 def main():
     parser = argparse.ArgumentParser(description="Send a long text to LLM for summarization")
-    parser.add_argument("file", help="Path to the text file to summarize")
+    parser.add_argument("-f", "--file", help="Path to the text file to summarize")
+    parser.add_argument("-l", "--prompt_length", type=int, default=-1, help="Manually generate prompt of this length (Conflicting with [file])")
     parser.add_argument("-t", "--file-repeat-times", type=int, default=1, help="Number of times to repeat the file content (default: 1)")
     parser.add_argument("--host", default=None, help="Server host (default: hostname -i)")
     parser.add_argument("-p", "--port", type=int, default=60011, help="Server port (default: 60011)")
     parser.add_argument("-d", "--max-new-tokens", type=int, default=200, help="Max new tokens (default: 200)")
     args = parser.parse_args()
 
-    with open(args.file, "r") as f:
-        content = f.read()
+    assert args.file or args.prompt_length > 0, "Either --file or --prompt-length must be provided"
+    assert not (args.file and args.prompt_length > 0), "Cannot specify both --file and --prompt-length"
 
-    content = content * args.file_repeat_times
+    if args.file:
+        with open(args.file, "r") as f:
+            content = f.read()
+        content = content * args.file_repeat_times
+    else:
+        prompt_length = max(0, args.prompt_length - 55)  # 预留系统提示和总结的长度
+        content =  str(random.randint(0, 1000000)) + " token" * prompt_length
     nonce = uuid.uuid4().hex
     system_prompt = f"{nonce} ( <-- cache_bypass, ignore it ), You are a helpful assistant for code or document summarization."
 

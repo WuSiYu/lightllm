@@ -56,7 +56,7 @@ while true; do
 
     # every 10 success, test long
     if [ $SUCCESS -gt 0 ] && [ $((SUCCESS % 10)) -eq 0 ]; then
-      python test_long_request.py benchmark_serving_chat_req_rate.py -d 2 -t 4
+      python test_long_request.py -f benchmark_serving_chat_req_rate.py -d 2 -t 2
     fi
 
   else

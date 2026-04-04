@@ -23,6 +23,7 @@ class StartArgs:
     pd_decode_rpyc_port: int = field(default=None)
     select_p_d_node_strategy: str = field(default=None)
     flex_tp_threshold: int = field(default=8000)
+    flex_tp_slo_ttft: Optional[float] = field(default=None)
     model_name: str = field(default="default_model_name")
     model_dir: Optional[str] = field(default=None)
     tokenizer_mode: str = field(default="slow")

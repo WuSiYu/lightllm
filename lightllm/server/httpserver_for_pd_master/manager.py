@@ -89,9 +89,12 @@ class HttpServerManagerForPDMaster:
         sampling_params: SamplingParams,
         multimodal_params: MultimodalParams,
         input_token_num: Optional[int] = None,
+        arrival_time: Optional[float] = None,
+        req_id: Optional[int] = None,
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
         return await self.pd_manager.select_p_d_node(
-            prompt, sampling_params, multimodal_params, input_token_num=input_token_num
+            prompt, sampling_params, multimodal_params,
+            input_token_num=input_token_num, arrival_time=arrival_time, req_id=req_id
         )
 
     async def generate(
@@ -125,7 +128,7 @@ class HttpServerManagerForPDMaster:
         p_node = None
         d_node = None
         # flex TP (drain 模式): 每个请求独立的上下文，避免并发覆盖
-        flex_tp_ctx = {"notified": False, "input_token_num": input_token_num or 0}
+        flex_tp_ctx = {"notified": False, "input_token_num": input_token_num or 0, "arrival_time": start_time, "req_id": origin_group_request_id}
         try:
             # 记录请求到达的相关信息
             await self._log_req_header(request, origin_group_request_id)
@@ -136,7 +139,9 @@ class HttpServerManagerForPDMaster:
             )
 
             p_node, d_node = await self.select_p_d_node(
-                prompt, origin_sampling_params, multimodal_params, input_token_num=input_token_num
+                prompt, origin_sampling_params, multimodal_params,
+                input_token_num=input_token_num, arrival_time=start_time,
+                req_id=origin_group_request_id
             )
 
             history_gen_token_strs = []
@@ -180,7 +185,9 @@ class HttpServerManagerForPDMaster:
             logger.error(f"has exception {str(e)}")
             # flex TP (drain 模式): 如果 prefill 通知还未发出，安全兜底释放
             if not flex_tp_ctx["notified"]:
-                await self.pd_manager.notify_flex_tp_request_done(p_node, flex_tp_ctx["input_token_num"])
+                await self.pd_manager.notify_flex_tp_request_done(
+                    p_node, flex_tp_ctx["input_token_num"], req_id=flex_tp_ctx.get("req_id")
+                )
                 flex_tp_ctx["notified"] = True
             try:
                 if block_group_request_id is not None:
@@ -262,7 +269,12 @@ class HttpServerManagerForPDMaster:
 
         # prefill 计算已完成（第一个 token 已返回），通知 flex TP 调度器释放 GPU（仅 drain 模式）
         if flex_tp_ctx is not None and not flex_tp_ctx["notified"]:
-            await self.pd_manager.notify_flex_tp_request_done(p_node, flex_tp_ctx["input_token_num"])
+            _arrival = flex_tp_ctx.get("arrival_time")
+            _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
+            await self.pd_manager.notify_flex_tp_request_done(
+                p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
+                req_id=flex_tp_ctx.get("req_id")
+            )
             flex_tp_ctx["notified"] = True
 
         # 如果只需要一个输出 token，prefill 完就直接结束掉吧
@@ -332,7 +344,12 @@ class HttpServerManagerForPDMaster:
 
         # prefill 计算已完成（prompt_ids 已上报），通知 flex TP 调度器释放 GPU（仅 drain 模式）
         if flex_tp_ctx is not None and not flex_tp_ctx["notified"]:
-            await self.pd_manager.notify_flex_tp_request_done(p_node, flex_tp_ctx["input_token_num"])
+            _arrival = flex_tp_ctx.get("arrival_time")
+            _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
+            await self.pd_manager.notify_flex_tp_request_done(
+                p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
+                req_id=flex_tp_ctx.get("req_id")
+            )
             flex_tp_ctx["notified"] = True
 
         sampling_params.max_new_tokens = old_max_new_tokens
@@ -427,7 +444,12 @@ class HttpServerManagerForPDMaster:
         # fetch_stream 生成器可能因 break 被提前关闭（如 max_new_tokens=1），
         # 导致其内部的 notify_flex_tp_request_done 未执行，这里兜底补发
         if flex_tp_ctx is not None and not flex_tp_ctx["notified"]:
-            await self.pd_manager.notify_flex_tp_request_done(p_node, flex_tp_ctx["input_token_num"])
+            _arrival = flex_tp_ctx.get("arrival_time")
+            _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
+            await self.pd_manager.notify_flex_tp_request_done(
+                p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
+                req_id=flex_tp_ctx.get("req_id")
+            )
             flex_tp_ctx["notified"] = True
 
         total_cost_time_ms = (time.time() - start_time) * 1000
@@ -601,6 +623,7 @@ class PDManager:
             args.select_p_d_node_strategy,
             self,
             flex_tp_threshold=getattr(args, "flex_tp_threshold", 8000),
+            flex_tp_slo_ttft=getattr(args, "flex_tp_slo_ttft", None),
         )
         return
 
@@ -669,20 +692,26 @@ class PDManager:
         sampling_params: SamplingParams,
         multimodal_params: MultimodalParams,
         input_token_num: Optional[int] = None,
+        arrival_time: Optional[float] = None,
+        req_id: Optional[int] = None,
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
         from .pd_selector.flex_tp_selector import FlexTPSelector
 
         if isinstance(self.selector, FlexTPSelector):
             return await self.selector.async_select_p_d_node(
-                prompt, sampling_params, multimodal_params, input_token_num=input_token_num
+                prompt, sampling_params, multimodal_params,
+                input_token_num=input_token_num, arrival_time=arrival_time, req_id=req_id
             )
         return self.selector.select_p_d_node(prompt, sampling_params, multimodal_params)
 
-    async def notify_flex_tp_request_done(self, p_node: Optional[PD_Client_Obj], input_token_num: int = 0):
+    async def notify_flex_tp_request_done(self, p_node: Optional[PD_Client_Obj], input_token_num: int = 0,
+                                          actual_ttft: Optional[float] = None,
+                                          req_id: Optional[int] = None):
         """通知 flex TP 选择器请求已完成，用于更新在途请求计数和 token 数（仅 drain 模式的 FlexTPSelector 需要）"""
         from .pd_selector.flex_tp_selector import FlexTPSelector
-        logger.info(f"notify_flex_tp_request_done for p_node {p_node.client_ip_port if p_node else None}")
+        logger.info(f"notify_flex_tp_request_done: req_id={req_id}, p_node={p_node.client_ip_port if p_node else None}")
 
         if isinstance(self.selector, FlexTPSelector) and p_node is not None:
-            await self.selector.notify_request_done(p_node, input_token_num=input_token_num)
+            await self.selector.notify_request_done(p_node, input_token_num=input_token_num,
+                                                    actual_ttft=actual_ttft, req_id=req_id)
 

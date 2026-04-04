@@ -4,7 +4,7 @@ HOST_IP=`hostname -i`
 # 定义 tmux session 的名称
 SESSION_NAME="lightllm_cluster"
 
-EXPR_NAME="70b_p22.4d4_v4.2_flex_10k_mps_sche1"
+EXPR_NAME="70b_p22.4d4_v5_flex_10k_mps_sche1"
 
 LOGDIR="_/server_log_$EXPR_NAME"
 mkdir -p $LOGDIR
@@ -32,7 +32,7 @@ if [ $? != 0 ]; then
   tmux new-session -d -s $SESSION_NAME -n master
   # 向 'master' 窗口发送命令并执行 (C-m 代表回车)
   tmux send-keys -t $SESSION_NAME:master "unset https_proxy" C-m
-  tmux send-keys -t $SESSION_NAME:master "python -m lightllm.server.api_server --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len 65536 --run_mode 'pd_master' --select_p_d_node_strategy flex_tp --flex_tp_threshold 10000 --host $HOST_IP --port 60011 2>&1 | tee $LOGDIR/master.log" C-m
+  tmux send-keys -t $SESSION_NAME:master "python -m lightllm.server.api_server --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len 65536 --run_mode 'pd_master' --select_p_d_node_strategy flex_tp --flex_tp_slo_ttft 3 --host $HOST_IP --port 60011 2>&1 | tee $LOGDIR/master.log" C-m
 
   # 2. 创建 'p01' 窗口: prefill master A (tp2, GPU 0,1)
   tmux new-window -t $SESSION_NAME -n p01

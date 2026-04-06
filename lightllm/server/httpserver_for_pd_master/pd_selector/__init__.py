@@ -1,5 +1,6 @@
 from .pd_selector import PDSelector, RandomSelector, RoundRobinSelector, AdaptiveLoadSelector
 from .flex_tp_selector import FlexTPSelector
+from .flex_tp_selector_naive import FlexTPNaiveSelector
 
 
 def create_selector(selector_type: str, pd_manager, **kwargs) -> PDSelector:
@@ -13,5 +14,8 @@ def create_selector(selector_type: str, pd_manager, **kwargs) -> PDSelector:
         length_threshold = kwargs.get("flex_tp_threshold", 8000)
         slo_ttft = kwargs.get("flex_tp_slo_ttft", None)
         return FlexTPSelector(pd_manager, length_threshold=length_threshold, slo_ttft=slo_ttft)
+    elif selector_type == "flex_tp_naive":
+        length_threshold = kwargs.get("flex_tp_threshold", 8000)
+        return FlexTPNaiveSelector(pd_manager, length_threshold=length_threshold)
     else:
         raise ValueError(f"Invalid selector type: {selector_type}")

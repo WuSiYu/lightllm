@@ -34,6 +34,7 @@ def _handle_kvmove_task(
     connect_id_to_comm: Dict[str, PyNcclCommunicator],
     connect_id: str,
     dp_size_in_node: int,
+    remote_recv_buffers: dict = None,
 ):
     total_move_kv_len = sum([task.move_kv_len for task in move_tasks])
     try:
@@ -48,7 +49,8 @@ def _handle_kvmove_task(
                 )
             else:
                 cur_mem.receive_from_prefill_node(
-                    move_tasks, mem_managers, dp_size_in_node, connect_id_to_comm[connect_id]
+                    move_tasks, mem_managers, dp_size_in_node, connect_id_to_comm[connect_id],
+                    pre_alloc_remote_recv_buffers=remote_recv_buffers,
                 )
             logger.info(f"trans finished: {move_tasks[0].to_decode_log_info()} move len: {total_move_kv_len}")
         torch.cuda.synchronize()
@@ -136,13 +138,23 @@ def _init_env(args, device_id: int, task_in_queue: mp.Queue, task_out_queue: mp.
             MemoryManager.loads_from_shm(rank_in_node=rank) for rank in range(node_world_size)
         ]
 
+        # Pre-allocate persistent staging buffers on each remote device to avoid
+        # repeated torch.empty/free cycles that cause CUDA caching-allocator
+        # fragmentation under MPS, eventually leading to illegal-memory-access.
+        remote_recv_buffers = MemoryManager.alloc_remote_recv_buffers(mem_managers, device_id)
+        logger.info(
+            f"pre-allocated remote recv buffers for device {device_id}: "
+            f"ranks={list(remote_recv_buffers.keys())}"
+        )
+
         task_out_queue.put("get_mem_managers_ok")
         connect_id_to_comm: Dict[str, PyNcclCommunicator] = {}
         while True:
             task: Union[KVMoveTaskGroup, PDTransJoinInfo, PDTransLeaveInfo] = task_in_queue.get()
             if isinstance(task, KVMoveTaskGroup):
                 _handle_kvmove_task(
-                    task.tasks, task_out_queue, mem_managers, connect_id_to_comm, task.connect_id, dp_size_in_node
+                    task.tasks, task_out_queue, mem_managers, connect_id_to_comm, task.connect_id, dp_size_in_node,
+                    remote_recv_buffers=remote_recv_buffers,
                 )
             elif isinstance(task, PDTransJoinInfo):
                 _handle_prefill_join(task, task_out_queue, connect_id_to_comm)

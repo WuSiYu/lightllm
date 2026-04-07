@@ -184,6 +184,34 @@ class MemoryManager:
         self.token_dim_size = self.kv_move_buffer.shape[-2] * self.kv_move_buffer.shape[-1]
         return
 
+    @staticmethod
+    def alloc_remote_recv_buffers(
+        mem_managers: list, local_device_index: int
+    ) -> dict:
+        """
+        Pre-allocate persistent staging buffers on each remote device for the
+        asymmetric-TP KV receive path. Called once at transfer-process startup
+        to avoid repeated torch.empty / cudaFree cycles on remote GPUs, which
+        under MPS fragment the per-process CUDA caching allocator and
+        eventually cause illegal-memory-access errors.
+
+        Returns {device_rank: tensor} for every rank != local_device_index.
+        Each tensor has shape (1, max_token_num, 2*head_num, head_dim) and
+        lives on that rank's device.
+        """
+        local_mem = mem_managers[local_device_index]
+        max_token_num = local_mem.kv_move_buffer.shape[1]  # max_req_total_len + 8
+        buffers = {}
+        for i, mem in enumerate(mem_managers):
+            if i == local_device_index:
+                continue
+            buffers[i] = torch.empty(
+                (1, max_token_num, 2 * mem.head_num, mem.head_dim),
+                dtype=mem.dtype,
+                device=mem.kv_buffer.device,
+            )
+        return buffers
+
     def alloc_paged_kv_move_buffer(self, page_num, page_size) -> torch.Tensor:
         if isinstance(self, MemoryManager) and type(self) is not MemoryManager:
             raise NotImplementedError("subclass need reimpl this method")
@@ -492,6 +520,7 @@ class MemoryManager:
         mem_managers: List["MemoryManager"],
         dp_size_in_node: int,
         nccl_comm: PyNcclCommunicator,
+        pre_alloc_remote_recv_buffers: dict = None,
     ):
         assert dp_size_in_node == 1
         total_start = time.perf_counter()
@@ -533,11 +562,21 @@ class MemoryManager:
         move_size = self.token_dim_size * token_num
         recive_buffer = self.kv_move_buffer.view(-1)[0:move_size].view(1, token_num, 2 * self.head_num, self.head_dim)
         expected_shape = (1, token_num, 2 * self.head_num, self.head_dim)
-        remote_recv_buffer_views = {
-            i: torch.empty(recive_buffer.shape, dtype=self.dtype, device=mem.kv_buffer.device)
-            for i, mem in enumerate(mem_managers)
-            if i != cur_device_index
-        }
+        # Use pre-allocated remote staging buffers (sliced to current token_num)
+        # to avoid repeated torch.empty/free on remote GPUs which under MPS
+        # causes caching-allocator fragmentation and illegal-memory-access.
+        if pre_alloc_remote_recv_buffers is not None:
+            remote_recv_buffer_views = {
+                i: pre_alloc_remote_recv_buffers[i][:, :token_num, :, :]
+                for i in pre_alloc_remote_recv_buffers
+                if i != cur_device_index
+            }
+        else:
+            remote_recv_buffer_views = {
+                i: torch.empty(recive_buffer.shape, dtype=self.dtype, device=mem.kv_buffer.device)
+                for i, mem in enumerate(mem_managers)
+                if i != cur_device_index
+            }
 
         if prefill_tp_in_node == decode_tp_in_node:
             recv_nccl_ms = 0.0

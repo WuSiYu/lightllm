@@ -219,6 +219,10 @@ class PyNcclCommunicator:
             stream.synchronize()
             del data
 
+    def get_nccl_stream(self) -> torch.cuda.Stream:
+        """Return the CUDA stream used by this communicator's NCCL operations."""
+        return current_stream()
+
     def destroy(self):
         self.nccl.ncclCommDestroy(self.comm)
 

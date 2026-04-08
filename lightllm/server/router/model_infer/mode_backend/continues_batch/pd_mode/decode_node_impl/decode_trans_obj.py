@@ -97,6 +97,12 @@ class KVTransConnectObj:
         src_tp = int(getattr(move_tasks[0], "prefill_tp_in_node", self.manager.node_world_size) or self.manager.node_world_size)
         dst_tp = int(getattr(move_tasks[0], "decode_tp_in_node", self.manager.node_world_size) or self.manager.node_world_size)
         if src_tp != dst_tp:
+            # Under MPS, concurrent asymmetric transfers from multiple transfer
+            # sub-processes (each a separate MPS client) doing cross-device
+            # index_put_ on the same GPUs can cause CUDA illegal memory access.
+            # Serialize with the global lock to limit to one transfer at a time.
+            if getattr(self.manager.args, "enable_mps", False):
+                return False
             return True
         return kv_trans_use_p2p() and src_tp == dst_tp == self.manager.node_world_size
 

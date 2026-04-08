@@ -35,6 +35,7 @@ def _handle_kvmove_task(
     connect_id: str,
     dp_size_in_node: int,
     remote_recv_buffers: dict = None,
+    remote_token_index_buffers: dict = None,
 ):
     total_move_kv_len = sum([task.move_kv_len for task in move_tasks])
     try:
@@ -51,9 +52,14 @@ def _handle_kvmove_task(
                 cur_mem.receive_from_prefill_node(
                     move_tasks, mem_managers, dp_size_in_node, connect_id_to_comm[connect_id],
                     pre_alloc_remote_recv_buffers=remote_recv_buffers,
+                    pre_alloc_token_index_buffers=remote_token_index_buffers,
                 )
             logger.info(f"trans finished: {move_tasks[0].to_decode_log_info()} move len: {total_move_kv_len}")
-        torch.cuda.synchronize()
+        # Sync ALL devices that may have received remote writes, not just
+        # the transfer process's primary device.
+        for mem in mem_managers:
+            with torch.cuda.device(mem.kv_buffer.device):
+                torch.cuda.synchronize()
         path_tag = "p2p" if _can_use_p2p_for_tasks(move_tasks, mem_managers) else (
             "sym" if move_tasks[0].prefill_tp_in_node == move_tasks[0].decode_tp_in_node else "asym"
         )
@@ -147,6 +153,15 @@ def _init_env(args, device_id: int, task_in_queue: mp.Queue, task_out_queue: mp.
             f"ranks={list(remote_recv_buffers.keys())}"
         )
 
+        max_token_num = mem_managers[device_id].kv_move_buffer.shape[1]
+        remote_token_index_buffers = MemoryManager.alloc_remote_token_index_buffers(
+            mem_managers, max_token_num
+        )
+        logger.info(
+            f"pre-allocated remote token index buffers for device {device_id}: "
+            f"dev_indices={list(remote_token_index_buffers.keys())}"
+        )
+
         task_out_queue.put("get_mem_managers_ok")
         connect_id_to_comm: Dict[str, PyNcclCommunicator] = {}
         while True:
@@ -155,6 +170,7 @@ def _init_env(args, device_id: int, task_in_queue: mp.Queue, task_out_queue: mp.
                 _handle_kvmove_task(
                     task.tasks, task_out_queue, mem_managers, connect_id_to_comm, task.connect_id, dp_size_in_node,
                     remote_recv_buffers=remote_recv_buffers,
+                    remote_token_index_buffers=remote_token_index_buffers,
                 )
             elif isinstance(task, PDTransJoinInfo):
                 _handle_prefill_join(task, task_out_queue, connect_id_to_comm)

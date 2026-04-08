@@ -68,7 +68,7 @@ _mid_start_times = []
 _mid_end_times = []
 _mid_end_rates = []
 FAILED_REQUESTS = 0
-MAX_REQ_TOTAL_TOKENS = 16000
+MAX_REQ_TOTAL_TOKENS = 65000
 
 # Predefined simple mixed uniform distributions for --dataset-type simple.X
 # Each entry is a list of components: {weight, input_range (min,max), output_range (min,max)}
@@ -171,14 +171,27 @@ def sample_requests_from_servegen(args) -> List[Request]:
         from servegen.utils import get_constant_rate_fn
 
     duration = 300
-    pool = ClientPool(Category.LANGUAGE, args.servegen_mode)
+    if args.servegen_mode == 'mm-image':
+        category_name = Category.MULTIMODAL
+    elif args.servegen_mode == 'deepseek-r1':
+        category_name = Category.REASON
+    else:
+        category_name = Category.LANGUAGE
+
+    pool = ClientPool(category_name, args.servegen_mode)
     rate_fn = get_constant_rate_fn(pool.span(0, duration), args.request_rate)
     sg_requests = generate_workload(pool, rate_fn, duration=duration, seed=args.seed)
 
     sampled_requests: List[Request] = []
     dropped_too_long = 0
     for req in sg_requests:
-        input_tokens = max(4, int(req.data.get("input_tokens", 16)))
+        if category_name == Category.MULTIMODAL:
+            input_tokens = max(4, int(req.data.get("text_tokens", 16)))
+            input_tokens += int(sum(req.data.get("image_tokens", 0)))
+            input_tokens += int(sum(req.data.get("audio_tokens", 0)))
+            input_tokens += int(sum(req.data.get("video_tokens", 0)))
+        else:
+            input_tokens = max(4, int(req.data.get("input_tokens", 16)))
         output_tokens = max(4, int(req.data.get("output_tokens", 16)))
         if input_tokens + output_tokens > MAX_REQ_TOTAL_TOKENS:
             dropped_too_long += 1

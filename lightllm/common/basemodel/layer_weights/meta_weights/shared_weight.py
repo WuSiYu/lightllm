@@ -45,7 +45,7 @@ class TensorShareService(rpyc.Service):
             return None
 
         item = self._registry[tensor_id]
-        tensor = item['tensor']
+        tensor: torch.Tensor = item['tensor']
         user_meta = item['meta']
 
         # Ensure tensor is in contiguous memory for safe sharing

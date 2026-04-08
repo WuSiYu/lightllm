@@ -205,11 +205,33 @@ class MemoryManager:
         for i, mem in enumerate(mem_managers):
             if i == local_device_index:
                 continue
-            buffers[i] = torch.empty(
-                (1, max_token_num, 2 * mem.head_num, mem.head_dim),
-                dtype=mem.dtype,
-                device=mem.kv_buffer.device,
-            )
+            with torch.cuda.device(mem.kv_buffer.device):
+                buffers[i] = torch.empty(
+                    (1, max_token_num, 2 * mem.head_num, mem.head_dim),
+                    dtype=mem.dtype,
+                    device=mem.kv_buffer.device,
+                )
+        return buffers
+
+    @staticmethod
+    def alloc_remote_token_index_buffers(
+        mem_managers: list, max_token_num: int
+    ) -> dict:
+        """
+        Pre-allocate token index buffers on each device to avoid per-call
+        torch.tensor() allocations on remote GPUs under MPS.
+
+        Returns {device_index: tensor} for every unique device in mem_managers.
+        """
+        buffers = {}
+        for mem in mem_managers:
+            dev = mem.kv_buffer.device
+            dev_idx = dev.index
+            if dev_idx not in buffers:
+                with torch.cuda.device(dev):
+                    buffers[dev_idx] = torch.empty(
+                        max_token_num, dtype=torch.int64, device=dev
+                    )
         return buffers
 
     def alloc_paged_kv_move_buffer(self, page_num, page_size) -> torch.Tensor:
@@ -521,6 +543,7 @@ class MemoryManager:
         dp_size_in_node: int,
         nccl_comm: PyNcclCommunicator,
         pre_alloc_remote_recv_buffers: dict = None,
+        pre_alloc_token_index_buffers: dict = None,
     ):
         assert dp_size_in_node == 1
         total_start = time.perf_counter()
@@ -535,13 +558,26 @@ class MemoryManager:
         if len(move_token_indexes) == 0:
             return
 
-        token_indexes_by_device = {}
-        for mem in mem_managers:
-            dev_idx = mem.kv_buffer.device.index
-            if dev_idx not in token_indexes_by_device:
-                token_indexes_by_device[dev_idx] = torch.tensor(
-                    move_token_indexes, dtype=torch.int64, device=mem.kv_buffer.device
-                )
+        token_num = len(move_token_indexes)
+        # Use pre-allocated token index buffers to avoid per-call torch.tensor()
+        # on remote GPUs, which fragments the caching allocator under MPS.
+        if pre_alloc_token_index_buffers is not None:
+            token_indexes_by_device = {}
+            idx_src = torch.tensor(move_token_indexes, dtype=torch.int64, device="cpu")
+            for mem in mem_managers:
+                dev_idx = mem.kv_buffer.device.index
+                if dev_idx not in token_indexes_by_device:
+                    buf = pre_alloc_token_index_buffers[dev_idx][:token_num]
+                    buf.copy_(idx_src, non_blocking=False)
+                    token_indexes_by_device[dev_idx] = buf
+        else:
+            token_indexes_by_device = {}
+            for mem in mem_managers:
+                dev_idx = mem.kv_buffer.device.index
+                if dev_idx not in token_indexes_by_device:
+                    token_indexes_by_device[dev_idx] = torch.tensor(
+                        move_token_indexes, dtype=torch.int64, device=mem.kv_buffer.device
+                    )
 
         decode_tp_in_node = move_tasks[0].decode_tp_in_node if move_tasks[0].decode_tp_in_node is not None else len(mem_managers)
         prefill_tp_in_node = move_tasks[0].prefill_tp_in_node if move_tasks[0].prefill_tp_in_node is not None else decode_tp_in_node
@@ -558,8 +594,8 @@ class MemoryManager:
             )
 
         cur_device_index = self.kv_buffer.get_device()
-        token_num = len(move_token_indexes)
         move_size = self.token_dim_size * token_num
+        nccl_stream = nccl_comm.get_nccl_stream()
         recive_buffer = self.kv_move_buffer.view(-1)[0:move_size].view(1, token_num, 2 * self.head_num, self.head_dim)
         expected_shape = (1, token_num, 2 * self.head_num, self.head_dim)
         # Use pre-allocated remote staging buffers (sliced to current token_num)
@@ -586,6 +622,7 @@ class MemoryManager:
                 for layer_index in range(mem.layer_num):
                     t0 = time.perf_counter()
                     nccl_comm.recv(recive_buffer, src=0)
+                    nccl_stream.synchronize()
                     recv_nccl_ms += (time.perf_counter() - t0) * 1000.0
                     if recive_buffer.shape != expected_shape:
                         raise ValueError(f"Unexpected recv buffer shape {recive_buffer.shape}, expect {expected_shape}")
@@ -595,13 +632,14 @@ class MemoryManager:
                         mem._write_kv_move_data(token_indexes, recive_buffer, layer_index)
                         recv_write_ms += (time.perf_counter() - t1) * 1000.0
                     else:
-                        new_recive_buffer = remote_recv_buffer_views[i]
-                        t1 = time.perf_counter()
-                        new_recive_buffer.copy_(recive_buffer, non_blocking=False)
-                        bcast_ops += 1
-                        token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
-                        mem._write_kv_move_data(token_indexes, new_recive_buffer, layer_index)
-                        recv_write_ms += (time.perf_counter() - t1) * 1000.0
+                        with torch.cuda.device(mem.kv_buffer.device):
+                            new_recive_buffer = remote_recv_buffer_views[i]
+                            t1 = time.perf_counter()
+                            new_recive_buffer.copy_(recive_buffer, non_blocking=False)
+                            bcast_ops += 1
+                            token_indexes = token_indexes_by_device[mem.kv_buffer.device.index]
+                            mem._write_kv_move_data(token_indexes, new_recive_buffer, layer_index)
+                            recv_write_ms += (time.perf_counter() - t1) * 1000.0
             total_ms = (time.perf_counter() - total_start) * 1000.0
             recv_bytes = (
                 len(move_token_indexes)
@@ -653,14 +691,16 @@ class MemoryManager:
             for mem, tidx, is_local, remote_buf in recv_rank_info:
                 t0 = time.perf_counter()
                 nccl_comm.recv(recive_buffer, src=0)
+                nccl_stream.synchronize()
                 recv_nccl_ms += (time.perf_counter() - t0) * 1000.0
                 t1 = time.perf_counter()
                 if is_local:
                     mem._write_kv_move_data(tidx, recive_buffer, layer_index)
                 else:
-                    remote_buf.copy_(recive_buffer, non_blocking=False)
-                    bcast_ops += 1
-                    mem._write_kv_move_data(tidx, remote_buf, layer_index)
+                    with torch.cuda.device(mem.kv_buffer.device):
+                        remote_buf.copy_(recive_buffer, non_blocking=False)
+                        bcast_ops += 1
+                        mem._write_kv_move_data(tidx, remote_buf, layer_index)
                 recv_write_ms += (time.perf_counter() - t1) * 1000.0
         total_ms = (time.perf_counter() - total_start) * 1000.0
         recv_bytes = (

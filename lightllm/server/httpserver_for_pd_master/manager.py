@@ -697,8 +697,9 @@ class PDManager:
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
         from .pd_selector.flex_tp_selector import FlexTPSelector
         from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
+        from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
 
-        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector)):
+        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPSelectorV2)):
             return await self.selector.async_select_p_d_node(
                 prompt, sampling_params, multimodal_params,
                 input_token_num=input_token_num, arrival_time=arrival_time, req_id=req_id
@@ -711,9 +712,10 @@ class PDManager:
         """通知 flex TP 选择器请求已完成，用于更新在途请求计数和 token 数"""
         from .pd_selector.flex_tp_selector import FlexTPSelector
         from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
+        from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
         logger.info(f"notify_flex_tp_request_done: req_id={req_id}, p_node={p_node.client_ip_port if p_node else None}")
 
-        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector)) and p_node is not None:
+        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPSelectorV2)) and p_node is not None:
             await self.selector.notify_request_done(p_node, input_token_num=input_token_num,
                                                     actual_ttft=actual_ttft, req_id=req_id)
 

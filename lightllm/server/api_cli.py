@@ -46,7 +46,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--select_p_d_node_strategy",
         type=str,
         default="round_robin",
-        choices=["random", "round_robin", "adaptive_load", "flex_tp", "flex_tp_naive"],
+        choices=["random", "round_robin", "adaptive_load", "flex_tp", "flex_tp_naive", "flex_tp_v2"],
         help="pd master use this strategy to select p d node, can be round_robin, random, adaptive_load or flex_tp/flex_tp_naive",
     )
     parser.add_argument(

@@ -47,6 +47,7 @@ fi
 
 echo "🧹 停止 MPS daemon..."
 echo quit | nvidia-cuda-mps-control 2>/dev/null
+echo quit | CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_prefill nvidia-cuda-mps-control 2>/dev/null
 
 echo "🎉 集群清理工作全部完成！"
 

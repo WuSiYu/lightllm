@@ -20,7 +20,6 @@ def create_selector(selector_type: str, pd_manager, **kwargs) -> PDSelector:
         return FlexTPNaiveSelector(pd_manager, length_threshold=length_threshold)
     elif selector_type == "flex_tp_v2":
         slo_ttft = kwargs.get("flex_tp_slo_ttft", 5.0)
-        latency_constants = kwargs.get("flex_tp_latency_constants", None)
-        return FlexTPSelectorV2(pd_manager, slo_ttft=slo_ttft, latency_constants=latency_constants)
+        return FlexTPSelectorV2(pd_manager, slo_ttft=slo_ttft)
     else:
         raise ValueError(f"Invalid selector type: {selector_type}")

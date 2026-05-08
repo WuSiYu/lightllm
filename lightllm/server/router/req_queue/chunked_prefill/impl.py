@@ -81,6 +81,8 @@ class ChunkedPrefillQueue(BaseQueue):
         abort_req_list = []
         aborted_count = 0
 
+        token_to_prefill = 0
+
         waiting_queue = self.waiting_req_list
 
         for req in waiting_queue:
@@ -95,6 +97,10 @@ class ChunkedPrefillQueue(BaseQueue):
             )
             if ok_insert:
                 can_run_list.append(req)
+                token_to_prefill += req.input_len   # TODO: fixme
+                if token_to_prefill > 6000:
+                    logger.info(f"token_to_prefill {token_to_prefill} reach the limit, break to generate batch, batch size = {len(can_run_list)}")
+                    break
             else:
                 break
         new_batch = None

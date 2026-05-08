@@ -92,6 +92,25 @@ SIMPLE_DATASETS = {
         {"weight": 0.80, "input_range": (100, 1000),   "output_range": (50, 500)},
         {"weight": 0.20, "input_range": (1000, 20000), "output_range": (50, 500)},
     ],
+    "2-0": [
+        {"weight": 1.0, "input_range": (100, 1000),   "output_range": (50, 200)},
+    ],
+    "2-3": [
+        {"weight": 0.97, "input_range": (100, 1000),   "output_range": (50, 200)},
+        {"weight": 0.03, "input_range": (1000, 20000), "output_range": (50, 200)},
+    ],
+    "2-10": [
+        {"weight": 0.90, "input_range": (100, 1000),   "output_range": (50, 200)},
+        {"weight": 0.10, "input_range": (1000, 20000), "output_range": (50, 200)},
+    ],
+    "2-5": [
+        {"weight": 0.95, "input_range": (100, 1000),   "output_range": (50, 200)},
+        {"weight": 0.05, "input_range": (1000, 20000), "output_range": (50, 200)},
+    ],
+    "2-20": [
+        {"weight": 0.80, "input_range": (100, 1000),   "output_range": (50, 200)},
+        {"weight": 0.20, "input_range": (1000, 20000), "output_range": (50, 200)},
+    ],
 }
 
 def get_tokenizer(
@@ -170,7 +189,7 @@ def sample_requests_from_servegen(args) -> List[Request]:
         from servegen.construct import generate_workload
         from servegen.utils import get_constant_rate_fn
 
-    duration = 300
+    duration = args.servegen_duration
     if args.servegen_mode == 'mm-image':
         category_name = Category.MULTIMODAL
     elif args.servegen_mode == 'deepseek-r1':
@@ -237,6 +256,66 @@ def sample_requests_from_servegen(args) -> List[Request]:
         print(f"servegen avg / p50 / p90 / p95 / p99 output tokens: {avg_out:.2f} / {p50_out:.2f} / {p90_out:.2f} / {p95_out:.2f} / {p99_out:.2f}")
     return sampled_requests
 
+def sample_requests_mooncake(args) -> List[Request]:
+    """Load a mooncake-format JSONL dataset.
+
+    Each line: {"timestamp": ..., "input_length": N, "output_length": M, "hash_ids": [...]}
+    Takes the first --num-prompts lines, ignores timestamps, uses --request-rate + Poisson.
+    """
+    assert args.dataset, "--dataset (jsonl file) is required for mooncake"
+    # Load all entries and filter out too-long ones
+    all_entries = []
+    dropped_too_long = 0
+    with open(args.dataset) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            input_len = int(entry["input_length"])
+            output_len = int(entry["output_length"])
+            if input_len < 4 or output_len < 4:
+                dropped_too_long += 1
+                continue
+            if input_len + output_len > MAX_REQ_TOTAL_TOKENS:
+                dropped_too_long += 1
+                continue
+            all_entries.append((input_len, output_len))
+
+    print(f"mooncake dataset: {len(all_entries)} valid entries, {dropped_too_long} dropped (too long/short)")
+    assert len(all_entries) >= args.num_prompts, \
+        f"not enough valid entries ({len(all_entries)}) for --num-prompts={args.num_prompts}"
+
+    # Random sample
+    sampled_entries = random.sample(all_entries, args.num_prompts)
+
+    sampled_requests: List[Request] = []
+    for input_len, output_len in sampled_entries:
+        system_prompt = ""
+        if args.bypass_cache:
+            nonce = uuid.uuid4().hex
+            system_prompt = f"{nonce} ( <-- cache_bypass, ignore it )"
+
+        prompts = [
+            dict(role="system", content=system_prompt),
+            dict(role="user", content=_build_user_content_by_token_budget(input_len)),
+        ]
+        sampled_requests.append(Request(
+            prompts=prompts,
+            prompt_len=input_len,
+            dataset_output_len=output_len,
+            chat_rounds=1,
+        ))
+
+    print(f"Sampled {len(sampled_requests)} mooncake requests from {args.dataset}")
+    if sampled_requests:
+        p_lens = [r.prompt_len for r in sampled_requests]
+        o_lens = [r.dataset_output_len for r in sampled_requests]
+        print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p95={np.percentile(p_lens,95):.1f}, p99={np.percentile(p_lens,99):.1f}")
+        print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p95={np.percentile(o_lens,95):.1f}, p99={np.percentile(o_lens,99):.1f}")
+    return sampled_requests
+
+
 def sample_requests_simple(args) -> List[Request]:
     dataset_id = args.dataset_type.split(".", 1)[1]
     if dataset_id not in SIMPLE_DATASETS:
@@ -275,8 +354,8 @@ def sample_requests_simple(args) -> List[Request]:
         print(f"  component {idx}: weight={c['weight']}, input=[{c['input_range'][0]},{c['input_range'][1]}], output=[{c['output_range'][0]},{c['output_range'][1]}]")
     p_lens = [r.prompt_len for r in sampled_requests]
     o_lens = [r.dataset_output_len for r in sampled_requests]
-    print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p99={np.percentile(p_lens,99):.1f}")
-    print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p99={np.percentile(o_lens,99):.1f}")
+    print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p95={np.percentile(p_lens,95):.1f}, p99={np.percentile(p_lens,99):.1f}")
+    print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p95={np.percentile(o_lens,95):.1f}, p99={np.percentile(o_lens,99):.1f}")
     return sampled_requests
 
 
@@ -420,8 +499,33 @@ async def get_request(
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
-# via /generate_stream
-async def send_request(
+BACKEND = 'lightllm'   # set by argparse: 'lightllm' or 'vllm'
+VLLM_MODEL_NAME = ''   # set by argparse --vllm-model-name
+
+def _record_result(prompts, prompt_len, output_str, output_len, latencies,
+                   dataset_output_len, request_latency, chat_rounds):
+    """Common result recording logic shared by all backends."""
+    RESULTS.append(Results(
+        prompt=prompts,
+        prompt_len=prompt_len,
+        output=output_str,
+        output_len=output_len,
+        token_latencys=latencies,
+        dataset_output_len=dataset_output_len,
+        latency=request_latency, chat_rounds=chat_rounds
+    ))
+
+    if len(RESULTS) % 100 == 0:
+        time_now = time.time()
+        d_time = time_now - _mid_end_times[-1]
+        _mid_end_times.append(time_now)
+        rate = 100/d_time
+        _mid_end_rates.append(rate)
+        print(f"{len(RESULTS)} requests completed, current rate {rate:.3f} reqs/s")
+
+
+# ============== Backend: lightllm (via /generate_stream) ==============
+async def _send_request_lightllm(
     prompts: List[Dict[str, str]],
     prompt_len: int,
     dataset_output_len: int,
@@ -433,8 +537,6 @@ async def send_request(
     headers = {'Content-Type': 'application/json', 'Connection': 'keep-alive', "User-Agent": "Benchmark Client"}
     url = f'http://{ADDR}:{PORT}/generate_stream'
 
-    # print("req", prompt_len, output_len)
-
     if mode == 'known_output_len':
         parameters = dict(
             do_sample = False,
@@ -444,7 +546,6 @@ async def send_request(
     elif mode == 'unknown_output_len':
         parameters = dict(
             do_sample = False,
-            # ignore_eos = True,  # FIXME: tmp test
             max_new_tokens = 2048,
         )
     else:
@@ -473,7 +574,6 @@ async def send_request(
                     async for chunk, _ in response.content.iter_chunks():
                         time_now = time.time()
                         chunks.append(chunk)
-                        # print(chunk)
                         latencies.append(time_now - last_time)
                         last_time = time_now
 
@@ -481,10 +581,6 @@ async def send_request(
                 chunks = [json.loads(s.strip()[len('data:'):].strip()) for s in chunks]
 
                 output_str = ''.join(c['token']['text'] for c in chunks)
-                # print('_'*10)
-                # print("req:", req_json)
-                # print("output:", output_str)
-                # print("latencies:", ' '.join(f'{x:.5f}' for x in latencies))
                 break
     except Exception as e:
         FAILED_REQUESTS += 1
@@ -493,103 +589,110 @@ async def send_request(
 
     request_end_time = time.time()
     request_latency = request_end_time - request_start_time
-    RESULTS.append(Results(
-        prompt=prompts,
-        prompt_len=prompt_len,
-        output=output_str,
-        output_len=output_len,
-        token_latencys=latencies,
-        dataset_output_len=dataset_output_len,
-        latency=request_latency, chat_rounds=chat_rounds
-    ))
+    _record_result(prompts, prompt_len, output_str, output_len, latencies,
+                   dataset_output_len, request_latency, chat_rounds)
 
-    if len(RESULTS) % 100 == 0:
-        time_now = time.time()
-        d_time = time_now - _mid_end_times[-1]
-        _mid_end_times.append(time_now)
-        rate = 100/d_time
-        _mid_end_rates.append(rate)
-        print(f"{len(RESULTS)} requests completed, current rate {rate:.3f} reqs/s")
 
-# via /v1/chat/completions
-# async def send_request(
-#     prompts: List[Dict[str, str]],
-#     prompt_len: int,
-#     dataset_output_len: int,
-#     chat_rounds: int,
-#     mode: Literal['known_output_len', 'unknown_output_len']
-# ) -> None:
-#     headers = {'Content-Type': 'application/json', 'Connection': 'keep-alive', "User-Agent": "Benchmark Client"}
-#     url = 'http://localhost:8000/v1/chat/completions'
+# ============== Backend: vllm (via /v1/completions, OpenAI SSE) ==============
+async def _send_request_vllm(
+    prompts: List[Dict[str, str]],
+    prompt_len: int,
+    dataset_output_len: int,
+    chat_rounds: int,
+    mode: Literal['known_output_len', 'unknown_output_len'],
+    i: int,
+) -> None:
+    global FAILED_REQUESTS
+    headers = {'Content-Type': 'application/json', 'Connection': 'keep-alive', "User-Agent": "Benchmark Client"}
+    url = f'http://{ADDR}:{PORT}/v1/completions'
 
-#     # print("req", prompt_len, output_len)
+    if mode == 'known_output_len':
+        max_tokens = dataset_output_len
+        extra_body = {"ignore_eos": True}
+    elif mode == 'unknown_output_len':
+        max_tokens = 2048
+        extra_body = {}
+    else:
+        raise RuntimeError(f"unknown mode: {mode}")
 
-#     if mode == 'known_output_len':
-#         parameters = dict(
-#             do_sample = False,
-#             ignore_eos = True,
-#             max_tokens = dataset_output_len,
-#         )
-#     elif mode == 'unknown_output_len':
-#         parameters = dict(
-#             do_sample = False,
-#             # ignore_eos = True,  # FIXME: tmp test
-#             max_tokens = 2048,
-#         )
-#     else:
-#         raise RuntimeError(f"unknown mode: {mode}")
+    prompt_str = gen_prompt_from_conversation(prompts)
 
-#     req_json = dict(
-#         model = '1',
-#         stream = True,
-#         messages = prompts,
-#         **parameters,
-#     )
+    req_json = dict(
+        model = VLLM_MODEL_NAME,
+        prompt = prompt_str,
+        max_tokens = max_tokens,
+        temperature = 0,
+        stream = True,
+        **extra_body,
+    )
 
-#     request_start_time = time.time()
-#     timeout = aiohttp.ClientTimeout(total=3 * 3600)
-#     async with aiohttp.ClientSession(timeout=timeout) as session:
-#         while True:
-#             last_time = request_start_time
-#             async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
-#                 chunks = []
-#                 latencies = []
-#                 async for chunk, _ in response.content.iter_chunks():
-#                     time_now = time.time()
-#                     chunks.append(chunk)
-#                     print(chunk)
-#                     latencies.append(time_now - last_time)
-#                     last_time = time_now
+    request_start_time = time.time()
+    timeout = aiohttp.ClientTimeout(total=24 * 3600, connect=24 * 3600)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            last_time = request_start_time
+            async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise RuntimeError(f"bad http status: {response.status}, body: {body[:500]}")
 
-#             output_len = len(chunks)
-#             chunks = [json.loads(s.strip()[len('data: '):]) for s in chunks]
+                token_count = 0
+                latencies = []
+                output_pieces = []
+                line_buf = ""
 
-#             output_str = ''.join(c['choices'][0]['delta']['content'] for c in chunks)
-#             print('_'*10)
-#             print("req:", req_json)
-#             print("output:", output_str)
-#             print("latencies:", ' '.join(f'{x:.5f}' for x in latencies))
-#             break
+                async for raw_bytes, _ in response.content.iter_chunks():
+                    time_now = time.time()
+                    line_buf += raw_bytes.decode('utf-8', errors='replace')
+                    # Process complete lines from buffer
+                    while '\n' in line_buf:
+                        line, line_buf = line_buf.split('\n', 1)
+                        line = line.strip()
+                        if not line.startswith('data:'):
+                            continue
+                        payload = line[len('data:'):].strip()
+                        if payload == '[DONE]':
+                            continue
+                        try:
+                            obj = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = obj.get('choices', [])
+                        if not choices:
+                            continue
+                        text = choices[0].get('text', '')
+                        if text:
+                            output_pieces.append(text)
+                            token_count += 1
+                            latencies.append(time_now - last_time)
+                            last_time = time_now
 
-#     request_end_time = time.time()
-#     request_latency = request_end_time - request_start_time
-#     RESULTS.append(Results(
-#         prompt=prompts,
-#         prompt_len=prompt_len,
-#         output=output_str,
-#         output_len=output_len,
-#         token_latencys=latencies,
-#         dataset_output_len=dataset_output_len,
-#         latency=request_latency, chat_rounds=chat_rounds
-#     ))
+                output_str = ''.join(output_pieces)
+                output_len = token_count
+    except Exception as e:
+        FAILED_REQUESTS += 1
+        print(f"request failed: req_id={i}, prompt_len={prompt_len}, dataset_output_len={dataset_output_len}, err={repr(e)}")
+        return
 
-#     if len(RESULTS) % 100 == 0:
-#         time_now = time.time()
-#         d_time = time_now - _mid_times[-1]
-#         _mid_times.append(time_now)
-#         rate = 100/d_time
-#         _mid_rate.append(rate)
-#         print(f"{len(RESULTS)} requests completed, current rate {rate:.3f} reqs/s")
+    request_end_time = time.time()
+    request_latency = request_end_time - request_start_time
+    _record_result(prompts, prompt_len, output_str, output_len, latencies,
+                   dataset_output_len, request_latency, chat_rounds)
+
+
+# ============== Dispatch ==============
+async def send_request(
+    prompts: List[Dict[str, str]],
+    prompt_len: int,
+    dataset_output_len: int,
+    chat_rounds: int,
+    mode: Literal['known_output_len', 'unknown_output_len'],
+    i: int,
+) -> None:
+    if BACKEND == 'vllm':
+        await _send_request_vllm(prompts, prompt_len, dataset_output_len, chat_rounds, mode, i)
+    else:
+        await _send_request_lightllm(prompts, prompt_len, dataset_output_len, chat_rounds, mode, i)
 
 
 async def benchmark(
@@ -635,6 +738,8 @@ def main(args: argparse.Namespace):
         np.random.seed(args.seed)
         if args.dataset_type == 'servegen':
             input_requests = sample_requests_from_servegen(args)
+        elif args.dataset_type == 'mooncake':
+            input_requests = sample_requests_mooncake(args)
         elif args.dataset_type.startswith('simple.'):
             input_requests = sample_requests_simple(args)
         else:
@@ -658,7 +763,7 @@ def main(args: argparse.Namespace):
             args.request_rate,
             mode=mode,
             follow_request_timestamp=(args.dataset_type == 'servegen'),
-            fixed_interval=args.dataset_type.startswith('simple.'),
+            fixed_interval=args.dataset_type.startswith('simple.') or args.dataset_type == 'mooncake',
         ))
         benchmark_end_time = time.time()
         benchmark_time = benchmark_end_time - benchmark_start_time
@@ -763,6 +868,7 @@ if __name__ == "__main__":
                         help=(
                             "dataset source type: "
                             "sharegpt (need --dataset/--tokenizer), "
+                            "mooncake (need --dataset, jsonl with input_length/output_length), "
                             "servegen (no --dataset needed), "
                             "simple.N (predefined synthetic distributions, no --dataset/--tokenizer needed). "
                             f"Available simple types: {', '.join('simple.' + k for k in SIMPLE_DATASETS)}. "
@@ -771,6 +877,7 @@ if __name__ == "__main__":
                             "simple types use fixed (constant) request intervals instead of Poisson."
                         ))
     parser.add_argument("--servegen-mode", default="m-large", help="ServeGen mode, only work when --dataset-type=servegen, see ServeGen repo for details.")
+    parser.add_argument("--servegen-duration", type=int, default=300, help="ServeGen duration, only work when --dataset-type=servegen, see ServeGen repo for details.")
     parser.add_argument("--addr", type=str, default="127.0.0.1",
                         help="server addr.")
     parser.add_argument("--port", type=str, default="8000",
@@ -795,6 +902,11 @@ if __name__ == "__main__":
     parser.add_argument("--long-1500", action='store_true', help="set max_new_token to normal(1500, 200), so use with known_output_len mode")
     parser.add_argument("--long-out-3x", action='store_true', help="set max_new_token to 3x of dataset output length, so use with known_output_len mode")
     parser.add_argument("--use-existing-dump", default=None, help="don't run the benchmark, use the existed benckmark dump from previous runs")
+    parser.add_argument("--backend", type=str, default="lightllm", choices=["lightllm", "vllm"],
+                        help="serving backend: lightllm (/generate_stream) or vllm (/v1/completions)")
+    parser.add_argument("--vllm-model-name", type=str, default=None,
+                        help="model name for vllm OpenAI API (required when --backend=vllm). "
+                             "Must match the model name served by vllm, e.g. meta-llama/Llama-3.1-70B-Instruct")
     args = parser.parse_args()
     if args.bypass_cache and args.mode == 'unknown_output_len':
         raise UserWarning("use bypass-cache in unknown_output_len mode may break the model's response pattern and cause the output length very different from the dataset output length, which may make the benchmark results less meaningful")
@@ -830,6 +942,17 @@ if __name__ == "__main__":
             warnings.warn("--long-1500 is ignored when --dataset-type=servegen")
         if args.long_out_3x:
             warnings.warn("--long-out-3x is ignored when --dataset-type=servegen")
+    elif args.dataset_type == 'mooncake':
+        if args.tokenizer:
+            warnings.warn("--tokenizer is ignored when --dataset-type=mooncake")
+        if args.max_round != 99999:
+            warnings.warn("--max-round is ignored when --dataset-type=mooncake")
+        if args.long:
+            warnings.warn("--long is ignored when --dataset-type=mooncake")
+        if args.long_1500:
+            warnings.warn("--long-1500 is ignored when --dataset-type=mooncake")
+        if args.long_out_3x:
+            warnings.warn("--long-out-3x is ignored when --dataset-type=mooncake")
     elif _is_simple:
         if args.dataset:
             warnings.warn(f"--dataset is ignored when --dataset-type={args.dataset_type}")
@@ -844,9 +967,11 @@ if __name__ == "__main__":
         if args.long_out_3x:
             warnings.warn(f"--long-out-3x is ignored when --dataset-type={args.dataset_type}")
 
-    if args.dataset_type not in ('servegen',) and not _is_simple:
+    if args.dataset_type not in ('servegen', 'mooncake') and not _is_simple:
         assert args.dataset, "--dataset is required when --dataset-type=sharegpt"
         assert args.tokenizer, "--tokenizer is required when --dataset-type=sharegpt"
+    elif args.dataset_type == 'mooncake':
+        assert args.dataset, "--dataset (jsonl file) is required when --dataset-type=mooncake"
     elif args.dataset_type == 'servegen':
         if args.request_rate == float("inf") or args.request_rate <= 0:
             raise ValueError("For --dataset-type servegen, --request-rate must be a finite positive number.")
@@ -863,4 +988,10 @@ if __name__ == "__main__":
     assert not (args.long_1500 and args.long_out_3x), "cannot use both long_1500 and long_out_3x"
     ADDR = args.addr
     PORT = args.port
+    BACKEND = args.backend
+    if BACKEND == 'vllm':
+        if not args.vllm_model_name:
+            raise ValueError("--vllm-model-name is required when --backend=vllm")
+        VLLM_MODEL_NAME = args.vllm_model_name
+    print(f"Backend: {BACKEND}" + (f" (model={VLLM_MODEL_NAME})" if BACKEND == 'vllm' else ''))
     main(args)

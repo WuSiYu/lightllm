@@ -45,10 +45,10 @@ class LatencyModelV2:
 
     # 默认常数 (a, b, c, d)，可通过 set_constants 覆盖
     DEFAULT_CONSTANTS: Dict[int, Tuple[float, float, float, float]] = {
-        1: (0.00024, 1e-8, 0.005, 0.005),
-        2: (0.00018, 8e-9, 0.004, 0.004),
-        4: (0.00012, 5e-9, 0.003, 0.003),
-        8: (0.00008, 3e-9, 0.002, 0.002),
+        1: (0.00024, 1e-8, 0.05, 0.05),
+        2: (2.018352e-04, 6.048427e-09, 2.341091e-02, 6.794939e-02),
+        4: (2.075268e-04, 3.480743e-09, 1.166994e-01, 2.912135e-01),
+        8: (0.00008, 3e-9, 0.05, 0.05),
     }
 
     def __init__(self, constants: Optional[Dict[int, Tuple[float, float, float, float]]] = None):
@@ -86,6 +86,21 @@ class LatencyModelV2:
         compute = a * sum_s / tp_size + b * sum_s2 / tp_size
         return max(compute, c) + d
 
+    def predict_queue(self, seq_lens: List[int], tp_size: int) -> float:
+        """模拟服务端组batch的行为"""
+        # 组batch行为：往batch中加请求，直到当前batch已经超过6000tokens后，进行执行
+        THRESHOLD = 6000
+        batch = []
+        total_time = 0.0
+        for s in seq_lens:
+            batch.append(s)
+            if sum(batch) >= THRESHOLD:
+                total_time += self.predict_batch(batch, tp_size)
+                batch = []
+        if batch:
+            total_time += self.predict_batch(batch, tp_size)
+        return total_time
+
 
 # ===========================================================================
 #  Active Large-TP Instance Tracker
@@ -93,25 +108,26 @@ class LatencyModelV2:
 
 
 @dataclass
-class ActiveLargeTPInstance:
+class ActiveLargeTPReq:
     """跟踪一个正在执行的大 TP 请求"""
     req_id: Optional[int]
     tp_size: int
     gpu_set: frozenset  # 该实例占用的 GPU 集合
     group_id: str
     exclusive_latency: float  # 独占执行时间
-    budget: float  # contention budget = T_slo - exclusive_latency
+    predicted_ttft: float  # 预测的 TTFT（含排队）
+    budget: float  # contention budget = T_slo - predicted_ttft
     budget_remaining: float  # 剩余 budget
-    start_time: float  # 开始执行的墙钟时间
+    dispatch_time: float  # 开始执行的墙钟时间
     node_key: str  # 节点标识
 
     def wall_clock_remaining(self) -> float:
         """预计剩余墙钟执行时间。
-        remain(I) = start_time + exclusive_latency + (budget - budget_remaining) - now
-        简化：预计完成时间 = start_time + exclusive_latency + 已消耗 budget
+        remain(I) = dispatch_time + exclusive_latency + (budget - budget_remaining) - now
+        简化：预计完成时间 = dispatch_time + exclusive_latency + 已消耗 budget
         """
         budget_consumed = self.budget - self.budget_remaining
-        estimated_finish = self.start_time + self.exclusive_latency + budget_consumed
+        estimated_finish = self.dispatch_time + self.predicted_ttft + budget_consumed
         return max(0.0, estimated_finish - time.time())
 
 
@@ -131,16 +147,16 @@ class FlexTPGroupV2:
         self.tp_sizes: List[int] = []
         # 该组的 GPU 集合 (由节点的 gpu_ids 决定)
         self.gpu_set: frozenset = frozenset()
+        self.latency_model = LatencyModelV2()
 
         # 每个节点的在途请求数
         self.node_inflight_requests: Dict[str, int] = {}
 
-        # 队列剩余时间估计，由于受contention影响，记录exclusive等价延迟和时间基线（上一次warp），并在large_tp更新时进行warp
-        self.node_queue_remains_exclusive: Dict[str, float] = {}  # 节点上排队请求的 exclusive predicted_latency 之和
-        self.node_queue_last_warp_time: Dict[str, float] = {}  # 上一次 warp 的时间戳
+        self.node_queue_req_list: Dict[str, List[Tuple[int, int]]] = {}  # 节点上排队请求的 (req_id,seq_len) 列表（用于精确扣减 budget）
+        self.node_queue_last_finished_time: Dict[str, float] = {}  # 上一次有请求完成的时间戳
 
         # 活跃大 TP 实例列表
-        self.active_large_tp: List[ActiveLargeTPInstance] = []
+        self.active_large_tp_reqs: List[ActiveLargeTPReq] = []
 
         # 大 TP 完成事件：用于唤醒被 block 的小 TP 请求
         self.large_tp_done_event: asyncio.Event = asyncio.Event()
@@ -152,45 +168,32 @@ class FlexTPGroupV2:
     def min_tp(self) -> int:
         return self.tp_sizes[0] if self.tp_sizes else 0
 
-    def add_inflight(self, node_key: str, predicted_latency: float):
+    def add_inflight(self, node_key: str, req_id: int, seq_len: int):
         current_inflight = self.node_inflight_requests.get(node_key, 0)
         if not current_inflight:
-            # 第一个请求到达，初始化 warp 时间基线
-            self.node_queue_last_warp_time[node_key] = time.time()
+            # 第一个请求到达，初始化时间基线
+            self.node_queue_last_finished_time[node_key] = time.time()
         self.node_inflight_requests[node_key] = current_inflight + 1
-        self.node_queue_remains_exclusive[node_key] = self.node_queue_remains_exclusive.get(node_key, 0.0) + predicted_latency
+        self.node_queue_req_list[node_key] = self.node_queue_req_list.get(node_key, []) + [(req_id, seq_len)]
 
-    def remove_inflight(self, node_key: str, predicted_latency: float):
+    def remove_inflight(self, node_key: str, req_id: int):
         new_req = max(0, self.node_inflight_requests.get(node_key, 0) - 1)
         self.node_inflight_requests[node_key] = new_req
-        if new_req == 0:
-            self.node_queue_remains_exclusive[node_key] = 0.0
-        else:
-            self.node_queue_remains_exclusive[node_key] = max(0.0, self.node_queue_remains_exclusive.get(node_key, 0.0) - predicted_latency)
-        self.node_queue_last_warp_time[node_key] = time.time()
+        self.node_queue_last_finished_time[node_key] = time.time()
+        req_list = self.node_queue_req_list.get(node_key, [])
+        req_list = [r for r in req_list if r[0] != req_id]
+        self.node_queue_req_list[node_key] = req_list
 
-    def get_queue_delay(self, node_key: str) -> float:
+    def get_queue_delay(self, node_key: str, tp_size: int) -> float:
         """获取节点上排队请求的 predicted_latency 之和"""
         if self.node_inflight_requests.get(node_key, 0) == 0:
             logger.info(f"Node {node_key} queue delay: = 0s (empty)")
             return 0.0
-        t_old_remain_exclusive = self.node_queue_remains_exclusive.get(node_key, 0.0)
+        req_list = self.node_queue_req_list.get(node_key, [])
         n_contention = self.get_current_contention()
-        t_old_remain = t_old_remain_exclusive * n_contention
-        t_last_warp = self.node_queue_last_warp_time.get(node_key, 0.0)
-        t_remain = max(0.0, t_old_remain - (time.time() - t_last_warp))
-        logger.info(f"Node {node_key} queue delay: = {t_remain:.3f}s (exclusive remain={t_old_remain_exclusive:.3f}s, contention={n_contention}, t_old_remain={t_old_remain:.3f}s, last warp={time.time() - t_last_warp:.3f}s)")
-        return t_remain
-
-    def warp_all_queue_delays(self):
-        """当大 TP 状态发生变化时，更新所有节点的 queue delay 基线"""
-        for node_key in self.node_inflight_requests.keys():
-            if self.node_inflight_requests[node_key] > 0:
-                wall_clock_passed = time.time() - self.node_queue_last_warp_time.get(node_key, 0.0)
-                exclusive_reduction = wall_clock_passed / self.get_current_contention()  # 粗略估计 exclusive 已经减少的部分
-                self.node_queue_last_warp_time[node_key] = time.time()
-                self.node_queue_remains_exclusive[node_key] = max(0.0, self.node_queue_remains_exclusive.get(node_key, 0.0) - exclusive_reduction)
-                logger.info(f"Warping node {node_key} queue delay baseline at {wall_clock_passed:.3f}s since last warp, reducing exclusive remain by {exclusive_reduction:.3f}s, new exclusive remain={self.node_queue_remains_exclusive[node_key]:.3f}s")
+        t_queue = n_contention * self.latency_model.predict_queue([seq_len for _, seq_len in req_list], tp_size)
+        logger.info(f"Node {node_key} queue delay: n_contention={n_contention}, reqs={req_list}, predicted_queue_delay={t_queue:.3f}s")
+        return t_queue
 
     def get_current_contention(self, exclude_tp_size: Optional[int] = None) -> int:
         """获取 GPU 上当前活跃进程数"""
@@ -198,38 +201,35 @@ class FlexTPGroupV2:
         return sum(any(self.node_inflight_requests.get(n.client_ip_port, 0) for n in nodes)
                    for ts, nodes in self.tp_nodes.items() if ts != exclude_tp_size)
 
-    def get_min_budget_for_gpu_set(self, exclude_req_id: Optional[int] = None) -> float:
-        """获取该组 GPU 上所有活跃大 TP 实例的最低剩余 budget"""
-        if not self.active_large_tp:
-            return float("inf")
-        min_budget = float("inf")
-        for inst in self.active_large_tp:
-            if exclude_req_id is not None and inst.req_id == exclude_req_id:
-                continue
-            min_budget = min(min_budget, inst.budget_remaining)
-        return min_budget
+    # def get_min_budget_for_gpu_set(self, exclude_req_id: Optional[int] = None) -> float:
+    #     """获取该组 GPU 上所有活跃大 TP 实例的最低剩余 budget"""
+    #     if not self.active_large_tp_reqs:
+    #         return float("inf")
+    #     min_budget = float("inf")
+    #     for inst in self.active_large_tp_reqs:
+    #         if exclude_req_id is not None and inst.req_id == exclude_req_id:
+    #             continue
+    #         min_budget = min(min_budget, inst.budget_remaining)
+    #     return min_budget
 
-    def register_active_large_tp(self, instance: ActiveLargeTPInstance):
-        self.warp_all_queue_delays()
-        if instance not in self.active_large_tp:
-            self.active_large_tp.append(instance)
+    def register_active_large_tp(self, instance: ActiveLargeTPReq):
+        self.active_large_tp_reqs.append(instance)
         # 清除 event，表示有活跃大 TP
         self.large_tp_done_event.clear()
 
     def unregister_active_large_tp(self, req_id: Optional[int], node_key: str):
-        self.warp_all_queue_delays()
-        self.active_large_tp = [
-            inst for inst in self.active_large_tp
+        self.active_large_tp_reqs = [
+            inst for inst in self.active_large_tp_reqs
             if not (inst.req_id == req_id and inst.node_key == node_key)
         ]
-        if not self.active_large_tp:
+        if not self.active_large_tp_reqs:
             # 所有大 TP 完成，唤醒等待的小 TP 请求
             self.large_tp_done_event.set()
 
-    def deduct_budget(self, delta: float):
-        """从所有活跃大 TP 实例扣减 budget"""
-        for inst in self.active_large_tp:
-            inst.budget_remaining -= delta
+    # def deduct_budget(self, delta: float):
+    #     """从所有活跃大 TP 实例扣减 budget"""
+    #     for inst in self.active_large_tp_reqs:
+    #         inst.budget_remaining -= delta
 
     def __repr__(self):
         tp_details = []
@@ -241,7 +241,7 @@ class FlexTPGroupV2:
                 for n in nodes
             )
             tp_details.append(f"tp{tp}x{len(nodes)}[{node_info}]")
-        active = len(self.active_large_tp)
+        active = len(self.active_large_tp_reqs)
         return (
             f"FlexTPGroupV2(id={self.group_id}, {', '.join(tp_details)}, "
             f"active_large={active})"
@@ -263,8 +263,7 @@ class FlexTPSelectorV2(PDSelector):
     """
     SLO_IMMPOSIBLE_FALLBACK: Literal['best_effort', 'max_throughput'] = 'max_throughput'  # 当所有 TP 都无法满足 SLO 时的 fallback 策略
 
-    def __init__(self, pd_manager, slo_ttft: float = 5.0,
-                 latency_constants: Optional[Dict[int, Tuple[float, float, float, float]]] = None):
+    def __init__(self, pd_manager, slo_ttft: float = 5.0):
         super().__init__(pd_manager)
         self.slo_ttft: float = slo_ttft  # T_slo (秒)
         # group_id -> FlexTPGroupV2
@@ -278,7 +277,7 @@ class FlexTPSelectorV2(PDSelector):
         # decode 节点轮询索引
         self._decode_rr_index: int = 0
         # 延迟模型
-        self.latency_model = LatencyModelV2(latency_constants)
+        self.latency_model = LatencyModelV2()
         # 每个请求的 predicted_latency 记录，用于 remove_inflight 时准确扣减
         # req_id -> (node_key, predicted_latency, tp_size, group)
         self._req_dispatch_info: Dict[int, Tuple[str, float, int, FlexTPGroupV2]] = {}
@@ -354,9 +353,10 @@ class FlexTPSelectorV2(PDSelector):
 
     # ---- Phase 1: TP 选择 ----
 
-    def _select_tp(self, seq_len: int) -> Tuple[int, FlexTPGroupV2, PD_Client_Obj]:
+    def _select_tp(self, seq_len: int) -> Tuple[int, FlexTPGroupV2, PD_Client_Obj, float]:
         """
         从小到大遍历候选 TP 组，选满足 SLO 的最小 TP。
+        返回 (tp_size, group, node, predicted_ttft)
 
         对每种 TP：
         1. exclusive = predict_exclusive(seq_len, tp)
@@ -399,8 +399,9 @@ class FlexTPSelectorV2(PDSelector):
                 logger.info(f"FlexTP V2 SELECT_TP: Checking group nodes: {[n.client_ip_port for n in nodes]}")
 
                 # 选 queue_delay 最小的节点
-                candidate_node = min(
-                    nodes, key=lambda n: group.get_queue_delay(n.client_ip_port)
+                candidate_node, candidate_node_delay = min(
+                    ((n, group.get_queue_delay(n.client_ip_port, tp_size)) for n in nodes),
+                    key=lambda x: x[1]
                 )
                 node_key = candidate_node.client_ip_port
 
@@ -408,12 +409,11 @@ class FlexTPSelectorV2(PDSelector):
 
                 n = 1 + group.get_current_contention(exclude_tp_size=tp_size)
                 exec_time = exclusive * n
-                queue_delay = group.get_queue_delay(node_key)
-                predicted_ttft = exec_time + queue_delay
+                predicted_ttft = exec_time + candidate_node_delay
 
                 logger.info(
                     f"FlexTP V2 SELECT_TP: TP={tp_size}, node={node_key}, n={n}, exec_time={exec_time * 1000:.1f}ms, "
-                    f"queue_delay={queue_delay * 1000:.1f}ms, predicted_ttft={predicted_ttft * 1000:.1f}ms"
+                    f"queue_delay={candidate_node_delay * 1000:.1f}ms, predicted_ttft={predicted_ttft * 1000:.1f}ms"
                 )
 
                 if not minimal_tp:
@@ -442,33 +442,36 @@ class FlexTPSelectorV2(PDSelector):
             if best_tp == tp_size:
                 break
 
+            if seq_len < 1000:
+                break  # 小请求不考虑更大的 TP
+
         if best_tp is not None:
             logger.info(
-                f"FlexTP V2 TP select: tp={best_tp}, group={best_group.group_id}, "
+                f"FlexTP V2 TP select: FINAL tp={best_tp}, len={seq_len}, group={best_group.group_id}, "
                 f"node={best_node.client_ip_port}, predicted_ttft={best_ttft * 1000:.1f}ms "
                 f"(<= slo={self.slo_ttft * 1000:.1f}ms)"
             )
-            return best_tp, best_group, best_node
+            return best_tp, best_group, best_node, best_ttft
 
         # 没有满足 SLO 的 TP
         # 策略1: fallback（最小 TTFT）
         if self.SLO_IMMPOSIBLE_FALLBACK == 'best_effort':
             logger.warning(
-                f"FlexTP V2 TP select: no TP meets SLO={self.slo_ttft * 1000:.1f}ms, "
-                f"fallback tp={fallback_tp}, group={fallback_group.group_id}, "
+                f"FlexTP V2 TP select: FINAL no TP meets SLO={self.slo_ttft * 1000:.1f}ms, "
+                f"fallback tp={fallback_tp}, len={seq_len}, group={fallback_group.group_id}, "
                 f"node={fallback_node.client_ip_port}, predicted_ttft={fallback_ttft * 1000:.1f}ms"
             )
-            return fallback_tp, fallback_group, fallback_node
+            return fallback_tp, fallback_group, fallback_node, fallback_ttft
 
         # 策略2: 直接选最小 TP（不考虑 predicted_ttft），优化吞吐
         elif self.SLO_IMMPOSIBLE_FALLBACK == 'max_throughput':
             logger.warning(
-                f"FlexTP V2 TP select: no TP meets SLO={self.slo_ttft * 1000:.1f}ms, "
+                f"FlexTP V2 TP select: FINAL no TP meets SLO={self.slo_ttft * 1000:.1f}ms, "
                 f"selecting smallest tp={minimal_tp} for better throughput, "
-                f"group={minimal_group.group_id}, node={minimal_node.client_ip_port}, "
+                f"len={seq_len}, group={minimal_group.group_id}, node={minimal_node.client_ip_port}, "
                 f"predicted_ttft={minimal_ttft * 1000:.1f}ms"
             )
-            return minimal_tp, minimal_group, minimal_node
+            return minimal_tp, minimal_group, minimal_node, minimal_ttft
         else:
             raise ValueError(f"Invalid SLO_IMMPOSIBLE_FALLBACK strategy: {self.SLO_IMMPOSIBLE_FALLBACK}")
 
@@ -478,7 +481,7 @@ class FlexTPSelectorV2(PDSelector):
 
     async def _dispatch(
         self, tp_size: int, group: FlexTPGroupV2, p_node: PD_Client_Obj,
-        seq_len: int, req_id: Optional[int] = None,
+        seq_len: int, req_id: Optional[int] = None, predicted_ttft: Optional[float] = None,
     ) -> PD_Client_Obj:
         """派发请求到选定的 TP 配置。
 
@@ -488,13 +491,13 @@ class FlexTPSelectorV2(PDSelector):
         is_min_tp = (tp_size == group.min_tp)
 
         if not is_min_tp:
-            return await self._dispatch_large_tp(tp_size, group, p_node, seq_len, req_id)
+            return await self._dispatch_large_tp(tp_size, group, p_node, seq_len, req_id, predicted_ttft)
         else:
-            return await self._dispatch_small_tp(tp_size, group, p_node, seq_len, req_id)
+            return await self._dispatch_small_tp(tp_size, group, p_node, seq_len, req_id, predicted_ttft)
 
     async def _dispatch_large_tp(
         self, tp_size: int, group: FlexTPGroupV2, p_node: PD_Client_Obj,
-        seq_len: int, req_id: Optional[int] = None,
+        seq_len: int, req_id: int, predicted_ttft: float,
     ) -> PD_Client_Obj:
         """Phase 2: 大 TP 请求直接派发。
 
@@ -503,22 +506,23 @@ class FlexTPSelectorV2(PDSelector):
         3. 直接派发
         """
         exclusive = self.latency_model.predict_exclusive(seq_len, tp_size)
-        budget = self.slo_ttft - exclusive
+        budget = self.slo_ttft - predicted_ttft
 
         async with group.lock:
-            instance = ActiveLargeTPInstance(
+            instance = ActiveLargeTPReq(
                 req_id=req_id,
                 tp_size=tp_size,
                 gpu_set=group.gpu_set,
                 group_id=group.group_id,
                 exclusive_latency=exclusive,
+                predicted_ttft=predicted_ttft,
                 budget=budget,
                 budget_remaining=budget,
-                start_time=time.time(),
+                dispatch_time=time.time(),
                 node_key=p_node.client_ip_port,
             )
             group.register_active_large_tp(instance)
-            group.add_inflight(p_node.client_ip_port, exclusive)
+            group.add_inflight(p_node.client_ip_port, req_id, seq_len)
 
         # 记录 dispatch info 用于 notify_request_done
         if req_id is not None:
@@ -533,7 +537,7 @@ class FlexTPSelectorV2(PDSelector):
 
     async def _dispatch_small_tp(
         self, tp_size: int, group: FlexTPGroupV2, p_node: PD_Client_Obj,
-        seq_len: int, req_id: Optional[int] = None,
+        seq_len: int, req_id: int, predicted_ttft: float,
     ) -> PD_Client_Obj:
         """Phase 3: 小 TP 请求准入控制。
 
@@ -547,39 +551,48 @@ class FlexTPSelectorV2(PDSelector):
 
         while True:
             async with group.lock:
-                if not group.active_large_tp:
+                if not group.active_large_tp_reqs:
                     # 没有活跃大 TP，直接派发
                     # 重新选 queue_delay 最小的节点
                     nodes = group.tp_nodes.get(tp_size, [])
                     if nodes:
-                        p_node = min(nodes, key=lambda n: group.get_queue_delay(n.client_ip_port))
-                    group.add_inflight(p_node.client_ip_port, exclusive)
+                        p_node = min(nodes, key=lambda n: group.get_queue_delay(n.client_ip_port, tp_size))
+                    group.add_inflight(p_node.client_ip_port, req_id, seq_len)
                     if req_id is not None:
                         self._req_dispatch_info[req_id] = (p_node.client_ip_port, exclusive, tp_size, group)
                     logger.info(
                         f"FlexTP V2 dispatch small (no contention): req_id={req_id}, tp={tp_size}, "
-                        f"node={p_node.client_ip_port}, group={group.group_id}"
+                        f"node={p_node.client_ip_port} (re-selected), group={group.group_id}"
                     )
                     return p_node
 
+                afftected_largs_reqs: List[ActiveLargeTPReq] = []
+                afftected_largs_reqs.append(group.active_large_tp_reqs[0])  # TODO: fixme
+
                 # 有活跃大 TP，计算 delta 和 min_budget
-                min_remain = min(inst.wall_clock_remaining() for inst in group.active_large_tp)
-                delta = min(exclusive, min_remain)
-                min_budget = group.get_min_budget_for_gpu_set()
+                # min_remain = min(inst.wall_clock_remaining() for inst in group.active_large_tp_reqs)
+                # delta = min(exclusive, min_remain)
+                # min_budget = group.get_min_budget_for_gpu_set()
+
+                min_budget = min(inst.budget_remaining for inst in afftected_largs_reqs)
+                delta = exclusive  # 简化：直接用 exclusive 作为 delta
 
                 if delta <= min_budget:
                     # 准入：扣 delta
-                    group.deduct_budget(delta)
+                    # group.deduct_budget(delta)
+                    for inst in afftected_largs_reqs:
+                        inst.budget_remaining -= delta
+
                     # 重新选节点
                     nodes = group.tp_nodes.get(tp_size, [])
                     if nodes:
-                        p_node = min(nodes, key=lambda n: group.get_queue_delay(n.client_ip_port))
-                    group.add_inflight(p_node.client_ip_port, exclusive)
+                        p_node = min(nodes, key=lambda n: group.get_queue_delay(n.client_ip_port, tp_size))
+                    group.add_inflight(p_node.client_ip_port, req_id, seq_len)
                     if req_id is not None:
                         self._req_dispatch_info[req_id] = (p_node.client_ip_port, exclusive, tp_size, group)
                     logger.info(
                         f"FlexTP V2 dispatch small (admitted): req_id={req_id}, tp={tp_size}, "
-                        f"node={p_node.client_ip_port}, delta={delta * 1000:.1f}ms, "
+                        f"node={p_node.client_ip_port} (re-selected), delta={delta * 1000:.1f}ms, "
                         f"min_budget={min_budget * 1000:.1f}ms, group={group.group_id}"
                     )
                     return p_node
@@ -628,16 +641,15 @@ class FlexTPSelectorV2(PDSelector):
         )
 
         # Phase 1: TP 选择 (one-shot, 不重评估)
-        tp_size, group, p_node = self._select_tp(seq_len)
+        tp_size, group, p_node, predicted_ttft = self._select_tp(seq_len)
 
         # Phase 2/3: 派发
-        p_node = await self._dispatch(tp_size, group, p_node, seq_len, req_id)
+        p_node = await self._dispatch(tp_size, group, p_node, seq_len, req_id, predicted_ttft)
 
         return p_node, d_node
 
-    async def notify_request_done(self, p_node: PD_Client_Obj, input_token_num: int = 0,
-                                  actual_ttft: Optional[float] = None,
-                                  req_id: Optional[int] = None):
+    async def notify_request_done(self, p_node: PD_Client_Obj, input_token_num: int,
+                                  actual_ttft: float, req_id: int):
         """请求完成后调用，更新 inflight 并释放大 TP 资源"""
         if p_node is None:
             return
@@ -650,17 +662,17 @@ class FlexTPSelectorV2(PDSelector):
         tp_size = self.node_tp_size.get(node_key, 1)
 
         # 获取并清除 dispatch info
-        dispatch_info = self._req_dispatch_info.pop(req_id, None) if req_id is not None else None
+        dispatch_info = self._req_dispatch_info.pop(req_id, None)
         if dispatch_info is not None:
             node_key_d, predicted_latency, tp_size_d, group_d = dispatch_info
             # 使用 dispatch 时的信息
             async with group.lock:
-                group.remove_inflight(node_key_d, predicted_latency)
+                group.remove_inflight(node_key_d, req_id)
         else:
             # Fallback: 使用当前信息
             predicted_latency = self.latency_model.predict_exclusive(input_token_num, tp_size)
             async with group.lock:
-                group.remove_inflight(node_key, predicted_latency)
+                group.remove_inflight(node_key, req_id)
 
         is_min_tp = (tp_size == group.min_tp)
 
@@ -671,7 +683,7 @@ class FlexTPSelectorV2(PDSelector):
             logger.info(
                 f"FlexTP V2 large TP done: req_id={req_id}, tp={tp_size}, "
                 f"node={node_key}, group={group.group_id}, "
-                f"remaining_active={len(group.active_large_tp)}"
+                f"remaining_active={len(group.active_large_tp_reqs)}"
             )
         else:
             logger.info(

@@ -4,7 +4,7 @@ set -e
 ADDR=$(hostname -i)
 PORT=60011
 SLEEP_INTERVAL=60
-LOG_DIR="_/260404-70b_p22.4d4_v4.1_sche1_10k_mps_simple.1"
+LOG_DIR="_/260408-70b_p22d4_v6.1_mps_simple.1"
 
 mkdir -p "$LOG_DIR"
 

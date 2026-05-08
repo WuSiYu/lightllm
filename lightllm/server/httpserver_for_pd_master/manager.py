@@ -282,7 +282,7 @@ class HttpServerManagerForPDMaster:
             return
 
         try:
-            await asyncio.wait_for(up_status_event.wait(), timeout=60)
+            await asyncio.wait_for(up_status_event.wait(), timeout=300)
         except asyncio.TimeoutError:
             logger.warning(f"group_request_id: {group_request_id} kv move time out err, server is busy now.")
             raise ServerBusyError()
@@ -331,7 +331,7 @@ class HttpServerManagerForPDMaster:
         await p_node.websocket.send_bytes(pickle.dumps((ObjType.REQ, (prompt, sampling_params, multimodal_params))))
 
         try:
-            await asyncio.wait_for(nixl_np_up_prompt_ids_event.wait(), timeout=60)
+            await asyncio.wait_for(nixl_np_up_prompt_ids_event.wait(), timeout=300)
         except asyncio.TimeoutError:
             logger.warning(f"group_request_id: {group_request_id} wait np up prompt ids time out")
             raise ServerBusyError()
@@ -358,7 +358,7 @@ class HttpServerManagerForPDMaster:
         )
 
         try:
-            await asyncio.wait_for(up_status_event.wait(), timeout=60)
+            await asyncio.wait_for(up_status_event.wait(), timeout=300)
         except asyncio.TimeoutError:
             logger.warning(f"group_request_id: {group_request_id} kv move time out err, server is busy now.")
             raise ServerBusyError()

@@ -9,6 +9,7 @@ EXPR_NAME="70b_224_v3.1_mps"
 
 LOGDIR="_/server_log_$EXPR_NAME"
 mkdir -p $LOGDIR
+FILTER="error|exception|traceback|warning|failed|oom|cuda|regist|flex|batch size|PERF"
 
 # 检查该 session 是否已经存在
 tmux has-session -t $SESSION_NAME 2>/dev/null
@@ -33,22 +34,26 @@ if [ $? != 0 ]; then
   tmux new-session -d -s $SESSION_NAME -n master
   # 向 'master' 窗口发送命令并执行 (C-m 代表回车)
   tmux send-keys -t $SESSION_NAME:master "unset https_proxy" C-m
-  tmux send-keys -t $SESSION_NAME:master "python -m lightllm.server.api_server --model_dir /mtc/wusiyu/models/llama3-70b --max_req_total_len 65536 --run_mode 'pd_master' --host $HOST_IP --port 60011 2>&1 | tee $LOGDIR/master.log" C-m
+  tmux send-keys -t $SESSION_NAME:master "python -m lightllm.server.api_server --model_dir /mtc/wusiyu/models/llama3-70b --max_req_total_len 65536 --run_mode 'pd_master' --host $HOST_IP --port 60011 > $LOGDIR/master.log 2>&1 &" C-m
+  tmux send-keys -t $SESSION_NAME:master "tail -f $LOGDIR/master.log | grep -a --line-buffered -i -E '$FILTER'" C-m
 
   # 2. 创建 'p01' 窗口并发送命令
   tmux new-window -t $SESSION_NAME -n p01
   tmux send-keys -t $SESSION_NAME:p01 "unset https_proxy" C-m
-  tmux send-keys -t $SESSION_NAME:p01 "sleep 5; CUDA_VISIBLE_DEVICES=0,1 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8000 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --tp 2 --nccl_port 20010 --run_mode 'prefill' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP 2>&1 | tee $LOGDIR/p01.log" C-m
+  tmux send-keys -t $SESSION_NAME:p01 "sleep 5; CUDA_VISIBLE_DEVICES=0,1 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8000 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --tp 2 --nccl_port 20010 --run_mode 'prefill' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP > $LOGDIR/p01.log 2>&1 &" C-m
+  tmux send-keys -t $SESSION_NAME:p01 "tail -f $LOGDIR/p01.log | grep -a --line-buffered -i -E '$FILTER'" C-m
 
   # 3. 创建 'p23' 窗口并发送命令
   tmux new-window -t $SESSION_NAME -n p23
   tmux send-keys -t $SESSION_NAME:p23 "unset https_proxy" C-m
-  tmux send-keys -t $SESSION_NAME:p23 "sleep 40; CUDA_VISIBLE_DEVICES=2,3 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8001 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --tp 2 --nccl_port 20020 --run_mode 'prefill' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP 2>&1 | tee $LOGDIR/p23.log" C-m
+  tmux send-keys -t $SESSION_NAME:p23 "sleep 40; CUDA_VISIBLE_DEVICES=2,3 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8001 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --tp 2 --nccl_port 20020 --run_mode 'prefill' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP > $LOGDIR/p23.log 2>&1 &" C-m
+  tmux send-keys -t $SESSION_NAME:p23 "tail -f $LOGDIR/p23.log | grep -a --line-buffered -i -E '$FILTER'" C-m
 
   # 5. 创建 'd4567' 窗口并发送命令
   tmux new-window -t $SESSION_NAME -n d4567
   tmux send-keys -t $SESSION_NAME:d4567 "unset https_proxy" C-m
-  tmux send-keys -t $SESSION_NAME:d4567 "sleep 20; CUDA_VISIBLE_DEVICES=4,5,6,7 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8003 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --tp 4 --nccl_port 20040 --run_mode 'decode' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP 2>&1 | tee $LOGDIR/d4567.log" C-m
+  tmux send-keys -t $SESSION_NAME:d4567 "sleep 20; CUDA_VISIBLE_DEVICES=4,5,6,7 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port 8003 --model_dir /mtc/wusiyu/models/llama3-70b --enable_mps --max_req_total_len 65536 --mem_fraction 0.8 --tp 4 --nccl_port 20040 --run_mode 'decode' --pd_master_ip $HOST_IP --pd_master_port 60011 --host $HOST_IP > $LOGDIR/d4567.log 2>&1 &" C-m
+  tmux send-keys -t $SESSION_NAME:d4567 "tail -f $LOGDIR/d4567.log | grep -a --line-buffered -i -E '$FILTER'" C-m
 
   # 6. 创建 'client' 窗口并发送命令
   tmux new-window -t $SESSION_NAME -n client

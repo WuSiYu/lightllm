@@ -216,6 +216,9 @@ def sample_requests_from_servegen(args) -> List[Request]:
             dropped_too_long += 1
             continue
 
+        if args.servegen_mode == "deepseek-r1":
+            output_tokens = output_tokens // 20
+
         system_prompt = ""
         if args.bypass_cache:
             nonce = uuid.uuid4().hex

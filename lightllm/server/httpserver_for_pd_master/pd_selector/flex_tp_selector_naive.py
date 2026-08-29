@@ -178,10 +178,18 @@ class FlexTPNaiveSelector(PDSelector):
         """选择负载最低（在途 token 数最少）的节点"""
         return min(nodes, key=lambda n: group.node_inflight_tokens.get(n.client_ip_port, 0))
 
-    def _pick_decode_node(self) -> PD_Client_Obj:
-        """轮询方式选择 decode 节点"""
-        self._decode_rr_index = self._decode_rr_index % len(self.decode_nodes)
-        d_node = self.decode_nodes[self._decode_rr_index]
+    def _pick_decode_node(self, p_node: Optional[PD_Client_Obj] = None) -> PD_Client_Obj:
+        """选择 decode 节点：优先选择与选中的 p 节点在同一主机上的 decode 节点，
+        若无同主机 decode 节点则回退到全局轮询。"""
+        candidates = self.decode_nodes
+        if p_node is not None:
+            p_host = p_node.client_ip_port.split(":")[0]
+            same_host = [d for d in self.decode_nodes if d.client_ip_port.split(":")[0] == p_host]
+            if same_host:
+                candidates = same_host
+
+        self._decode_rr_index = self._decode_rr_index % len(candidates)
+        d_node = candidates[self._decode_rr_index]
         self._decode_rr_index += 1
         return d_node
 
@@ -200,11 +208,9 @@ class FlexTPNaiveSelector(PDSelector):
                 f"(prefill={len(self.prefill_nodes)}, decode={len(self.decode_nodes)})"
             )
 
-        d_node = self._pick_decode_node()
-
         if not self.flex_groups:
             p_node = random.choice(self.prefill_nodes)
-            return p_node, d_node
+            return p_node, self._pick_decode_node(p_node)
 
         token_num = input_token_num or 0
         use_large_tp = token_num > self.length_threshold
@@ -240,7 +246,7 @@ class FlexTPNaiveSelector(PDSelector):
 
         if best_group is None or best_node is None:
             p_node = random.choice(self.prefill_nodes)
-            return p_node, d_node
+            return p_node, self._pick_decode_node(p_node)
 
         best_group.add_inflight(best_node.client_ip_port, token_num)
         tp_type = "large" if self.node_is_large_tp.get(best_node.client_ip_port, False) else "small"
@@ -252,7 +258,7 @@ class FlexTPNaiveSelector(PDSelector):
             f"group={best_group.group_id}, inflight_tokens={best_load + token_num}"
         )
 
-        return best_node, d_node
+        return best_node, self._pick_decode_node(best_node)
 
     async def notify_request_done(self, p_node: PD_Client_Obj, input_token_num: int = 0,
                                   actual_ttft: Optional[float] = None,

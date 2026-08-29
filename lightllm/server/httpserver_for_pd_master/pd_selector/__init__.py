@@ -1,6 +1,8 @@
 from .pd_selector import PDSelector, RandomSelector, RoundRobinSelector, AdaptiveLoadSelector
 from .flex_tp_selector import FlexTPSelector
 from .flex_tp_selector_naive import FlexTPNaiveSelector
+from .flex_tp_selector_static_2node import FlexTPStatic2NodeSelector
+from .flex_tp_selector_static_plus_2node import FlexTPStaticPlus2NodeSelector
 from .flex_tp_selector_v2 import FlexTPSelectorV2
 
 
@@ -18,6 +20,17 @@ def create_selector(selector_type: str, pd_manager, **kwargs) -> PDSelector:
     elif selector_type == "flex_tp_naive":
         length_threshold = kwargs.get("flex_tp_threshold", 8000)
         return FlexTPNaiveSelector(pd_manager, length_threshold=length_threshold)
+    elif selector_type == "flex_tp_static_2node":
+        length_threshold = kwargs.get("flex_tp_threshold", 8000)
+        return FlexTPStatic2NodeSelector(pd_manager, length_threshold=length_threshold)
+    elif selector_type == "flex_tp_static_plus_2node":
+        length_threshold = kwargs.get("flex_tp_threshold", 8000)
+        overload_tokens = kwargs.get("flex_tp_overload_tokens", 20000)
+        spill_ratio = kwargs.get("flex_tp_spill_ratio", 2.0)
+        return FlexTPStaticPlus2NodeSelector(
+            pd_manager, length_threshold=length_threshold,
+            overload_tokens=overload_tokens, spill_ratio=spill_ratio,
+        )
     elif selector_type == "flex_tp_v2":
         slo_ttft = kwargs.get("flex_tp_slo_ttft", 5.0)
         return FlexTPSelectorV2(pd_manager, slo_ttft=slo_ttft)

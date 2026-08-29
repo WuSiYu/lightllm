@@ -33,7 +33,7 @@ def main():
 
     if args.host is None:
         import subprocess
-        args.host = subprocess.check_output(["hostname", "-i"]).decode().strip()
+        args.host = subprocess.check_output(["hostname", "-i"]).decode().strip().split()[0]
 
     url = f"http://{args.host}:{args.port}/generate"
     payload = {

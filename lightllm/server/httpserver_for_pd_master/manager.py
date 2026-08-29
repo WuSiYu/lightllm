@@ -624,6 +624,8 @@ class PDManager:
             self,
             flex_tp_threshold=getattr(args, "flex_tp_threshold", 8000),
             flex_tp_slo_ttft=getattr(args, "flex_tp_slo_ttft", None),
+            flex_tp_overload_tokens=getattr(args, "flex_tp_overload_tokens", 20000),
+            flex_tp_spill_ratio=getattr(args, "flex_tp_spill_ratio", 2.0),
         )
         return
 
@@ -697,9 +699,11 @@ class PDManager:
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
         from .pd_selector.flex_tp_selector import FlexTPSelector
         from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
+        from .pd_selector.flex_tp_selector_static_2node import FlexTPStatic2NodeSelector
+        from .pd_selector.flex_tp_selector_static_plus_2node import FlexTPStaticPlus2NodeSelector
         from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
 
-        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPSelectorV2)):
+        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPStatic2NodeSelector, FlexTPStaticPlus2NodeSelector, FlexTPSelectorV2)):
             return await self.selector.async_select_p_d_node(
                 prompt, sampling_params, multimodal_params,
                 input_token_num=input_token_num, arrival_time=arrival_time, req_id=req_id

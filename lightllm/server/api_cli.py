@@ -46,7 +46,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--select_p_d_node_strategy",
         type=str,
         default="round_robin",
-        choices=["random", "round_robin", "adaptive_load", "flex_tp", "flex_tp_naive", "flex_tp_v2"],
+        choices=["random", "round_robin", "adaptive_load", "flex_tp", "flex_tp_naive", "flex_tp_v2", "flex_tp_static_2node", "flex_tp_static_plus_2node"],
         help="pd master use this strategy to select p d node, can be round_robin, random, adaptive_load or flex_tp/flex_tp_naive",
     )
     parser.add_argument(
@@ -61,6 +61,20 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="flex_tp mode: SLO TTFT target in seconds. When set, overrides --flex_tp_threshold; "
              "selects the smallest TP that meets the SLO, or the lowest-TTFT TP if none meets it",
+    )
+    parser.add_argument(
+        "--flex_tp_overload_tokens",
+        type=int,
+        default=20000,
+        help="flex_tp_static_plus_2node mode: a primary-pool node is considered overloaded when its "
+             "estimated inflight tokens >= this value (precondition for spilling to the other pool)",
+    )
+    parser.add_argument(
+        "--flex_tp_spill_ratio",
+        type=float,
+        default=2.0,
+        help="flex_tp_static_plus_2node mode: spill to the other pool only if "
+             "other_node_load * spill_ratio < primary_node_load (the other pool must be clearly lighter)",
     )
     parser.add_argument(
         "--config_server_host",

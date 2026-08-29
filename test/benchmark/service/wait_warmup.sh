@@ -1,5 +1,5 @@
 #!/bin/bash
-HOST_IP=$(hostname -i)
+HOST_IP=$(hostname -i | awk '{print $1}')
 URL="http://${HOST_IP}:60011/generate"
 SUCCESS=0
 ATTEMPT=0

@@ -33,6 +33,7 @@ if torch.__version__ >= "2.1.0" and (not _disable_gpu_tensor_cache):
         inner_tensor: torch.Tensor
         shape_key: Tuple[int, torch.dtype]
         storage_weak_ptr: int
+        free_use_count_bias: int = 0
         shape_to_tensor: Dict[Union[torch.Size, Iterable[int]], torch.Tensor] = field(default_factory=dict)
 
         def __del__(self):
@@ -99,7 +100,8 @@ if torch.__version__ >= "2.1.0" and (not _disable_gpu_tensor_cache):
             # 回收可能消亡的 tensor
             for ptr in self.changed_ptr:
                 t_buf_node = self.ptr_to_bufnode[ptr]
-                if self.use_count(ptr) == 1 + len(t_buf_node.shape_to_tensor):
+                free_use_count = t_buf_node.free_use_count_bias + 1 + len(t_buf_node.shape_to_tensor)
+                if self.use_count(ptr) <= free_use_count:
                     self.free_shape_dtype_to_bufs[t_buf_node.shape_key].append(t_buf_node)
             self.changed_ptr.clear()
 
@@ -124,13 +126,14 @@ if torch.__version__ >= "2.1.0" and (not _disable_gpu_tensor_cache):
 
             buf_tensor = torch.empty((size,), dtype=data_type, device=device, requires_grad=False)
             # 用于调试显存占用的重要日志
-            # self.managed_total_tensor_bytes +=  buf_tensor.element_size() * buf_tensor.numel()
-            # logger.info(f"gpu cache managed_total_tensor_bytes: {self.managed_total_tensor_bytes}")
+            self.managed_total_tensor_bytes +=  buf_tensor.element_size() * buf_tensor.numel()
+            logger.info(f"gpu cache managed_total_tensor_bytes: {self.managed_total_tensor_bytes}")
             storage_weak_ptr = buf_tensor.untyped_storage()._weak_ref()
             buf_node = BufNode(buf_tensor, key, storage_weak_ptr)
             self.ptr_to_bufnode[storage_weak_ptr] = buf_node
             if shape not in buf_node.shape_to_tensor:
                 buf_node.shape_to_tensor[shape] = buf_node.inner_tensor.view(shape)
+            buf_node.free_use_count_bias = self.use_count(storage_weak_ptr) - (1 + len(buf_node.shape_to_tensor))
             mark_tensor = buf_node.shape_to_tensor[shape]
             ans = mark_tensor.data  # 返回一个新的引用, 否则引用计数会无法判断
             ans.storage_weak_ptr = buf_node.storage_weak_ptr

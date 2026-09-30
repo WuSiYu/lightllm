@@ -1,5 +1,8 @@
 import torch
 import time
+import json
+import os
+from pathlib import Path
 from typing import List, Optional, Callable, Dict, Any
 from queue import Queue
 from lightllm.server.router.model_infer.mode_backend.base_backend import ModeBackend
@@ -106,11 +109,22 @@ class ChunkedPrefillBackend(ModeBackend):
         prefill_reqs: List[InferReq],
     ):
         t = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+        # Optional worker-side trace for real-request MPS measurements.  This is
+        # deliberately guarded by an environment variable so normal runs keep
+        # the original execution path and overhead.
+        trace_dir = os.environ.get("LIGHTLLM_MPS_TRACE_DIR")
+        trace_start = torch.cuda.Event(enable_timing=True) if trace_dir else None
+        trace_end = torch.cuda.Event(enable_timing=True) if trace_dir else None
+        trace_start_wall = time.time() if trace_dir else None
         # 第一阶段: 模型推理
         t[0].record()
         model_input, run_reqs = prepare_prefill_inputs(prefill_reqs, is_chuncked_mode=not self.disable_chunked_prefill)
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+            if trace_start is not None:
+                trace_start.record()
             model_output = self.model.forward(model_input)
+            if trace_end is not None:
+                trace_end.record()
             _, next_token_ids_cpu, next_token_logprobs_cpu = self._sample_and_scatter_token(
                 logits=model_output.logits,
                 b_req_idx=model_input.b_req_idx,
@@ -122,6 +136,36 @@ class ChunkedPrefillBackend(ModeBackend):
             )
             sync_event = torch.cuda.Event()
             sync_event.record()
+
+        if trace_end is not None:
+            # Synchronize only in explicitly instrumented experiments, then
+            # append one JSON object per worker/batch.  The interval is exactly
+            # the model.forward call on the overlap stream, excluding queueing,
+            # request preparation, sampling, and post-processing.
+            trace_end.synchronize()
+            trace_end_wall = time.time()
+            try:
+                trace_path = Path(trace_dir)
+                trace_path.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "pid": os.getpid(),
+                    "tp": int(getattr(self.args, "tp", -1)),
+                    "worker_port": int(getattr(self.args, "port", -1)),
+                    "device": int(get_current_device_id()),
+                    "timestamp_wall": time.time(),
+                    "forward_start_wall": trace_start_wall,
+                    "forward_end_wall": trace_end_wall,
+                    "model_forward_ms": float(trace_start.elapsed_time(trace_end)),
+                    "batch_size": int(model_input.batch_size),
+                    "batch_tokens": int(model_input.total_token_num),
+                    "request_ids": [str(req.req_id) for req in run_reqs],
+                    "request_input_lens": [int(req.shm_req.input_len) for req in run_reqs],
+                    "request_cur_kv_lens": [int(req.cur_kv_len) for req in run_reqs],
+                }
+                with (trace_path / f"prefill_{os.getpid()}.jsonl").open("a") as f:
+                    f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            except Exception:
+                logger.exception("failed to write LIGHTLLM_MPS_TRACE_DIR record")
 
         # 第二阶段
         t[1].record()

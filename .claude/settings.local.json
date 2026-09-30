@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''lightllm/common/kv_cache_mem_manager/mem_manager.py'', doraise=True\\)\")",
+      "Bash(python3:*)",
+      "Bash(chmod +x /mtc/wusiyu/work/LightLLM-flex-tp/start-cluster1_70b_p22.4d4_no_nixl.sh)",
+      "Bash(chmod +x /mtc/wusiyu/work/LightLLM-flex-tp/test/benchmark/service/wait_warmup.sh)",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"from lightllm.server.httpserver_for_pd_master.pd_selector import FlexTPSelector, FlexTPSelectorChunked, create_selector; print\\(''FlexTPSelector:'', FlexTPSelector\\); print\\(''FlexTPSelectorChunked:'', FlexTPSelectorChunked\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''/mtc/wusiyu/work/LightLLM-flex-tp/lightllm/server/httpserver_for_pd_master/pd_selector/flex_tp_selector.py''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''/mtc/wusiyu/work/LightLLM-flex-tp/lightllm/server/httpserver_for_pd_master/pd_selector/__init__.py''\\).read\\(\\)\\); print\\(''init OK''\\)\")",
+      "Bash(python -m pytest test/test_flex_tp_selector.py -v)",
+      "Bash(python -m pytest test/test_flex_tp_selector.py -v --timeout=10)"
+    ]
+  }
+}

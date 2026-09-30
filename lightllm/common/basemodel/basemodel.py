@@ -915,6 +915,7 @@ class TpPartBaseModel:
                 b_prefill_start_loc=b_prefill_start_loc,
                 multimodal_params=[{"images": [], "audios": []}],
             )
+            print(f"check max_len {self.batch_max_tokens} infer start")
             model_output = self.forward(
                 model_input,
             )

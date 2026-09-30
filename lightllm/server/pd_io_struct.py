@@ -52,6 +52,15 @@ class ObjType(enum.Enum):
     TOKEN_PACKS = 3
     NIXL_UPLOAD_NP_PROMPT_IDS = 4  # nixl p 节点上报生成的 prompt ids 信息。
     NIXL_REQ_DECODE_NODE_INFO = 5  # nixl pd master 节点下发给 nixl p 节点的对应请求对应的 d 节点的信息。
+    # Normal-PD FlexTP two-level admission protocol.  These messages are kept
+    # separate from the NIXL prompt-id protocol because prompt-id readiness is
+    # not Prefill execution completion.
+    REQ_BUNDLE = 6
+    BUNDLE_ACCEPTED = 7
+    PREFILL_FAILED = 8
+    INSTANCE_REPORT = 9
+    PREFILL_FINISHED = 10
+    BUNDLE_REJECTED = 11
 
 
 @dataclass
@@ -67,6 +76,9 @@ class PD_Client_Obj:
     start_args: object  # 节点的启动参数信息，用于做匹配性的校验，防止运行过程中出现问题。
     websocket: WebSocket = None  # 用于通信的 websocket 连接对象
     run_status: _PD_Client_RunStatus = field(default_factory=_PD_Client_RunStatus)
+    # Changes on every worker websocket connection.  Master-side lifecycle
+    # messages use it to reject stale ACKs from a previous incarnation.
+    instance_generation: Optional[str] = None
 
     def __post_init__(self):
         if self.mode not in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:

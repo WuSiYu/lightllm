@@ -1,0 +1,99 @@
+#!/bin/bash
+set -u
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+HOST_IP=${HOST_IP:-$(hostname -i 2>/dev/null | awk '{print $1}')}
+HOST_IP=${HOST_IP:-127.0.0.1}
+SELECTOR=${SELECTOR:-flex_tp_v9}
+WORKER_PROFILE=${WORKER_PROFILE:-flex}
+MASTER_PORT=${MASTER_PORT:-60011}
+PREFILL_PORT_01=${PREFILL_PORT_01:-8000}
+PREFILL_PORT_23=${PREFILL_PORT_23:-8001}
+PREFILL_PORT_0123=${PREFILL_PORT_0123:-8002}
+MPS_PIPE=${MPS_PIPE:-/tmp/mps_prefill}
+MAX_REQ_TOTAL_LEN=${MAX_REQ_TOTAL_LEN:-65536}
+MAX_TOTAL_TOKEN_NUM=${MAX_TOTAL_TOKEN_NUM:-70000}
+BATCH_MAX_TOKENS=${BATCH_MAX_TOKENS:-16384}
+CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
+GRAPH_MAX_LEN_IN_BATCH=${GRAPH_MAX_LEN_IN_BATCH:-65536}
+TRACE_ENV=""
+if [[ -n "${LIGHTLLM_MPS_TRACE_DIR:-}" ]]; then
+  TRACE_ENV="LIGHTLLM_MPS_TRACE_DIR='$LIGHTLLM_MPS_TRACE_DIR'"
+fi
+FAKE_KV_FIXED_MS=${FAKE_KV_FIXED_MS:-20}
+FAKE_KV_US_PER_TOKEN=${FAKE_KV_US_PER_TOKEN:-0}
+START_MASTER=${START_MASTER:-1}
+SESSION_NAME="lightllm_fake_decode_${WORKER_PROFILE}_${SELECTOR}"
+EXPR_NAME="70b_p22.4d4_mps_prefill_fake_decode_${WORKER_PROFILE}_${SELECTOR}"
+LOGDIR="${LOGDIR:-_/server_log_${EXPR_NAME}}"
+mkdir -p "$LOGDIR"
+FILTER="error|exception|traceback|warning|failed|oom|cuda|regist|flex|bundle|batch size|PERF"
+
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! timeout 10 nvidia-smi -L >/dev/null 2>&1; then
+  echo "NVIDIA driver is unavailable; refusing to start fake-decode workers." >&2
+  exit 1
+fi
+GPU_COUNT=$(nvidia-smi -L | awk 'END { print NR }')
+if [[ "${GPU_COUNT:-0}" -lt 4 ]]; then
+  echo "fake-decode workers require 4 visible GPUs; found ${GPU_COUNT:-0}" >&2
+  exit 1
+fi
+
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "Tmux session '$SESSION_NAME' 已存在。请使用 tmux attach-session -t $SESSION_NAME 查看。"
+  exit 0
+fi
+
+: > "$LOGDIR/master.log"
+: > "$LOGDIR/p01.log"
+: > "$LOGDIR/p23.log"
+: > "$LOGDIR/p0123.log"
+
+# Only GPUs 0-3 are used. Decode is represented by the pd_master fake endpoint.
+mkdir -p "$MPS_PIPE"
+echo quit | CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" nvidia-cuda-mps-control 2>/dev/null || true
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" nvidia-cuda-mps-control -d
+
+tmux new-session -d -s "$SESSION_NAME" -n master
+tmux send-keys -t "$SESSION_NAME:master" "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY" C-m
+if [[ "$START_MASTER" == "1" ]]; then
+  tmux send-keys -t "$SESSION_NAME:master" "python -m lightllm.server.api_server --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len $MAX_REQ_TOTAL_LEN --run_mode pd_master --select_p_d_node_strategy $SELECTOR --flex_tp_threshold 4000 --flex_tp_long_threshold 4000 --flex_tp_slo_ttft 3 --flex_tp_mps_slowdown 2 --flex_tp_bundle_window_ms 20 --flex_tp_bundle_token_cap 8192 --flex_tp_bundle_token_trigger 4096 --flex_tp_max_inflight 64 --flex_tp_instance_token_credit 16384 --flex_tp_prediction_margin 0.08 --pd_fake_decode --pd_fake_decode_kv_transfer_fixed_ms $FAKE_KV_FIXED_MS --pd_fake_decode_kv_transfer_us_per_token $FAKE_KV_US_PER_TOKEN --host $HOST_IP --port $MASTER_PORT > $LOGDIR/master.log 2>&1 &" C-m
+  tmux send-keys -t "$SESSION_NAME:master" "tail -f $LOGDIR/master.log | grep -a --line-buffered -i -E '$FILTER'" C-m
+else
+  tmux send-keys -t "$SESSION_NAME:master" "echo 'worker-only mode: live benchmark suite will manage pd_master on ${HOST_IP}:$MASTER_PORT'" C-m
+fi
+
+if [[ "$WORKER_PROFILE" != "fixed_tp4" ]]; then
+  tmux new-window -t "$SESSION_NAME" -n p01
+  tmux send-keys -t "$SESSION_NAME:p01" "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY" C-m
+  tmux send-keys -t "$SESSION_NAME:p01" "sleep 5; ${TRACE_ENV} CUDA_VISIBLE_DEVICES=0,1 CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE DISABLE_GPU_TENSOR_CACHE=1 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port $PREFILL_PORT_01 --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len $MAX_REQ_TOTAL_LEN --tp 2 --max_total_token_num $MAX_TOTAL_TOKEN_NUM --batch_max_tokens $BATCH_MAX_TOKENS --chunked_prefill_size $CHUNKED_PREFILL_SIZE --graph_max_len_in_batch $GRAPH_MAX_LEN_IN_BATCH --data_type bfloat16 --disable_vision --disable_audio --disable_dynamic_prompt_cache --enable_mps --nccl_port 20010 --run_mode prefill --pd_master_ip $HOST_IP --pd_master_port $MASTER_PORT --host $HOST_IP --shared_weight master --shared_weight_master_port_start 1300 --tp_smt_group_id flex0 --tp_smt_gpu_ids 0,1 --pd_fake_decode --pd_fake_decode_kv_transfer_fixed_ms $FAKE_KV_FIXED_MS --pd_fake_decode_kv_transfer_us_per_token $FAKE_KV_US_PER_TOKEN --schedule_time_interval 0.005 > $LOGDIR/p01.log 2>&1 &" C-m
+  tmux send-keys -t "$SESSION_NAME:p01" "tail -f $LOGDIR/p01.log | grep -a --line-buffered -i -E '$FILTER'" C-m
+fi
+
+if [[ "$WORKER_PROFILE" != "fixed_tp4" ]]; then
+  tmux new-window -t "$SESSION_NAME" -n p23
+  tmux send-keys -t "$SESSION_NAME:p23" "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; until test -f $LOGDIR/p01.log && grep -a -q 'server start up ok' $LOGDIR/p01.log; do sleep 2; done; ${TRACE_ENV} CUDA_VISIBLE_DEVICES=2,3 CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE DISABLE_GPU_TENSOR_CACHE=1 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port $PREFILL_PORT_23 --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len $MAX_REQ_TOTAL_LEN --tp 2 --max_total_token_num $MAX_TOTAL_TOKEN_NUM --batch_max_tokens $BATCH_MAX_TOKENS --chunked_prefill_size $CHUNKED_PREFILL_SIZE --graph_max_len_in_batch $GRAPH_MAX_LEN_IN_BATCH --data_type bfloat16 --disable_vision --disable_audio --disable_dynamic_prompt_cache --enable_mps --nccl_port 20020 --run_mode prefill --pd_master_ip $HOST_IP --pd_master_port $MASTER_PORT --host $HOST_IP --shared_weight master --shared_weight_master_port_start 1300 --tp_smt_group_id flex0 --tp_smt_gpu_ids 2,3 --pd_fake_decode --pd_fake_decode_kv_transfer_fixed_ms $FAKE_KV_FIXED_MS --pd_fake_decode_kv_transfer_us_per_token $FAKE_KV_US_PER_TOKEN --schedule_time_interval 0.005 > $LOGDIR/p23.log 2>&1 &" C-m
+  tmux send-keys -t "$SESSION_NAME:p23" "tail -f $LOGDIR/p23.log | grep -a --line-buffered -i -E '$FILTER'" C-m
+fi
+
+if [[ "$WORKER_PROFILE" != "fixed_tp2" ]]; then
+  tmux new-window -t "$SESSION_NAME" -n p0123
+  P0123_WAIT=""
+  P0123_SHARED_WEIGHT="slave"
+  if [[ "$WORKER_PROFILE" == "flex" ]]; then
+    P0123_WAIT="until test -f $LOGDIR/p01.log && test -f $LOGDIR/p23.log && grep -a -q 'server start up ok' $LOGDIR/p01.log && grep -a -q 'server start up ok' $LOGDIR/p23.log; do sleep 2; done; "
+  elif [[ "$WORKER_PROFILE" == "fixed_tp4" ]]; then
+    P0123_SHARED_WEIGHT="master"
+  fi
+  tmux send-keys -t "$SESSION_NAME:p0123" "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; ${P0123_WAIT}${TRACE_ENV} CUDA_VISIBLE_DEVICES=0,2,1,3 CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE DISABLE_GPU_TENSOR_CACHE=1 LOADWORKER=12 LIGHTLLM_TOKEN_MAX_BYTES=16384 python -m lightllm.server.api_server --port $PREFILL_PORT_0123 --model_dir /mtc/wusiyu/models/Llama-3.3-70B-Instruct --max_req_total_len $MAX_REQ_TOTAL_LEN --tp 4 --max_total_token_num $MAX_TOTAL_TOKEN_NUM --batch_max_tokens $BATCH_MAX_TOKENS --chunked_prefill_size $CHUNKED_PREFILL_SIZE --graph_max_len_in_batch $GRAPH_MAX_LEN_IN_BATCH --data_type bfloat16 --disable_vision --disable_audio --disable_dynamic_prompt_cache --enable_mps --nccl_port 20030 --run_mode prefill --pd_master_ip $HOST_IP --pd_master_port $MASTER_PORT --host $HOST_IP --shared_weight $P0123_SHARED_WEIGHT --shared_weight_master_port_start 1300 --tp_smt_group_id flex0 --tp_smt_gpu_ids 0,1,2,3 --pd_fake_decode --pd_fake_decode_kv_transfer_fixed_ms $FAKE_KV_FIXED_MS --pd_fake_decode_kv_transfer_us_per_token $FAKE_KV_US_PER_TOKEN --schedule_time_interval 0.005 > $LOGDIR/p0123.log 2>&1 &" C-m
+  tmux send-keys -t "$SESSION_NAME:p0123" "tail -f $LOGDIR/p0123.log | grep -a --line-buffered -i -E '$FILTER'" C-m
+fi
+
+tmux new-window -t "$SESSION_NAME" -n client
+tmux send-keys -t "$SESSION_NAME:client" "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; echo 'fake decode ready: http://${HOST_IP}:$MASTER_PORT/generate; selector=$SELECTOR; GPUs=0,1,2,3'" C-m
+tmux select-window -t "$SESSION_NAME:master"
+echo "tmux attach-session -t $SESSION_NAME"
+if [[ "${NO_ATTACH:-0}" == "1" ]]; then
+  exit 0
+fi
+tmux attach-session -t "$SESSION_NAME"

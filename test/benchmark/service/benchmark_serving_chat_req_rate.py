@@ -69,6 +69,7 @@ _mid_end_times = []
 _mid_end_rates = []
 FAILED_REQUESTS = 0
 MAX_REQ_TOTAL_TOKENS = 65000
+REQUEST_TIMEOUT_S = 180.0
 
 # Predefined simple mixed uniform distributions for --dataset-type simple.X
 # Each entry is a list of components: {weight, input_range (min,max), output_range (min,max)}
@@ -111,6 +112,16 @@ SIMPLE_DATASETS = {
         {"weight": 0.80, "input_range": (100, 1000),   "output_range": (50, 200)},
         {"weight": 0.20, "input_range": (1000, 20000), "output_range": (50, 200)},
     ],
+    "mst-all": [  # mps slowdown test
+        {"weight": 0.95, "input_range": (512, 512),   "output_range": (10, 10)},
+        {"weight": 0.01, "input_range": (8192, 8192),   "output_range": (10, 10)}
+    ],
+    "mst-l": [  # mps slowdown test
+        {"weight": 1, "input_range": (8192, 8192),   "output_range": (10, 10)}
+    ],
+    "mst-s": [  # mps slowdown test
+        {"weight": 1, "input_range": (512, 512),   "output_range": (10, 10)},
+    ]
 }
 
 def get_tokenizer(
@@ -174,14 +185,14 @@ def sample_requests_from_servegen(args) -> List[Request]:
     if args.request_rate == float("inf") or args.request_rate <= 0:
         raise ValueError("For --dataset-type servegen, --request-rate must be a finite positive number.")
 
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    servegen_root = os.path.join(repo_root, "_", "ServeGen")
     try:
         from servegen import Category
         from servegen.clientpool import ClientPool
         from servegen.construct import generate_workload
         from servegen.utils import get_constant_rate_fn
     except ImportError:
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-        servegen_root = os.path.join(repo_root, "_", "ServeGen")
         if servegen_root not in sys.path:
             sys.path.insert(0, servegen_root)
         from servegen import Category
@@ -197,9 +208,17 @@ def sample_requests_from_servegen(args) -> List[Request]:
     else:
         category_name = Category.LANGUAGE
 
-    pool = ClientPool(category_name, args.servegen_mode)
-    rate_fn = get_constant_rate_fn(pool.span(0, duration), args.request_rate)
-    sg_requests = generate_workload(pool, rate_fn, duration=duration, seed=args.seed)
+    # ServeGen resolves its data directory relative to the package checkout.
+    # Benchmark scripts are normally launched from this directory, so make
+    # the lookup independent of the caller's current working directory.
+    caller_cwd = os.getcwd()
+    os.chdir(servegen_root)
+    try:
+        pool = ClientPool(category_name, args.servegen_mode)
+        rate_fn = get_constant_rate_fn(pool.span(0, duration), args.request_rate)
+        sg_requests = generate_workload(pool, rate_fn, duration=duration, seed=args.seed)
+    finally:
+        os.chdir(caller_cwd)
 
     sampled_requests: List[Request] = []
     dropped_too_long = 0
@@ -212,12 +231,15 @@ def sample_requests_from_servegen(args) -> List[Request]:
         else:
             input_tokens = max(4, int(req.data.get("input_tokens", 16)))
         output_tokens = max(4, int(req.data.get("output_tokens", 16)))
+        configured_divisor = getattr(args, "servegen_output_divisor", None)
+        output_divisor = max(
+            1,
+            int(configured_divisor) if configured_divisor is not None else (20 if args.servegen_mode == "deepseek-r1" else 1),
+        )
+        output_tokens = max(4, output_tokens // output_divisor)
         if input_tokens + output_tokens > MAX_REQ_TOTAL_TOKENS:
             dropped_too_long += 1
             continue
-
-        if args.servegen_mode == "deepseek-r1":
-            output_tokens = output_tokens // 20
 
         system_prompt = ""
         if args.bypass_cache:
@@ -293,7 +315,9 @@ def sample_requests_mooncake(args) -> List[Request]:
     sampled_entries = random.sample(all_entries, args.num_prompts)
 
     sampled_requests: List[Request] = []
+    output_divisor = max(1, int(getattr(args, "mooncake_output_divisor", 1)))
     for input_len, output_len in sampled_entries:
+        output_len = max(4, output_len // output_divisor)
         system_prompt = ""
         if args.bypass_cache:
             nonce = uuid.uuid4().hex
@@ -357,8 +381,8 @@ def sample_requests_simple(args) -> List[Request]:
         print(f"  component {idx}: weight={c['weight']}, input=[{c['input_range'][0]},{c['input_range'][1]}], output=[{c['output_range'][0]},{c['output_range'][1]}]")
     p_lens = [r.prompt_len for r in sampled_requests]
     o_lens = [r.dataset_output_len for r in sampled_requests]
-    print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p95={np.percentile(p_lens,95):.1f}, p99={np.percentile(p_lens,99):.1f}")
-    print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p95={np.percentile(o_lens,95):.1f}, p99={np.percentile(o_lens,99):.1f}")
+    print(f"  input  avg={np.mean(p_lens):.1f}, p50={np.percentile(p_lens,50):.1f}, p90={np.percentile(p_lens,90):.1f}, p95={np.percentile(p_lens,95):.1f}, p96={np.percentile(p_lens,96):.1f}, p97={np.percentile(p_lens,97):.1f}, p98={np.percentile(p_lens,98):.1f}, p99={np.percentile(p_lens,99):.1f}")
+    print(f"  output avg={np.mean(o_lens):.1f}, p50={np.percentile(o_lens,50):.1f}, p90={np.percentile(o_lens,90):.1f}, p95={np.percentile(o_lens,95):.1f}, p96={np.percentile(o_lens,96):.1f}, p97={np.percentile(o_lens,97):.1f}, p98={np.percentile(o_lens,98):.1f}, p99={np.percentile(o_lens,99):.1f}")
     return sampled_requests
 
 
@@ -562,29 +586,57 @@ async def _send_request_lightllm(
     )
 
     request_start_time = time.time()
-    timeout = aiohttp.ClientTimeout(total=24 * 3600, connect=24 * 3600)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S, connect=REQUEST_TIMEOUT_S)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            while True:
-                last_time = request_start_time
-                async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"bad http status: {response.status}")
+            last_time = request_start_time
+            chunks = []
+            latencies = []
+            line_buf = ""
+            async with session.post(url, headers=headers, json=req_json, timeout=timeout) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"bad http status: {response.status}")
 
-                    chunks = []
-                    latencies = []
-
-                    async for chunk, _ in response.content.iter_chunks():
+                async for raw_bytes, _ in response.content.iter_chunks():
+                    line_buf += raw_bytes.decode("utf-8", errors="replace")
+                    while "\n" in line_buf:
+                        line, line_buf = line_buf.split("\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[len("data:"):].strip()
+                        if not payload or payload == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError:
+                            # A partial frame remains buffered by the next chunk.
+                            continue
+                        token = event.get("token", {})
+                        if not isinstance(token, dict) or "text" not in token:
+                            continue
                         time_now = time.time()
-                        chunks.append(chunk)
+                        chunks.append(token["text"])
                         latencies.append(time_now - last_time)
                         last_time = time_now
 
-                output_len = len(chunks)
-                chunks = [json.loads(s.strip()[len('data:'):].strip()) for s in chunks]
+                if line_buf.strip().startswith("data:"):
+                    payload = line_buf.strip()[len("data:"):].strip()
+                    if payload and payload != "[DONE]":
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError:
+                            event = None
+                        token = event.get("token", {}) if isinstance(event, dict) else {}
+                        if isinstance(token, dict) and "text" in token:
+                            time_now = time.time()
+                            chunks.append(token["text"])
+                            latencies.append(time_now - last_time)
 
-                output_str = ''.join(c['token']['text'] for c in chunks)
-                break
+            if not chunks:
+                raise RuntimeError("empty LightLLM SSE stream")
+            output_len = len(chunks)
+            output_str = "".join(chunks)
     except Exception as e:
         FAILED_REQUESTS += 1
         print(f"request failed: req_id={i}, prompt_len={prompt_len}, dataset_output_len={dataset_output_len}, err={repr(e)}")
@@ -630,7 +682,7 @@ async def _send_request_vllm(
     )
 
     request_start_time = time.time()
-    timeout = aiohttp.ClientTimeout(total=24 * 3600, connect=24 * 3600)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S, connect=REQUEST_TIMEOUT_S)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             last_time = request_start_time
@@ -722,7 +774,7 @@ async def benchmark(
 
 
 def main(args: argparse.Namespace):
-    global RESULTS, FAILED_REQUESTS
+    global RESULTS, FAILED_REQUESTS, REQUEST_TIMEOUT_S
     print(args)
     FAILED_REQUESTS = 0
 
@@ -824,7 +876,7 @@ def main(args: argparse.Namespace):
 
     if len(RESULTS) == 0:
         print("No successful requests, skip latency/throughput statistics.")
-        return
+        return 1
 
     print()
     print(f"Number of prompt_tokens: {prompt_tokens} (avg {prompt_tokens / len(RESULTS)} tokens/req)")
@@ -848,15 +900,18 @@ def main(args: argparse.Namespace):
     print(f"    p50: {np.percentile(all_first_token_latency, 50)*1000:.2f} ms, p90: {np.percentile(all_first_token_latency, 90)*1000:.2f} ms, p95: {np.percentile(all_first_token_latency, 95)*1000:.2f} ms, p99: {np.percentile(all_first_token_latency, 99)*1000:.2f} ms, max: {np.max(all_first_token_latency)*1000:.2f} ms")
 
 
-    all_per_token_latencies = np.concatenate([x.token_latencys[1:] for x in RESULTS])
-    avg_per_token_latency = np.mean(all_per_token_latencies)
-    print(f"Average per-token latency (decode): {avg_per_token_latency*1000:.2f} ms", "(old)")
-    print(f"    p50: {np.percentile(all_per_token_latencies, 50)*1000:.2f} ms, p90: {np.percentile(all_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_per_token_latencies)*1000:.2f} ms")
-
-    all_reqmax_per_token_latencies = np.array([max(x.token_latencys[1:]) for x in RESULTS])
-    avg_reqmax_per_token_latency = np.mean(all_reqmax_per_token_latencies)
-    print(f"Average req-max per-token latency (decode): {avg_reqmax_per_token_latency*1000:.2f} ms")
-    print(f"    p50: {np.percentile(all_reqmax_per_token_latencies, 50)*1000:.2f} ms, p75: {np.percentile(all_reqmax_per_token_latencies, 75)*1000:.2f} ms, p90: {np.percentile(all_reqmax_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_reqmax_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_reqmax_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_reqmax_per_token_latencies)*1000:.2f} ms")
+    decode_latency_slices = [x.token_latencys[1:] for x in RESULTS if len(x.token_latencys) > 1]
+    if decode_latency_slices:
+        all_per_token_latencies = np.concatenate(decode_latency_slices)
+        avg_per_token_latency = np.mean(all_per_token_latencies)
+        print(f"Average per-token latency (decode): {avg_per_token_latency*1000:.2f} ms", "(old)")
+        print(f"    p50: {np.percentile(all_per_token_latencies, 50)*1000:.2f} ms, p90: {np.percentile(all_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_per_token_latencies)*1000:.2f} ms")
+        all_reqmax_per_token_latencies = np.array([max(x.token_latencys[1:]) for x in RESULTS if len(x.token_latencys) > 1])
+        avg_reqmax_per_token_latency = np.mean(all_reqmax_per_token_latencies)
+        print(f"Average req-max per-token latency (decode): {avg_reqmax_per_token_latency*1000:.2f} ms")
+        print(f"    p50: {np.percentile(all_reqmax_per_token_latencies, 50)*1000:.2f} ms, p75: {np.percentile(all_reqmax_per_token_latencies, 75)*1000:.2f} ms, p90: {np.percentile(all_reqmax_per_token_latencies, 90)*1000:.2f} ms, p95: {np.percentile(all_reqmax_per_token_latencies, 95)*1000:.2f} ms, p99: {np.percentile(all_reqmax_per_token_latencies, 99)*1000:.2f} ms, max: {np.max(all_reqmax_per_token_latencies)*1000:.2f} ms")
+    else:
+        print("Decode per-token latency: unavailable (all successful requests returned one token)")
     # req_avg_per_token_latencies = [np.mean(x.token_latencys[1:]) for x in RESULTS]
     # avg_req_avg_per_token_latency = np.mean(req_avg_per_token_latencies)
     # print(f"Average of request's average per-token latency (decode): {avg_req_avg_per_token_latency*1000:.2f} ms")
@@ -881,6 +936,9 @@ if __name__ == "__main__":
                         ))
     parser.add_argument("--servegen-mode", default="m-large", help="ServeGen mode, only work when --dataset-type=servegen, see ServeGen repo for details.")
     parser.add_argument("--servegen-duration", type=int, default=300, help="ServeGen duration, only work when --dataset-type=servegen, see ServeGen repo for details.")
+    parser.add_argument("--servegen-output-divisor", type=int, default=None, help="divide ServeGen output lengths before sending requests (default: deepseek-r1 /20, other modes unchanged; use 10 for decode-limited experiments)")
+    parser.add_argument("--mooncake-output-divisor", type=int, default=1, help="divide Mooncake JSONL output lengths before sending requests (default: 1; use 10 for decode-limited experiments)")
+    parser.add_argument("--request-timeout-s", type=float, default=180.0, help="per-request HTTP timeout; timed-out requests are recorded as failures")
     parser.add_argument("--addr", type=str, default="127.0.0.1",
                         help="server addr.")
     parser.add_argument("--port", type=str, default="8000",
@@ -916,6 +974,13 @@ if __name__ == "__main__":
     if args.request_rate == 0:
         print("treat --request-rate 0 as inf")
         args.request_rate = float("inf")
+    if args.servegen_output_divisor is not None and args.servegen_output_divisor < 1:
+        raise ValueError("--servegen-output-divisor must be >= 1")
+    if args.mooncake_output_divisor < 1:
+        raise ValueError("--mooncake-output-divisor must be >= 1")
+    if not np.isfinite(args.request_timeout_s) or args.request_timeout_s <= 0:
+        raise ValueError("--request-timeout-s must be a positive finite number")
+    REQUEST_TIMEOUT_S = args.request_timeout_s
     if args.record_output_length:
         assert args.mode == 'unknown_output_len', "see help"
     if args.use_output_length_record:
@@ -997,4 +1062,4 @@ if __name__ == "__main__":
             raise ValueError("--vllm-model-name is required when --backend=vllm")
         VLLM_MODEL_NAME = args.vllm_model_name
     print(f"Backend: {BACKEND}" + (f" (model={VLLM_MODEL_NAME})" if BACKEND == 'vllm' else ''))
-    main(args)
+    raise SystemExit(main(args) or 0)

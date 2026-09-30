@@ -22,6 +22,7 @@ from lightllm.server.httpserver.manager import AsyncQueue
 from lightllm.utils.error_utils import ServerBusyError
 from lightllm.utils.envs_utils import get_pd_split_max_new_tokens
 from .pd_selector import create_selector
+from .pd_bundle import PrefillBundleDispatchCancelled, PrefillBundleDispatcher
 
 logger = init_logger(__name__)
 
@@ -53,7 +54,18 @@ class HttpServerManagerForPDMaster:
         return
 
     async def remove_pd(self, pd_info_json):
-        self.pd_manager.remove_pd(pd_info_json)
+        removed = self.pd_manager.remove_pd(pd_info_json)
+        if not removed:
+            return
+        node_key = pd_info_json.get("client_ip_port")
+        for req_status in list(self.req_id_to_out_inf.values()):
+            if (
+                getattr(req_status.p_node, "client_ip_port", None) == node_key
+                or getattr(req_status.d_node, "client_ip_port", None) == node_key
+            ):
+                req_status.error = f"PD worker {node_key} disconnected"
+                req_status.event.set()
+                req_status.up_status_event.set()
         return
 
     async def update_req_status(self, upkv_status: Union[UpKVStatus, NixlUpKVStatus]):
@@ -124,11 +136,21 @@ class HttpServerManagerForPDMaster:
         origin_sampling_params = SamplingParams.from_buffer_copy(sampling_params)
         origin_group_request_id = self.id_gen.generate_id()
         max_new_tokens_list = self._split_max_new_tokens(max_new_tokens=origin_sampling_params.max_new_tokens)
+        if getattr(self.args, "pd_fake_decode", False):
+            # The experiment intentionally runs one Prefill per HTTP request;
+            # do not re-admit continuation blocks after the first token.
+            max_new_tokens_list = [max(1, int(origin_sampling_params.max_new_tokens))]
         block_group_request_id = None
         p_node = None
         d_node = None
         # flex TP (drain 模式): 每个请求独立的上下文，避免并发覆盖
-        flex_tp_ctx = {"notified": False, "input_token_num": input_token_num or 0, "arrival_time": start_time, "req_id": origin_group_request_id}
+        flex_tp_ctx = {
+            "notified": False,
+            "bundle_sent": False,
+            "input_token_num": input_token_num or 0,
+            "arrival_time": start_time,
+            "req_id": None,
+        }
         try:
             # 记录请求到达的相关信息
             await self._log_req_header(request, origin_group_request_id)
@@ -138,11 +160,13 @@ class HttpServerManagerForPDMaster:
                 "lightllm_request_max_new_tokens", origin_sampling_params.max_new_tokens
             )
 
+            first_block_group_request_id = self.id_gen.generate_id()
             p_node, d_node = await self.select_p_d_node(
                 prompt, origin_sampling_params, multimodal_params,
                 input_token_num=input_token_num, arrival_time=start_time,
-                req_id=origin_group_request_id
+                req_id=first_block_group_request_id,
             )
+            flex_tp_ctx["req_id"] = first_block_group_request_id
 
             history_gen_token_strs = []
 
@@ -151,8 +175,43 @@ class HttpServerManagerForPDMaster:
                 raise Exception(f"{origin_group_request_id}: No p_node or d_node found")
 
             for iter_index, block_max_new_tokens in enumerate(max_new_tokens_list):
+                block_group_request_id = (
+                    first_block_group_request_id
+                    if iter_index == 0
+                    else self.id_gen.generate_id()
+                )
+                if iter_index > 0 and getattr(getattr(self.pd_manager, "selector", None), "supports_bundles", False):
+                    # Every continuation runs another Prefill over the prompt
+                    # plus the generated history. Re-admit that work as a
+                    # fresh bounded lease instead of leaving it invisible to
+                    # FlexTP while the previous block is decoded.
+                    continuation_prompt = prompt + "".join(history_gen_token_strs)
+                    # ``metadata["prompt_tokens"]`` is the token count for
+                    # the previous worker invocation and does not include the
+                    # history appended here. Re-encode the complete
+                    # continuation so admission does not under-reserve later
+                    # Prefill blocks. This also preserves multimodal token
+                    # accounting through the existing ``tokens`` helper.
+                    continuation_input_tokens = self.tokens(
+                        continuation_prompt, multimodal_params, origin_sampling_params
+                    )
+                    continuation_input_tokens = max(1, int(continuation_input_tokens))
+                    p_node, d_node = await self.select_p_d_node(
+                        continuation_prompt,
+                        origin_sampling_params,
+                        multimodal_params,
+                        input_token_num=continuation_input_tokens,
+                        arrival_time=time.time(),
+                        req_id=block_group_request_id,
+                    )
+                    flex_tp_ctx = {
+                        "notified": False,
+                        "bundle_sent": False,
+                        "input_token_num": continuation_input_tokens,
+                        "arrival_time": time.time(),
+                        "req_id": block_group_request_id,
+                    }
                 sampling_params = SamplingParams.from_buffer_copy(origin_sampling_params)
-                block_group_request_id = self.id_gen.generate_id()
                 sampling_params.group_request_id = block_group_request_id
                 logger.info(f"pd log gen sub req id {block_group_request_id} for main req id {origin_group_request_id}")
                 sampling_params.max_new_tokens = block_max_new_tokens
@@ -183,10 +242,19 @@ class HttpServerManagerForPDMaster:
 
         except BaseException as e:
             logger.error(f"has exception {str(e)}")
-            # flex TP (drain 模式): 如果 prefill 通知还未发出，安全兜底释放
-            if not flex_tp_ctx["notified"]:
-                await self.pd_manager.notify_flex_tp_request_done(
-                    p_node, flex_tp_ctx["input_token_num"], req_id=flex_tp_ctx.get("req_id")
+            # A bundle that reached the worker may still be queued/running in
+            # its Router.  Do not release that credit merely because the HTTP
+            # caller disappeared; wait for worker completion/failure (or the
+            # generation-aware node-removal cleanup).  Before send succeeds,
+            # there is no executor-side work and master can release safely.
+            uses_bundle_lifecycle = getattr(
+                getattr(self.pd_manager, "selector", None), "supports_bundles", False
+            )
+            if not flex_tp_ctx["notified"] and (
+                not uses_bundle_lifecycle or not flex_tp_ctx.get("bundle_sent", False)
+            ):
+                await self.pd_manager.notify_flex_tp_request_failed(
+                    p_node, flex_tp_ctx["input_token_num"], req_id=flex_tp_ctx.get("req_id"), reason=str(e)
                 )
                 flex_tp_ctx["notified"] = True
             try:
@@ -231,8 +299,9 @@ class HttpServerManagerForPDMaster:
 
         up_status_event = req_status.up_status_event
 
+        fake_decode = bool(getattr(self.args, "pd_fake_decode", False))
         d_start_args = d_node.start_args
-        decode_node_dict = {
+        decode_node_dict = None if fake_decode else {
             "node_id": d_start_args["pd_node_id"],
             "ip": d_start_args["host"],
             "rpyc_port": d_start_args["pd_decode_rpyc_port"],
@@ -246,17 +315,42 @@ class HttpServerManagerForPDMaster:
         sampling_params.move_kv_to_decode_node.initialize(decode_node_dict if old_max_new_tokens != 1 else None)
         sampling_params.suggested_dp_index = -1
 
-        await p_node.websocket.send_bytes(pickle.dumps((ObjType.REQ, (prompt, sampling_params, multimodal_params))))
+        use_bundle = flex_tp_ctx is not None and not flex_tp_ctx.get("bundle_sent", False)
+        if use_bundle:
+            try:
+                await self.pd_manager.send_prefill_request(
+                    p_node,
+                    group_request_id,
+                    prompt,
+                    sampling_params,
+                    multimodal_params,
+                    input_token_num=flex_tp_ctx.get("input_token_num", 0),
+                    lease_request_id=flex_tp_ctx.get("req_id"),
+                )
+            except PrefillBundleDispatchCancelled as exc:
+                # Preserve normal cancellation behavior while recording that
+                # the worker may still receive the bundle. The outer handler
+                # must wait for worker terminal lifecycle in that case.
+                if exc.sent:
+                    flex_tp_ctx["bundle_sent"] = True
+                raise asyncio.CancelledError() from None
+            flex_tp_ctx["bundle_sent"] = True
+        else:
+            await p_node.websocket.send_bytes(pickle.dumps((ObjType.REQ, (prompt, sampling_params, multimodal_params))))
 
         while True:
             await req_status.wait_to_ready()
+            if req_status.error is not None:
+                raise RuntimeError(req_status.error)
             if await request.is_disconnected():
                 raise Exception(f"req_id {group_request_id} disconnected")
 
             if await req_status.can_read(self.req_id_to_out_inf):
                 token_list = await req_status.pop_all_tokens()
                 for sub_req_id, request_output, metadata, finish_status in token_list:
-                    if old_max_new_tokens != 1:
+                    if fake_decode:
+                        finish_status = FinishStatus(FinishStatus.FINISHED_LENGTH)
+                    elif old_max_new_tokens != 1:
                         finish_status = FinishStatus(FinishStatus.NO_FINISH)
                     else:
                         finish_status = FinishStatus(FinishStatus.FINISHED_LENGTH)
@@ -267,15 +361,38 @@ class HttpServerManagerForPDMaster:
                     yield sub_req_id, request_output, metadata, finish_status
                 break
 
-        # prefill 计算已完成（第一个 token 已返回），通知 flex TP 调度器释放 GPU（仅 drain 模式）
-        if flex_tp_ctx is not None and not flex_tp_ctx["notified"]:
+        # prefill 计算已完成（第一个 token 已返回）。优先使用 worker 的
+        # PREFILL_FINISHED 事件；控制消息丢失时保留首 token 兜底。
+        uses_bundle_lifecycle = getattr(
+            getattr(self.pd_manager, "selector", None), "supports_bundles", False
+        )
+        if (
+            flex_tp_ctx is not None
+            and not flex_tp_ctx["notified"]
+            and (not uses_bundle_lifecycle or not flex_tp_ctx.get("bundle_sent", False))
+        ):
             _arrival = flex_tp_ctx.get("arrival_time")
             _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
-            await self.pd_manager.notify_flex_tp_request_done(
-                p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
-                req_id=flex_tp_ctx.get("req_id")
-            )
+            if not req_status.prefill_finished:
+                await self.pd_manager.notify_flex_tp_request_done(
+                    p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
+                    req_id=flex_tp_ctx.get("req_id")
+                )
             flex_tp_ctx["notified"] = True
+
+        # Fake Decode 是仅 Prefill 实验：首 token 证明 worker 已完成，master
+        # 等待一个可配置的虚拟 KV transfer 延迟后关闭请求，不联系 Decode worker。
+        if fake_decode:
+            transfer_s = (
+                max(0.0, float(getattr(self.args, "pd_fake_decode_kv_transfer_fixed_ms", 20.0)))
+                / 1000.0
+                + max(0.0, float(getattr(self.args, "pd_fake_decode_kv_transfer_us_per_token", 0.0)))
+                / 1_000_000.0
+                * max(0, int(flex_tp_ctx.get("input_token_num", 0) if flex_tp_ctx else 0))
+            )
+            if transfer_s > 0:
+                await asyncio.sleep(transfer_s)
+            return
 
         # 如果只需要一个输出 token，prefill 完就直接结束掉吧
         if old_max_new_tokens == 1:
@@ -286,6 +403,9 @@ class HttpServerManagerForPDMaster:
         except asyncio.TimeoutError:
             logger.warning(f"group_request_id: {group_request_id} kv move time out err, server is busy now.")
             raise ServerBusyError()
+
+        if req_status.error is not None:
+            raise RuntimeError(req_status.error)
 
         sampling_params.move_kv_to_decode_node.initialize(None)
         sampling_params.max_new_tokens = old_max_new_tokens - 1
@@ -298,6 +418,8 @@ class HttpServerManagerForPDMaster:
 
         while True:
             await req_status.wait_to_ready()
+            if req_status.error is not None:
+                raise RuntimeError(req_status.error)
             if await request.is_disconnected():
                 raise Exception(f"req_id {group_request_id} disconnected")
             if await req_status.can_read(self.req_id_to_out_inf):
@@ -444,12 +566,23 @@ class HttpServerManagerForPDMaster:
         # fetch_stream 生成器可能因 break 被提前关闭（如 max_new_tokens=1），
         # 导致其内部的 notify_flex_tp_request_done 未执行，这里兜底补发
         if flex_tp_ctx is not None and not flex_tp_ctx["notified"]:
-            _arrival = flex_tp_ctx.get("arrival_time")
-            _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
-            await self.pd_manager.notify_flex_tp_request_done(
-                p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
-                req_id=flex_tp_ctx.get("req_id")
+            req_status = self.req_id_to_out_inf.get(group_request_id)
+            uses_bundle_lifecycle = getattr(
+                getattr(self.pd_manager, "selector", None), "supports_bundles", False
             )
+            # For a bounded bundle, PREFILL_FINISHED/FAILED is the only normal
+            # release authority. The first TOKEN_PACKS may win the race with
+            # that control message when the caller closes after one token.
+            if (
+                (req_status is None or not req_status.prefill_finished)
+                and (not uses_bundle_lifecycle or not flex_tp_ctx.get("bundle_sent", False))
+            ):
+                _arrival = flex_tp_ctx.get("arrival_time")
+                _actual_ttft = (time.time() - _arrival) if _arrival is not None else None
+                await self.pd_manager.notify_flex_tp_request_done(
+                    p_node, flex_tp_ctx["input_token_num"], actual_ttft=_actual_ttft,
+                    req_id=flex_tp_ctx.get("req_id")
+                )
             flex_tp_ctx["notified"] = True
 
         total_cost_time_ms = (time.time() - start_time) * 1000
@@ -542,6 +675,15 @@ class HttpServerManagerForPDMaster:
                 for obj in objs:
                     if obj[0] == ObjType.TOKEN_PACKS:
                         token_list, node_load_info = obj[1], obj[2]
+                        if len(obj) >= 5:
+                            _, _, _, node_key, instance_generation = obj[:5]
+                            p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                            if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                                logger.warning(
+                                    "ignore stale TOKEN_PACKS node=%s generation=%s",
+                                    node_key, instance_generation,
+                                )
+                                continue
                         self.pd_manager.update_node_load_info(node_load_info)
 
                         for sub_req_id, text, metadata, finish_status in token_list:
@@ -565,6 +707,88 @@ class HttpServerManagerForPDMaster:
                             logger.error(
                                 f"NIXL_UPLOAD_NP_PROMPT_IDS fail find req status for group_req_id: {group_req_id}"
                             )
+                    elif obj[0] == ObjType.BUNDLE_ACCEPTED:
+                        if len(obj) == 4:
+                            _, node_key, bundle_id, req_ids = obj
+                            instance_generation = None
+                        else:
+                            _, node_key, instance_generation, bundle_id, req_ids = obj
+                        p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                        if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                            continue
+                        await self.pd_manager.notify_flex_tp_bundle_accepted(p_node, bundle_id, req_ids)
+                    elif obj[0] == ObjType.PREFILL_FAILED:
+                        if len(obj) == 5:
+                            _, node_key, group_req_id, lease_req_id, reason = obj
+                            instance_generation = None
+                        else:
+                            _, node_key, instance_generation, group_req_id, lease_req_id, reason = obj
+                        p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                        if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                            continue
+                        await self.pd_manager.notify_flex_tp_request_failed(
+                            p_node, req_id=lease_req_id, reason=reason
+                        )
+                        req_status = self.req_id_to_out_inf.get(group_req_id)
+                        if req_status is not None:
+                            req_status.error = f"Prefill failed for request {group_req_id}: {reason}"
+                            req_status.event.set()
+                        else:
+                            logger.error(f"PREFILL_FAILED fail find req status for group_req_id: {group_req_id}")
+                    elif obj[0] == ObjType.PREFILL_FINISHED:
+                        if len(obj) == 5:
+                            _, node_key, group_req_id, lease_req_id, detail = obj
+                            instance_generation = None
+                        else:
+                            _, node_key, instance_generation, group_req_id, lease_req_id, detail = obj
+                        p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                        if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                            continue
+                        detail_dict = detail if isinstance(detail, dict) else {}
+                        await self.pd_manager.notify_flex_tp_request_done(
+                            p_node,
+                            input_token_num=int(detail_dict.get("input_token_num", 0)),
+                            actual_ttft=detail_dict.get("actual_ttft"),
+                            req_id=lease_req_id,
+                        )
+                        req_status = self.req_id_to_out_inf.get(group_req_id)
+                        if req_status is not None:
+                            req_status.prefill_finished = True
+                            req_status.event.set()
+                    elif obj[0] == ObjType.BUNDLE_REJECTED:
+                        if len(obj) == 5:
+                            _, node_key, bundle_id, rejected_items, reason = obj
+                            instance_generation = None
+                        else:
+                            _, node_key, instance_generation, bundle_id, rejected_items, reason = obj
+                        p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                        if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                            continue
+                        for group_req_id, lease_req_id in rejected_items:
+                            await self.pd_manager.notify_flex_tp_request_failed(
+                                p_node, req_id=lease_req_id, reason=reason
+                            )
+                            req_status = self.req_id_to_out_inf.get(group_req_id)
+                            if req_status is not None:
+                                req_status.error = (
+                                    f"Prefill bundle {bundle_id} rejected request {group_req_id}: {reason}"
+                                )
+                                req_status.event.set()
+                    elif obj[0] == ObjType.INSTANCE_REPORT:
+                        if len(obj) == 3:
+                            _, node_key, report = obj
+                            instance_generation = None
+                            report_seq = None
+                        elif len(obj) == 4:
+                            _, node_key, instance_generation, report = obj
+                            report_seq = None
+                        else:
+                            _, node_key, instance_generation, report_seq, report = obj
+                        p_node = self.pd_manager.url_to_pd_nodes.get(node_key)
+                        if not self.pd_manager.is_current_instance(p_node, instance_generation):
+                            continue
+                        self.pd_manager.update_node_load_info(report)
+                        await self.pd_manager.update_flex_tp_instance_report(node_key, report, report_seq=report_seq)
                     else:
                         logger.error(f"recevie error obj {obj}")
             except BaseException as e:
@@ -587,6 +811,8 @@ class ReqStatus:
         self.event = asyncio.Event()
         self.up_status_event = asyncio.Event()
         self.nixl_np_up_prompt_ids_event = asyncio.Event()
+        self.error: Optional[str] = None
+        self.prefill_finished: bool = False
         self.out_token_info_list: List[Tuple[int, str, dict, FinishStatus]] = []
         self.p_node: PD_Client_Obj = p_node
         self.d_node: PD_Client_Obj = d_node
@@ -619,15 +845,117 @@ class PDManager:
         self.prefill_nodes: List[PD_Client_Obj] = []
         self.decode_nodes: List[PD_Client_Obj] = []
         self.url_to_pd_nodes: Dict[str, PD_Client_Obj] = {}
+        self.fake_decode_node: Optional[PD_Client_Obj] = None
+        if getattr(args, "pd_fake_decode", False):
+            self.fake_decode_node = PD_Client_Obj(
+                node_id=-1,
+                client_ip_port="fake-decode:0",
+                mode="decode",
+                start_args={
+                    "tp": 4,
+                    "nnodes": 1,
+                    "host": "fake-decode",
+                    "pd_node_id": -1,
+                    "pd_decode_rpyc_port": None,
+                },
+                instance_generation="fake-decode-generation",
+            )
+            self.decode_nodes.append(self.fake_decode_node)
         self.selector = create_selector(
             args.select_p_d_node_strategy,
             self,
             flex_tp_threshold=getattr(args, "flex_tp_threshold", 8000),
+            flex_tp_long_threshold=getattr(args, "flex_tp_long_threshold", 4000),
+            flex_tp_mps_slowdown=getattr(args, "flex_tp_mps_slowdown", 2.0),
+            flex_tp_v7_class_quantum_tokens=getattr(args, "flex_tp_v7_class_quantum_tokens", 4096),
+            flex_tp_v7_conflict_price_weight=getattr(args, "flex_tp_v7_conflict_price_weight", 0.35),
+            flex_tp_v7_urgency_weight=getattr(args, "flex_tp_v7_urgency_weight", 2.0),
+            flex_tp_v8_epoch_ms=getattr(args, "flex_tp_v8_epoch_ms", 50.0),
+            flex_tp_v8_epoch_token_budget=getattr(args, "flex_tp_v8_epoch_token_budget", 16384),
+            flex_tp_v8_min_lane_quota=getattr(args, "flex_tp_v8_min_lane_quota", 2048),
+            flex_tp_v8_deadline_pressure_weight=getattr(args, "flex_tp_v8_deadline_pressure_weight", 2.0),
+            flex_tp_v9_aging_interval_ms=getattr(args, "flex_tp_v9_aging_interval_ms", 150.0),
+            flex_tp_v9_interactive_tokens=getattr(args, "flex_tp_v9_interactive_tokens", 1024),
+            flex_tp_v9_short_weight=getattr(args, "flex_tp_v9_short_weight", 1.0),
+            flex_tp_v9_long_weight=getattr(args, "flex_tp_v9_long_weight", 1.0),
+            flex_tp_v10_short_weight=getattr(args, "flex_tp_v10_short_weight", 1.0),
+            flex_tp_v10_long_weight=getattr(args, "flex_tp_v10_long_weight", 1.0),
+            flex_tp_v10_slack_weight=getattr(args, "flex_tp_v10_slack_weight", 1.0),
+            flex_tp_v10_overlap_slack_ratio=getattr(args, "flex_tp_v10_overlap_slack_ratio", 0.10),
+            flex_tp_v11_short_weight=getattr(args, "flex_tp_v11_short_weight", 1.0),
+            flex_tp_v11_long_weight=getattr(args, "flex_tp_v11_long_weight", 1.0),
+            flex_tp_v11_slack_weight=getattr(args, "flex_tp_v11_slack_weight", 1.0),
+            flex_tp_v11_overlap_slack_ratio=getattr(args, "flex_tp_v11_overlap_slack_ratio", 0.10),
+            flex_tp_v11_routing_cost_weight=getattr(args, "flex_tp_v11_routing_cost_weight", 0.50),
+            flex_tp_v12_routing_cost_weight=getattr(args, "flex_tp_v12_routing_cost_weight", 2.0),
+            flex_tp_v12_tp4_service_ratio_limit=getattr(args, "flex_tp_v12_tp4_service_ratio_limit", 0.60),
+            flex_tp_v13_long_threshold=getattr(args, "flex_tp_v13_long_threshold", 12000),
+            flex_tp_v13_latency_scale=getattr(args, "flex_tp_v13_latency_scale", 1.0),
+            flex_tp_v13_routing_cost_weight=getattr(args, "flex_tp_v13_routing_cost_weight", 2.0),
+            flex_tp_v13_tp4_service_ratio_limit=getattr(args, "flex_tp_v13_tp4_service_ratio_limit", 0.60),
+            flex_tp_v13_tp4_pressure_threshold=getattr(args, "flex_tp_v13_tp4_pressure_threshold", 1.0),
+            flex_tp_v14_long_threshold=getattr(args, "flex_tp_v14_long_threshold", 12000),
+            flex_tp_v14_latency_scale=getattr(args, "flex_tp_v14_latency_scale", 1.0),
+            flex_tp_v14_routing_cost_weight=getattr(args, "flex_tp_v14_routing_cost_weight", 2.0),
+            flex_tp_v14_tp4_service_ratio_limit=getattr(args, "flex_tp_v14_tp4_service_ratio_limit", 0.60),
+            flex_tp_v14_tp4_pressure_threshold=getattr(args, "flex_tp_v14_tp4_pressure_threshold", 1.0),
+            flex_tp_v14_decode_locality=bool(getattr(args, "flex_tp_v14_decode_locality", 1)),
             flex_tp_slo_ttft=getattr(args, "flex_tp_slo_ttft", None),
             flex_tp_overload_tokens=getattr(args, "flex_tp_overload_tokens", 20000),
             flex_tp_spill_ratio=getattr(args, "flex_tp_spill_ratio", 2.0),
+            flex_tp_bundle_window_ms=getattr(args, "flex_tp_bundle_window_ms", 20.0),
+            flex_tp_bundle_token_cap=getattr(args, "flex_tp_bundle_token_cap", 8192),
+            flex_tp_bundle_token_trigger=getattr(args, "flex_tp_bundle_token_trigger", 4096),
+            flex_tp_max_inflight=getattr(args, "flex_tp_max_inflight", 64),
+            flex_tp_instance_token_credit=getattr(args, "flex_tp_instance_token_credit", 16384),
+            flex_tp_prediction_margin=getattr(args, "flex_tp_prediction_margin", 0.08),
+            flex_tp_overload_policy=getattr(args, "flex_tp_overload_policy", "best_effort"),
+        )
+        self.selector.update_nodes(self.prefill_nodes, self.decode_nodes)
+        self.bundle_dispatcher = (
+            PrefillBundleDispatcher(
+                batch_window_s=float(getattr(args, "flex_tp_bundle_window_ms", 20.0)) / 1000.0,
+                token_trigger=getattr(args, "flex_tp_bundle_token_trigger", 4096),
+                max_bundle_tokens=getattr(args, "flex_tp_bundle_token_cap", 8192),
+                max_bundle_requests=getattr(args, "flex_tp_max_inflight", 64),
+            )
+            if getattr(self.selector, "supports_bundles", False)
+            else None
         )
         return
+
+    async def send_prefill_request(
+        self,
+        p_node: PD_Client_Obj,
+        group_request_id: int,
+        prompt,
+        sampling_params,
+        multimodal_params,
+        input_token_num: int = 0,
+        lease_request_id: Optional[int] = None,
+    ) -> None:
+        """Send a normal-PD request, coalescing for bundle-capable selectors."""
+        if self.bundle_dispatcher is not None and p_node.mode == "prefill":
+            async def on_send_failed(exc: BaseException) -> None:
+                await self.notify_flex_tp_request_failed(
+                    p_node,
+                    input_token_num=input_token_num,
+                    req_id=lease_request_id if lease_request_id is not None else group_request_id,
+                    reason=f"bundle send failed: {exc}",
+                )
+
+            await self.bundle_dispatcher.enqueue(
+                p_node,
+                group_request_id,
+                prompt,
+                sampling_params,
+                multimodal_params,
+                input_token_num=input_token_num,
+                lease_request_id=lease_request_id,
+                on_send_failed=on_send_failed,
+            )
+            return
+        await p_node.websocket.send_bytes(pickle.dumps((ObjType.REQ, (prompt, sampling_params, multimodal_params))))
 
     def register_pd(self, pd_info_json, websocket):
         pd_client = PD_Client_Obj(**pd_info_json)
@@ -639,6 +967,24 @@ class PDManager:
                 f"client info {pd_info_json}"
             )
             assert False
+
+        old_client = self.url_to_pd_nodes.get(pd_client.client_ip_port)
+        if (
+            old_client is not None
+            and old_client.instance_generation != pd_client.instance_generation
+            and hasattr(self.selector, "notify_node_removed")
+        ):
+            # A replacement websocket invalidates all leases owned by the old
+            # incarnation before the new one is made visible.
+            self.selector.notify_node_removed(
+                pd_client.client_ip_port, instance_generation=old_client.instance_generation
+            )
+            logger.warning(
+                "replace worker %s generation=%s with generation=%s",
+                pd_client.client_ip_port,
+                old_client.instance_generation,
+                pd_client.instance_generation,
+            )
 
         pd_client.websocket = websocket
         self.url_to_pd_nodes[pd_client.client_ip_port] = pd_client
@@ -660,14 +1006,53 @@ class PDManager:
     def remove_pd(self, pd_info_json):
         pd_client = PD_Client_Obj(**pd_info_json)
 
+        # A worker may reconnect on the same address before the old websocket
+        # reaches its finally block.  Do not let that stale disconnect remove
+        # the newly registered instance.
+        current = self.url_to_pd_nodes.get(pd_client.client_ip_port)
+        if current is not None:
+            if pd_client.instance_generation is None and current.instance_generation is not None:
+                # A legacy disconnect payload cannot identify which websocket
+                # it came from. Never let it remove a newer generation.
+                logger.info(
+                    "ignore legacy removal for %s while generation=%s is active",
+                    pd_client.client_ip_port,
+                    current.instance_generation,
+                )
+                return False
+            if (
+                pd_client.instance_generation is not None
+                and current.instance_generation != pd_client.instance_generation
+            ):
+                logger.info(
+                    "ignore stale removal for %s generation=%s current=%s",
+                    pd_client.client_ip_port,
+                    pd_client.instance_generation,
+                    current.instance_generation,
+                )
+                return False
+
         self.url_to_pd_nodes.pop(pd_client.client_ip_port, None)
         self.prefill_nodes = [e for e in self.prefill_nodes if e.client_ip_port != pd_client.client_ip_port]
         self.decode_nodes = [e for e in self.decode_nodes if e.client_ip_port != pd_client.client_ip_port]
 
         self.selector.update_nodes(self.prefill_nodes, self.decode_nodes)
+        if hasattr(self.selector, "notify_node_removed"):
+            self.selector.notify_node_removed(
+                pd_client.client_ip_port, instance_generation=pd_client.instance_generation
+            )
 
         logger.info(f"mode: {pd_client.mode} url: {pd_client.client_ip_port} removed")
-        return
+        return True
+
+    @staticmethod
+    def is_current_instance(p_node: Optional[PD_Client_Obj], instance_generation: Optional[str]) -> bool:
+        """Accept legacy messages, but reject ACKs from an old websocket."""
+        if p_node is None:
+            return False
+        if instance_generation is None:
+            return True
+        return getattr(p_node, "instance_generation", None) == instance_generation
 
     def update_node_load_info(self, load_info: Optional[dict]):
         """更新节点负载信息
@@ -697,13 +1082,7 @@ class PDManager:
         arrival_time: Optional[float] = None,
         req_id: Optional[int] = None,
     ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
-        from .pd_selector.flex_tp_selector import FlexTPSelector
-        from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
-        from .pd_selector.flex_tp_selector_static_2node import FlexTPStatic2NodeSelector
-        from .pd_selector.flex_tp_selector_static_plus_2node import FlexTPStaticPlus2NodeSelector
-        from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
-
-        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPStatic2NodeSelector, FlexTPStaticPlus2NodeSelector, FlexTPSelectorV2)):
+        if hasattr(self.selector, "async_select_p_d_node"):
             return await self.selector.async_select_p_d_node(
                 prompt, sampling_params, multimodal_params,
                 input_token_num=input_token_num, arrival_time=arrival_time, req_id=req_id
@@ -714,12 +1093,47 @@ class PDManager:
                                           actual_ttft: Optional[float] = None,
                                           req_id: Optional[int] = None):
         """通知 flex TP 选择器请求已完成，用于更新在途请求计数和 token 数"""
-        from .pd_selector.flex_tp_selector import FlexTPSelector
-        from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
-        from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
         logger.info(f"notify_flex_tp_request_done: req_id={req_id}, p_node={p_node.client_ip_port if p_node else None}")
 
-        if isinstance(self.selector, (FlexTPSelector, FlexTPNaiveSelector, FlexTPSelectorV2)) and p_node is not None:
+        if p_node is not None and hasattr(self.selector, "notify_request_done"):
             await self.selector.notify_request_done(p_node, input_token_num=input_token_num,
                                                     actual_ttft=actual_ttft, req_id=req_id)
 
+    async def notify_flex_tp_request_failed(
+        self, p_node: Optional[PD_Client_Obj], input_token_num: int = 0,
+        req_id: Optional[int] = None, reason: str = "",
+    ):
+        from .pd_selector.flex_tp_selector import FlexTPSelector
+        from .pd_selector.flex_tp_selector_naive import FlexTPNaiveSelector
+        from .pd_selector.flex_tp_selector_naive_switch import FlexTPNaiveSwitchSelector
+        from .pd_selector.flex_tp_selector_static_2node import FlexTPStatic2NodeSelector
+        from .pd_selector.flex_tp_selector_static_plus_2node import FlexTPStaticPlus2NodeSelector
+        from .pd_selector.flex_tp_selector_v2 import FlexTPSelectorV2
+        if p_node is None:
+            return
+        if getattr(self.selector, "supports_bundles", False) and hasattr(
+            self.selector, "notify_request_failed"
+        ):
+            await self.selector.notify_request_failed(
+                p_node, input_token_num=input_token_num, req_id=req_id, reason=reason
+            )
+        elif isinstance(self.selector, FlexTPSelectorV2):
+            await self.selector.notify_request_failed(p_node, req_id=req_id)
+        elif isinstance(
+            self.selector,
+            (FlexTPSelector, FlexTPNaiveSelector, FlexTPNaiveSwitchSelector,
+             FlexTPStatic2NodeSelector, FlexTPStaticPlus2NodeSelector),
+        ):
+            # These legacy selectors only expose a completion callback.  Keep
+            # their existing counter cleanup semantics on dispatch failure.
+            await self.selector.notify_request_done(p_node, input_token_num=input_token_num, req_id=req_id)
+
+    async def notify_flex_tp_bundle_accepted(self, p_node: Optional[PD_Client_Obj], bundle_id: int, req_ids):
+        if p_node is not None and hasattr(self.selector, "notify_bundle_accepted"):
+            await self.selector.notify_bundle_accepted(p_node, bundle_id, req_ids)
+
+    async def update_flex_tp_instance_report(
+        self, node_key: str, report: dict, report_seq: Optional[int] = None
+    ):
+        if hasattr(self.selector, "update_instance_report"):
+            await self.selector.update_instance_report(node_key, report, report_seq=report_seq)

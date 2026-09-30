@@ -199,7 +199,7 @@ class RouterManager:
         self.req_queue = build_req_queue(self.args, self, self.dp_size_in_node)
         logger.info(f"use req queue {self.req_queue.__class__.__name__}")
 
-        if self.args.run_mode == "prefill":
+        if self.args.run_mode == "prefill" and not getattr(self.args, "pd_fake_decode", False):
             # 启动 prefill kv move 管理进程
             from lightllm.server.router.model_infer.mode_backend.continues_batch.pd_mode.prefill_node_impl import (
                 start_prefill_kv_move_manager_process,

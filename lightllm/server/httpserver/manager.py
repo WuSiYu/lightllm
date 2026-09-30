@@ -13,7 +13,7 @@ import pickle
 from frozendict import frozendict
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-from typing import Literal, Union, List, Tuple, Dict, Optional, AsyncGenerator
+from typing import Literal, Union, List, Tuple, Dict, Optional, AsyncGenerator, Callable, Awaitable
 from websockets import ClientConnection
 from fastapi import Request
 from ..tokenizer import get_tokenizer
@@ -284,6 +284,9 @@ class HttpServerManager:
         nixl_pd_upload_websocket: ClientConnection = None,
         # 用于等待 pd_master 下发的交换信息
         nixl_pd_event: asyncio.Event = None,
+        # normal-PD FlexTP bundle lifecycle callback.  It is invoked only
+        # after the GroupReqIndexes have been sent to the local Router.
+        pd_lifecycle_callback: Optional[Callable[[str, int, Optional[object]], Awaitable[None]]] = None,
     ) -> AsyncGenerator[Tuple[int, str, dict, FinishStatus], None]:
         start_time = time.time()
         request_headers = request.headers if request is not None else {}
@@ -369,6 +372,8 @@ class HttpServerManager:
             await self.transfer_to_next_module_or_node(
                 prompt, sampling_params, original_multimodal_params, req_status.group_req_objs
             )
+            if pd_lifecycle_callback is not None and self.pd_mode == NodeRole.P:
+                await pd_lifecycle_callback("accepted", group_request_id, None)
 
             results_generator = self._wait_to_token_package(
                 start_time,
@@ -399,6 +404,11 @@ class HttpServerManager:
 
         except Exception as e:
             logger.error(f"group_request_id: {group_request_id} has exception {str(e)}")
+            if pd_lifecycle_callback is not None and self.pd_mode == NodeRole.P:
+                try:
+                    await pd_lifecycle_callback("failed", group_request_id, str(e))
+                except Exception:
+                    logger.exception("failed to publish normal-PD lifecycle event")
             # error need to release multimodel resources.
             # 对于还没有形成正式请求对象管理的多模态资源，需要单独自己释放
             # 已经放入到 req_id_to_out_inf 中的请求对象，由统一的回收循环

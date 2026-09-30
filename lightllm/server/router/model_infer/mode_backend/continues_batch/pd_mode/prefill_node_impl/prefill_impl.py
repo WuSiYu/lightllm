@@ -51,6 +51,12 @@ class ChunckedPrefillForPrefillNode(ChunkedPrefillBackend):
         if len(finished_reqs) == 0:
             return
 
+        # Fake-decode and no-cache prefill workers have no radix cache and no
+        # KV-move task to create.  Skip the PD freeze path instead of logging a
+        # per-request NoneType exception after the first token was returned.
+        if self.radix_cache is None:
+            return
+
         # 提前在radix cache中回收相关的信息，并添加引用进行锁定，方便传输进程传输kv。
         if self.is_master_in_dp:
             logger.info("prefill_req_handle_and_frozen_tokens")

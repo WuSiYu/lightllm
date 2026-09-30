@@ -1,0 +1,53 @@
+#!/bin/bash
+set -e
+
+ADDR=$(hostname -i | awk '{print $1}')
+PORT=60011
+SLEEP_INTERVAL=10
+# LOG_DIR="_/260409-70b_p4d4_v8_mps_sg2"
+# LOG_DIR="_/260409-70b_p22.4d4_v8_mps_flex_naive_4k_sg2"
+LOG_DIR="_/260906-70b_p22.4d4_v12_mps_v12_sg2"
+
+
+mkdir -p "$LOG_DIR"
+
+START=${1:-10}
+
+for rate in 10 9 8 7 6 5 4 3 2 1; do
+# for rate in $(seq $START -1 1); do
+    echo "============================================"
+    echo "[$(date)] Starting benchmark with request-rate=$rate"
+    echo "============================================"
+
+    for dataset in servegen; do
+        for dataset_mode in mm-image; do
+            echo "--------------------------------------------"
+            echo "[$(date)] Running benchmark with dataset=$dataset and dataset_mode=$dataset_mode"
+            echo "--------------------------------------------"
+
+            mkdir -p "${LOG_DIR}/${dataset}/${dataset_mode}"
+            python -u benchmark_serving_chat_req_rate.py \
+                --dataset-type="$dataset" \
+                --servegen-mode="$dataset_mode" \
+                --servegen-duration 180 \
+                --port "$PORT" \
+                --addr "$ADDR" \
+                --request-rate "$rate" \
+                --bypass-cache \
+                --dump-dir "$LOG_DIR/${dataset}/${dataset_mode}" \
+                2>&1 | tee "${LOG_DIR}/${dataset}/${dataset_mode}/${rate}.log"
+
+        done
+    done
+
+    echo "[$(date)] Finished rate=$rate"
+
+    if [ "$rate" -lt "$START" ]; then
+        echo "Sleeping ${SLEEP_INTERVAL}s before next run..."
+        sleep "$SLEEP_INTERVAL"
+    fi
+done
+
+echo "============================================"
+echo "[$(date)] All benchmarks completed!"
+echo "============================================"

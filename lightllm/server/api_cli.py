@@ -43,10 +43,27 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="p d mode, decode node used for kv move manager rpyc server port",
     )
     parser.add_argument(
+        "--pd_fake_decode",
+        action="store_true",
+        help="pd_master: use a virtual Decode endpoint and finish after simulated KV transfer; no Decode GPU is needed",
+    )
+    parser.add_argument(
+        "--pd_fake_decode_kv_transfer_fixed_ms",
+        type=float,
+        default=20.0,
+        help="pd_fake_decode fixed KV transfer delay in milliseconds",
+    )
+    parser.add_argument(
+        "--pd_fake_decode_kv_transfer_us_per_token",
+        type=float,
+        default=0.0,
+        help="pd_fake_decode additional KV transfer delay per input token in microseconds",
+    )
+    parser.add_argument(
         "--select_p_d_node_strategy",
         type=str,
         default="round_robin",
-        choices=["random", "round_robin", "adaptive_load", "flex_tp", "flex_tp_naive", "flex_tp_v2", "flex_tp_static_2node", "flex_tp_static_plus_2node"],
+        choices=["random", "round_robin", "round_robin_plus", "adaptive_load", "flex_tp", "flex_tp_naive", "flex_tp_naive_switch", "flex_tp_v2", "flex_tp_v3", "flex_tp_v4", "flex_tp_v5", "flex_tp_v6", "flex_tp_v7", "flex_tp_v8", "flex_tp_v9", "flex_tp_v10", "flex_tp_v11", "flex_tp_v12", "flex_tp_v13", "flex_tp_v14", "flex_tp_static_2node", "flex_tp_static_plus_2node"],
         help="pd master use this strategy to select p d node, can be round_robin, random, adaptive_load or flex_tp/flex_tp_naive",
     )
     parser.add_argument(
@@ -54,6 +71,150 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=8000,
         help="flex_tp mode: requests with input_token_num > threshold are routed to large TP nodes",
+    )
+    parser.add_argument(
+        "--flex_tp_long_threshold",
+        type=int,
+        default=4000,
+        help="flex_tp_v4/v5/v6: requests above this input-token length use the largest resident TP.",
+    )
+    parser.add_argument(
+        "--flex_tp_mps_slowdown",
+        type=float,
+        default=2.0,
+        help="flex_tp_v6: profiled per-instance slowdown in an overlapping MPS mode.",
+    )
+    parser.add_argument(
+        "--flex_tp_v7_class_quantum_tokens", type=int, default=4096,
+        help="flex_tp_v7: per-class deficit quantum for online flow fairness.",
+    )
+    parser.add_argument(
+        "--flex_tp_v7_conflict_price_weight", type=float, default=0.35,
+        help="flex_tp_v7: weight of the shared-GPU conflict price.",
+    )
+    parser.add_argument(
+        "--flex_tp_v7_urgency_weight", type=float, default=2.0,
+        help="flex_tp_v7: weight of deadline urgency in marginal-cost routing.",
+    )
+    parser.add_argument(
+        "--flex_tp_v8_epoch_ms", type=float, default=50.0,
+        help="flex_tp_v8: admission epoch length in milliseconds.",
+    )
+    parser.add_argument(
+        "--flex_tp_v8_epoch_token_budget", type=int, default=16384,
+        help="flex_tp_v8: total new input-token budget per lane epoch.",
+    )
+    parser.add_argument(
+        "--flex_tp_v8_min_lane_quota", type=int, default=2048,
+        help="flex_tp_v8: minimum token quota for each active lane in a dual epoch.",
+    )
+    parser.add_argument(
+        "--flex_tp_v8_deadline_pressure_weight", type=float, default=2.0,
+        help="flex_tp_v8: weight of oldest-deadline pressure in quota water-filling.",
+    )
+    parser.add_argument(
+        "--flex_tp_v9_aging_interval_ms", type=float, default=150.0,
+        help="flex_tp_v9: wait time for one MLFQ aging promotion.",
+    )
+    parser.add_argument(
+        "--flex_tp_v9_interactive_tokens", type=int, default=1024,
+        help="flex_tp_v9: initial high-priority token limit for interactive work.",
+    )
+    parser.add_argument(
+        "--flex_tp_v9_short_weight", type=float, default=1.0,
+        help="flex_tp_v9: CFS virtual-runtime weight of the short class.",
+    )
+    parser.add_argument(
+        "--flex_tp_v9_long_weight", type=float, default=1.0,
+        help="flex_tp_v9: CFS virtual-runtime weight of the long class.",
+    )
+    parser.add_argument(
+        "--flex_tp_v10_short_weight", type=float, default=1.0,
+        help="flex_tp_v10: EEVDF virtual service weight of the short class.",
+    )
+    parser.add_argument(
+        "--flex_tp_v10_long_weight", type=float, default=1.0,
+        help="flex_tp_v10: EEVDF virtual service weight of the long class.",
+    )
+    parser.add_argument(
+        "--flex_tp_v10_slack_weight", type=float, default=1.0,
+        help="flex_tp_v10: weight of positive predicted deadline lateness.",
+    )
+    parser.add_argument(
+        "--flex_tp_v10_overlap_slack_ratio", type=float, default=0.10,
+        help="flex_tp_v10: fraction of TTFT SLO reserved before allowing shared-GPU overlap.",
+    )
+    parser.add_argument(
+        "--flex_tp_v11_short_weight", type=float, default=1.0,
+        help="flex_tp_v11: compatibility weight for the single elastic run queue.",
+    )
+    parser.add_argument(
+        "--flex_tp_v11_long_weight", type=float, default=1.0,
+        help="flex_tp_v11: compatibility weight for the single elastic run queue.",
+    )
+    parser.add_argument(
+        "--flex_tp_v11_slack_weight", type=float, default=1.0,
+        help="flex_tp_v11: weight of normalized deadline slack.",
+    )
+    parser.add_argument(
+        "--flex_tp_v11_overlap_slack_ratio", type=float, default=0.10,
+        help="flex_tp_v11: fraction of TTFT SLO reserved before allowing shared-GPU overlap.",
+    )
+    parser.add_argument(
+        "--flex_tp_v11_routing_cost_weight", type=float, default=0.50,
+        help="flex_tp_v11: continuous price on extra TP footprint and MPS overlap.",
+    )
+    parser.add_argument(
+        "--flex_tp_v12_routing_cost_weight", type=float, default=2.0,
+        help="flex_tp_v12: continuous price on TP footprint in predicted-finish routing.",
+    )
+    parser.add_argument(
+        "--flex_tp_v12_tp4_service_ratio_limit", type=float, default=0.60,
+        help="flex_tp_v12: TP4/TP2 profiled service-ratio guard before TP4 spill routing.",
+    )
+    parser.add_argument(
+        "--flex_tp_v13_latency_scale", type=float, default=1.0,
+        help="flex_tp_v13: multiplicative calibration for the V6 latency profile.",
+    )
+    parser.add_argument(
+        "--flex_tp_v13_long_threshold", type=int, default=12000,
+        help="flex_tp_v13: input-token threshold for the dedicated TP4 long-request fallback.",
+    )
+    parser.add_argument(
+        "--flex_tp_v13_routing_cost_weight", type=float, default=2.0,
+        help="flex_tp_v13: TP footprint price weight.",
+    )
+    parser.add_argument(
+        "--flex_tp_v13_tp4_service_ratio_limit", type=float, default=0.60,
+        help="flex_tp_v13: normal TP4/TP2 service-ratio guard.",
+    )
+    parser.add_argument(
+        "--flex_tp_v13_tp4_pressure_threshold", type=float, default=1.0,
+        help="flex_tp_v13: TP2 token-credit pressure at which TP4 spill is allowed.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_latency_scale", type=float, default=1.0,
+        help="flex_tp_v14: multiplicative calibration for the latency profile.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_long_threshold", type=int, default=12000,
+        help="flex_tp_v14: input-token threshold for the dedicated TP4 long-request fallback.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_routing_cost_weight", type=float, default=2.0,
+        help="flex_tp_v14: TP footprint price weight.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_tp4_service_ratio_limit", type=float, default=0.60,
+        help="flex_tp_v14: normal TP4/TP2 service-ratio guard.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_tp4_pressure_threshold", type=float, default=1.0,
+        help="flex_tp_v14: TP2 token-credit pressure at which TP4 spill is allowed.",
+    )
+    parser.add_argument(
+        "--flex_tp_v14_decode_locality", type=int, choices=(0, 1), default=1,
+        help="flex_tp_v14: prefer Decode nodes on the selected Prefill host.",
     )
     parser.add_argument(
         "--flex_tp_slo_ttft",
@@ -75,6 +236,43 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="flex_tp_static_plus_2node mode: spill to the other pool only if "
              "other_node_load * spill_ratio < primary_node_load (the other pool must be clearly lighter)",
+    )
+    parser.add_argument(
+        "--flex_tp_bundle_window_ms", type=float, default=20.0,
+        help="bundle-capable FlexTP: maximum time to coalesce normal-PD Prefill requests before sending a bundle.",
+    )
+    parser.add_argument(
+        "--flex_tp_bundle_token_cap", type=int, default=8192,
+        help="bundle-capable FlexTP: maximum first-chunk tokens in one normal-PD bundle.",
+    )
+    parser.add_argument(
+        "--flex_tp_bundle_token_trigger", type=int, default=4096,
+        help="bundle-capable FlexTP: flush a normal-PD bundle once this many input tokens are queued.",
+    )
+    parser.add_argument(
+        "--flex_tp_max_inflight", type=int, default=64,
+        help="bundle-capable FlexTP: maximum admitted requests per Prefill instance.",
+    )
+    parser.add_argument(
+        "--flex_tp_instance_token_credit", type=int, default=16384,
+        help="bundle-capable FlexTP: maximum admitted first-chunk tokens per Prefill instance.",
+    )
+    parser.add_argument(
+        "--flex_tp_prediction_margin", type=float, default=0.08,
+        help="bundle-capable FlexTP: conservative TTFT prediction margin in seconds.",
+    )
+    parser.add_argument(
+        "--flex_tp_overload_policy", type=str, default="best_effort",
+        choices=["best_effort", "reject"],
+        help="bundle-capable FlexTP: behavior for requests that cannot meet their deadline (default: best_effort).",
+    )
+    parser.add_argument(
+        "--tp_smt_group_id", type=str, default=None,
+        help="FlexTP topology group shared by Prefill instances on this host.",
+    )
+    parser.add_argument(
+        "--tp_smt_gpu_ids", type=str, default=None,
+        help="Comma-separated physical GPU ids used by this Prefill instance.",
     )
     parser.add_argument(
         "--config_server_host",

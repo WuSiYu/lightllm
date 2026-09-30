@@ -1,0 +1,15 @@
+
+[1mLong request latency sweep[0m (4001 ~ 32001, step 4000)
+
+[1;33m===== prompt_length = 4001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23832 chars
+
+--- Result ---
+350
+
+--- Stats ---
+Prompt tokens: 4002
+Output tokens: 1
+Finish reason: length
+Time: 1.24s

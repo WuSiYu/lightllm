@@ -52,6 +52,44 @@ class RoundRobinSelector(PDSelector):
         return p_node, d_node
 
 
+class RoundRobinPlusSelector(RoundRobinSelector):
+    """Round-robin Prefill with same-host Decode affinity."""
+
+    @staticmethod
+    def _node_hosts(node) -> set[str]:
+        hosts = set()
+        client_ip_port = str(getattr(node, "client_ip_port", ""))
+        if client_ip_port:
+            hosts.add(client_ip_port.split(":", 1)[0])
+        start_args = getattr(node, "start_args", None)
+        if isinstance(start_args, dict) and start_args.get("host"):
+            hosts.add(str(start_args["host"]))
+        return {host for host in hosts if host}
+
+    def _pick_decode_node(self, p_node: PD_Client_Obj) -> PD_Client_Obj:
+        candidates = self.decode_nodes
+        local_hosts = self._node_hosts(p_node)
+        local_candidates = [
+            node
+            for node in self.decode_nodes
+            if local_hosts.intersection(self._node_hosts(node))
+        ]
+        if local_candidates:
+            candidates = local_candidates
+        self.decode_node_index %= len(candidates)
+        d_node = candidates[self.decode_node_index]
+        self.decode_node_index += 1
+        return d_node
+
+    def select_p_d_node(
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams, multimodal_params: MultimodalParams
+    ) -> Tuple[PD_Client_Obj, PD_Client_Obj]:
+        self.prefill_node_index %= len(self.prefill_nodes)
+        p_node = self.prefill_nodes[self.prefill_node_index]
+        self.prefill_node_index += 1
+        return p_node, self._pick_decode_node(p_node)
+
+
 class AdaptiveLoadSelector(PDSelector):
     """基于负载使用情况的选择器"""
 

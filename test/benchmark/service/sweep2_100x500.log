@@ -1,0 +1,460 @@
+
+[1mLong request latency sweep[0m (4001 ~ 32001, step 4000)
+
+[1;33m===== prompt_length = 4001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23831 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 4003
+Output tokens: 1
+Finish reason: length
+Time: 1.63s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23831 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 4000
+Output tokens: 1
+Finish reason: length
+Time: 0.65s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23832 chars
+
+--- Result ---
+297
+
+--- Stats ---
+Prompt tokens: 4003
+Output tokens: 1
+Finish reason: length
+Time: 0.89s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 4000
+Output tokens: 1
+Finish reason: length
+Time: 0.65s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 23832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 4003
+Output tokens: 1
+Finish reason: length
+Time: 0.87s
+
+[1;33m===== prompt_length = 8001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 47831 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 7999
+Output tokens: 1
+Finish reason: length
+Time: 1.09s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 47832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 8003
+Output tokens: 1
+Finish reason: length
+Time: 1.38s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 47832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 8000
+Output tokens: 1
+Finish reason: length
+Time: 0.88s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 47832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 8002
+Output tokens: 1
+Finish reason: length
+Time: 0.83s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 47832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 7998
+Output tokens: 1
+Finish reason: length
+Time: 0.81s
+
+[1;33m===== prompt_length = 12001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 71832 chars
+
+--- Result ---
+810
+
+--- Stats ---
+Prompt tokens: 12004
+Output tokens: 1
+Finish reason: length
+Time: 1.45s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 71832 chars
+
+--- Result ---
+重
+
+--- Stats ---
+Prompt tokens: 12005
+Output tokens: 1
+Finish reason: length
+Time: 1.35s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 71832 chars
+
+--- Result ---
+510
+
+--- Stats ---
+Prompt tokens: 12005
+Output tokens: 1
+Finish reason: length
+Time: 1.47s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 71832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 12003
+Output tokens: 1
+Finish reason: length
+Time: 1.35s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 71832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 12005
+Output tokens: 1
+Finish reason: length
+Time: 1.30s
+
+[1;33m===== prompt_length = 16001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 95832 chars
+
+--- Result ---
+936
+
+--- Stats ---
+Prompt tokens: 16001
+Output tokens: 1
+Finish reason: length
+Time: 1.66s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 95832 chars
+
+--- Result ---
+701
+
+--- Stats ---
+Prompt tokens: 16001
+Output tokens: 1
+Finish reason: length
+Time: 1.81s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 95832 chars
+
+--- Result ---
+345
+
+--- Stats ---
+Prompt tokens: 16002
+Output tokens: 1
+Finish reason: length
+Time: 1.86s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 95832 chars
+
+--- Result ---
+一
+
+--- Stats ---
+Prompt tokens: 16003
+Output tokens: 1
+Finish reason: length
+Time: 1.84s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 95832 chars
+
+--- Result ---
+163
+
+--- Stats ---
+Prompt tokens: 15999
+Output tokens: 1
+Finish reason: length
+Time: 1.69s
+
+[1;33m===== prompt_length = 20001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 119832 chars
+
+--- Result ---
+932
+
+--- Stats ---
+Prompt tokens: 20002
+Output tokens: 1
+Finish reason: length
+Time: 2.13s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 119832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 20001
+Output tokens: 1
+Finish reason: length
+Time: 2.30s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 119832 chars
+
+--- Result ---
+131
+
+--- Stats ---
+Prompt tokens: 19999
+Output tokens: 1
+Finish reason: length
+Time: 2.11s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 119832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 20002
+Output tokens: 1
+Finish reason: length
+Time: 2.08s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 119832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 20002
+Output tokens: 1
+Finish reason: length
+Time: 2.19s
+
+[1;33m===== prompt_length = 24001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 143832 chars
+
+--- Result ---
+该
+
+--- Stats ---
+Prompt tokens: 24004
+Output tokens: 1
+Finish reason: length
+Time: 2.45s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 143832 chars
+
+--- Result ---
+token
+
+--- Stats ---
+Prompt tokens: 24002
+Output tokens: 1
+Finish reason: length
+Time: 2.94s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 143832 chars
+
+--- Result ---
+token
+
+--- Stats ---
+Prompt tokens: 24000
+Output tokens: 1
+Finish reason: length
+Time: 2.49s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 143832 chars
+
+--- Result ---
+507
+
+--- Stats ---
+Prompt tokens: 23997
+Output tokens: 1
+Finish reason: length
+Time: 2.53s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 143832 chars
+
+--- Result ---
+token
+
+--- Stats ---
+Prompt tokens: 24003
+Output tokens: 1
+Finish reason: length
+Time: 2.32s
+
+[1;33m===== prompt_length = 28001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 167832 chars
+
+--- Result ---
+853
+
+--- Stats ---
+Prompt tokens: 28000
+Output tokens: 1
+Finish reason: length
+Time: 2.91s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 167832 chars
+
+--- Result ---
+496
+
+--- Stats ---
+Prompt tokens: 27998
+Output tokens: 1
+Finish reason: length
+Time: 2.90s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 167832 chars
+
+--- Result ---
+934
+
+--- Stats ---
+Prompt tokens: 28004
+Output tokens: 1
+Finish reason: length
+Time: 3.08s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 167832 chars
+
+--- Result ---
+773
+
+--- Stats ---
+Prompt tokens: 28003
+Output tokens: 1
+Finish reason: length
+Time: 3.22s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 167832 chars
+
+--- Result ---
+382
+
+--- Stats ---
+Prompt tokens: 27999
+Output tokens: 1
+Finish reason: length
+Time: 3.51s
+
+[1;33m===== prompt_length = 32001 =====[0m
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 191832 chars
+
+--- Result ---
+568
+
+--- Stats ---
+Prompt tokens: 32001
+Output tokens: 1
+Finish reason: length
+Time: 5.39s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 191832 chars
+
+--- Result ---
+569
+
+--- Stats ---
+Prompt tokens: 32001
+Output tokens: 1
+Finish reason: length
+Time: 3.36s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 191832 chars
+
+--- Result ---
+973
+
+--- Stats ---
+Prompt tokens: 32000
+Output tokens: 1
+Finish reason: length
+Time: 3.38s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 191832 chars
+
+--- Result ---
+692
+
+--- Stats ---
+Prompt tokens: 31999
+Output tokens: 1
+Finish reason: length
+Time: 3.45s
+Sending request to http://10.120.178.80:60011/generate
+Prompt length: 191832 chars
+
+--- Result ---
+一
+
+--- Stats ---
+Prompt tokens: 32002
+Output tokens: 1
+Finish reason: length
+Time: 5.34s
+
+[0;32mDone.[0m

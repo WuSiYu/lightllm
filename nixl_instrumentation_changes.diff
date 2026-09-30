@@ -1,0 +1,1445 @@
+diff --git a/lightllm/server/httpserver_for_pd_master/manager.py b/lightllm/server/httpserver_for_pd_master/manager.py
+index d6a1a58b..4262c2aa 100644
+--- a/lightllm/server/httpserver_for_pd_master/manager.py
++++ b/lightllm/server/httpserver_for_pd_master/manager.py
+@@ -25,7 +25,7 @@ from .pd_selector import create_selector
+ 
+ logger = init_logger(__name__)
+ 
+-
++INTERNAL_TIMEOUT_SECONDS = 60
+ class HttpServerManagerForPDMaster:
+     def __init__(
+         self,
+@@ -242,7 +242,7 @@ class HttpServerManagerForPDMaster:
+             return
+ 
+         try:
+-            await asyncio.wait_for(up_status_event.wait(), timeout=60)
++            await asyncio.wait_for(up_status_event.wait(), timeout=INTERNAL_TIMEOUT_SECONDS)
+         except asyncio.TimeoutError:
+             logger.warning(f"group_request_id: {group_request_id} kv move time out err, server is busy now.")
+             raise ServerBusyError()
+@@ -290,7 +290,7 @@ class HttpServerManagerForPDMaster:
+         await p_node.websocket.send_bytes(pickle.dumps((ObjType.REQ, (prompt, sampling_params, multimodal_params))))
+ 
+         try:
+-            await asyncio.wait_for(nixl_np_up_prompt_ids_event.wait(), timeout=60)
++            await asyncio.wait_for(nixl_np_up_prompt_ids_event.wait(), timeout=INTERNAL_TIMEOUT_SECONDS)
+         except asyncio.TimeoutError:
+             logger.warning(f"group_request_id: {group_request_id} wait np up prompt ids time out")
+             raise ServerBusyError()
+@@ -307,7 +307,7 @@ class HttpServerManagerForPDMaster:
+         )
+ 
+         try:
+-            await asyncio.wait_for(up_status_event.wait(), timeout=60)
++            await asyncio.wait_for(up_status_event.wait(), timeout=INTERNAL_TIMEOUT_SECONDS)
+         except asyncio.TimeoutError:
+             logger.warning(f"group_request_id: {group_request_id} kv move time out err, server is busy now.")
+             raise ServerBusyError()
+diff --git a/lightllm/server/router/model_infer/mode_backend/base_backend.py b/lightllm/server/router/model_infer/mode_backend/base_backend.py
+index 90662bdc..587db41e 100644
+--- a/lightllm/server/router/model_infer/mode_backend/base_backend.py
++++ b/lightllm/server/router/model_infer/mode_backend/base_backend.py
+@@ -79,8 +79,69 @@ class ModeBackend:
+         self._radix_tree_merge_counter: int = 0
+         self._enable_radix_tree_timer_merge: bool = enable_radix_tree_timer_merge()
+         self._radix_tree_merge_update_delta: int = get_radix_tree_merge_update_delta()
++
++        # NIXL return-path statistics. Used to correlate decode gate blocking with
++        # whether trans task ret events are actually being consumed.
++        self._nixl_ret_stats_lock = threading.Lock()
++        self._nixl_ret_stats_last_log_time = time.time()
++        self._nixl_ret_stats_log_interval_s = 5.0
++        self._nixl_ret_stats_window = {
++            "ret_seen": 0,
++            "ret_req_found": 0,
++            "ret_req_missing": 0,
++            "ret_error": 0,
++            "ret_success": 0,
++            "ret_decode_first_token": 0,
++        }
++        self._nixl_ret_stats_total = {
++            "ret_seen": 0,
++            "ret_req_found": 0,
++            "ret_req_missing": 0,
++            "ret_error": 0,
++            "ret_success": 0,
++            "ret_decode_first_token": 0,
++        }
++        self._nixl_ret_last_missing_req_id = -1
+         pass
+ 
++    def _add_nixl_ret_stats(self, delta: dict, last_missing_req_id: int = -1):
++        with self._nixl_ret_stats_lock:
++            for key, value in delta.items():
++                self._nixl_ret_stats_window[key] += value
++                self._nixl_ret_stats_total[key] += value
++            if last_missing_req_id >= 0:
++                self._nixl_ret_last_missing_req_id = last_missing_req_id
++
++    def _maybe_log_nixl_ret_stats(self):
++        now = time.time()
++        with self._nixl_ret_stats_lock:
++            if now - self._nixl_ret_stats_last_log_time < self._nixl_ret_stats_log_interval_s:
++                return
++            window = self._nixl_ret_stats_window.copy()
++            total = self._nixl_ret_stats_total.copy()
++            last_missing_req_id = self._nixl_ret_last_missing_req_id
++            self._nixl_ret_stats_window = {
++                "ret_seen": 0,
++                "ret_req_found": 0,
++                "ret_req_missing": 0,
++                "ret_error": 0,
++                "ret_success": 0,
++                "ret_decode_first_token": 0,
++            }
++            self._nixl_ret_stats_last_log_time = now
++
++        self.logger.warning(
++            "nixl_trans_ret_stats "
++            f"\nwindow_s={self._nixl_ret_stats_log_interval_s:.0f} "
++            f"\nret_seen_w={window['ret_seen']} ret_seen_t={total['ret_seen']} "
++            f"\nret_req_found_w={window['ret_req_found']} ret_req_found_t={total['ret_req_found']} "
++            f"\nret_req_missing_w={window['ret_req_missing']} ret_req_missing_t={total['ret_req_missing']} "
++            f"\nret_error_w={window['ret_error']} ret_error_t={total['ret_error']} "
++            f"\nret_success_w={window['ret_success']} ret_success_t={total['ret_success']} "
++            f"\nret_decode_first_token_w={window['ret_decode_first_token']} ret_decode_first_token_t={total['ret_decode_first_token']} "
++            f"\nlast_missing_req_id={last_missing_req_id}"
++        )
++
+     def init_model(self, kvargs):
+         self.args: StartArgs = kvargs.get("args", None)
+         assert self.args is not None
+@@ -461,18 +522,30 @@ class ModeBackend:
+     def _read_nixl_trans_io_buffer_and_update_req_status(self):
+         cmds: List[NIXLChunckedTransTaskRet] = self.shm_nixl_trans_io_buffer.read_obj()
+         self.shm_nixl_trans_io_buffer.sub_state()
++        ret_seen_count = 0
++        ret_req_found_count = 0
++        ret_req_missing_count = 0
++        ret_error_count = 0
++        ret_success_count = 0
++        ret_decode_first_token_count = 0
++        last_missing_req_id = -1
+         if cmds:
+             for obj in cmds:
++                ret_seen_count += 1
+                 if obj.request_id in g_infer_context.requests_mapping:
++                    ret_req_found_count += 1
+                     req: InferReq = g_infer_context.requests_mapping[obj.request_id]
+                     if obj.has_error:
+                         req.nixl_pd_task_failed_num += 1
++                        ret_error_count += 1
+                     else:
+                         req.nixl_pd_task_sunccess_num += 1
++                        ret_success_count += 1
+                         # nixl decode 节点需要预填充 prefill 节点发送过来的产生的首token信息，以使
+                         # 推理过程可以继续。
+                         if self.is_nixl_decode_mode:
+                             if obj.first_gen_token_id is not None:
++                                ret_decode_first_token_count += 1
+                                 assert req.cur_output_len == 0
+                                 req.cur_output_len += 1
+                                 req_to_next_token_ids = (
+@@ -489,6 +562,22 @@ class ModeBackend:
+                                     is_master_in_dp=self.is_master_in_dp,
+                                     nixl_prefill_chuncked_handle_func=None,
+                                 )
++                else:
++                    ret_req_missing_count += 1
++                    last_missing_req_id = obj.request_id
++
++        self._add_nixl_ret_stats(
++            {
++                "ret_seen": ret_seen_count,
++                "ret_req_found": ret_req_found_count,
++                "ret_req_missing": ret_req_missing_count,
++                "ret_error": ret_error_count,
++                "ret_success": ret_success_count,
++                "ret_decode_first_token": ret_decode_first_token_count,
++            },
++            last_missing_req_id=last_missing_req_id,
++        )
++        self._maybe_log_nixl_ret_stats()
+         return
+ 
+     # 一些可以复用的通用功能函数
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_impl.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_impl.py
+index f1309ca9..5ff5efb3 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_impl.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_impl.py
+@@ -1,4 +1,7 @@
+ import random
++import time
++import threading
++import os
+ import torch.multiprocessing as mp
+ from lightllm.server.pd_io_struct import NIXLChunckedTransTask, NIXLChunckedTransTaskGroup, NIXLAbortReq
+ from lightllm.server.router.model_infer.mode_backend.chunked_prefill.impl import ChunkedPrefillBackend
+@@ -16,6 +19,117 @@ class NIXLDecodeNode(ChunkedPrefillBackend):
+         super().__init__()
+         self.info_queue: mp.Queue = info_queue
+         self.classed_req_strict_prefill = False
++        # Disabled by default because aggressive fail-fast can turn congestion into mass timeouts.
++        self._gate_stall_timeout_s = float(os.getenv("LIGHTLLM_NIXL_GATE_STALL_TIMEOUT_S", "0"))
++        self._stats_lock = threading.Lock()
++        self._stats_last_log_time = time.time()
++        self._stats_log_interval_s = 5.0
++        self._stats_window = {
++            "req_seen": 0,
++            "abort_notify": 0,
++            "gate_continue": 0,
++            "gate_pass": 0,
++            "req_normal_finish": 0,
++            "req_forced_finish": 0,
++            "gate_stall_timeout": 0,
++            "pending_sum": 0,
++            "pending_nonzero": 0,
++            "pending_max": 0,
++        }
++        self._stats_total = {
++            "req_seen": 0,
++            "abort_notify": 0,
++            "gate_continue": 0,
++            "gate_pass": 0,
++            "req_normal_finish": 0,
++            "req_forced_finish": 0,
++            "gate_stall_timeout": 0,
++            "pending_sum": 0,
++            "pending_nonzero": 0,
++            "pending_max": 0,
++        }
++        self._last_continue_snapshot = {
++            "req_id": -1,
++            "task_num": 0,
++            "success_num": 0,
++            "failed_num": 0,
++            "gap": 0,
++        }
++
++    def _add_stats(self, delta: dict):
++        with self._stats_lock:
++            for key, value in delta.items():
++                self._stats_window[key] += value
++                self._stats_total[key] += value
++                if key == "pending_max":
++                    self._stats_window[key] = max(self._stats_window[key], value)
++                    self._stats_total[key] = max(self._stats_total[key], value)
++
++    def _record_last_continue_snapshot(
++        self,
++        req_id: int,
++        task_num: int,
++        success_num: int,
++        failed_num: int,
++        gap: int,
++    ):
++        with self._stats_lock:
++            self._last_continue_snapshot = {
++                "req_id": req_id,
++                "task_num": task_num,
++                "success_num": success_num,
++                "failed_num": failed_num,
++                "gap": gap,
++            }
++
++    def _maybe_log_stats(self):
++        now = time.time()
++        with self._stats_lock:
++            if now - self._stats_last_log_time < self._stats_log_interval_s:
++                return
++            window = self._stats_window.copy()
++            total = self._stats_total.copy()
++            last_continue = self._last_continue_snapshot.copy()
++            self._stats_window = {
++                "req_seen": 0,
++                "abort_notify": 0,
++                "gate_continue": 0,
++                "gate_pass": 0,
++                "req_normal_finish": 0,
++                "req_forced_finish": 0,
++                "gate_stall_timeout": 0,
++                "pending_sum": 0,
++                "pending_nonzero": 0,
++                "pending_max": 0,
++            }
++            self._stats_last_log_time = now
++
++        logger.warning(
++            "nixl_decode_gate_stats "
++            f"window_s={self._stats_log_interval_s:.0f} "
++            f"req_seen_w={window['req_seen']} req_seen_t={total['req_seen']} "
++            f"abort_notify_w={window['abort_notify']} abort_notify_t={total['abort_notify']} "
++            f"gate_continue_w={window['gate_continue']} gate_continue_t={total['gate_continue']} "
++            f"gate_pass_w={window['gate_pass']} gate_pass_t={total['gate_pass']} "
++            f"normal_finish_w={window['req_normal_finish']} normal_finish_t={total['req_normal_finish']} "
++            f"forced_finish_w={window['req_forced_finish']} forced_finish_t={total['req_forced_finish']} "
++            f"gate_stall_timeout_w={window['gate_stall_timeout']} gate_stall_timeout_t={total['gate_stall_timeout']} "
++            f"pending_nonzero_w={window['pending_nonzero']} pending_nonzero_t={total['pending_nonzero']} "
++            f"pending_sum_w={window['pending_sum']} pending_sum_t={total['pending_sum']} "
++            f"pending_max_w={window['pending_max']} pending_max_t={total['pending_max']} "
++            f"last_continue_req_id={last_continue['req_id']} "
++            f"last_continue_task_num={last_continue['task_num']} "
++            f"last_continue_success_num={last_continue['success_num']} "
++            f"last_continue_failed_num={last_continue['failed_num']} "
++            f"last_continue_gap={last_continue['gap']}"
++        )
++
++    def _mark_normal_finish_counted(self, req_obj: InferReq) -> bool:
++        with self._stats_lock:
++            if getattr(req_obj, "_nixl_normal_finish_stat_reported", False):
++                return False
++            req_obj._nixl_normal_finish_stat_reported = True
++            return True
+ 
+     def init_custom(self):
+         assert kv_trans_use_p2p()
+@@ -80,15 +194,80 @@ class NIXLDecodeNode(ChunkedPrefillBackend):
+         """
+         g_infer_state_lock.acquire()
+         ans_list: List[InferReq] = []
++        req_seen_count = 0
++        abort_notify_count = 0
++        gate_continue_count = 0
++        gate_pass_count = 0
++        req_normal_finish_count = 0
++        req_forced_finish_count = 0
++        gate_stall_timeout_count = 0
++        pending_sum_count = 0
++        pending_nonzero_count = 0
++        pending_max_count = 0
++        now = time.time()
+         for request_id in req_ids:
+             req_obj: InferReq = g_infer_context.requests_mapping[request_id]
++            req_seen_count += 1
++            finished_task_num = req_obj.nixl_pd_task_failed_num + req_obj.nixl_pd_task_sunccess_num
++            pending_task_num = req_obj.nixl_pd_task_num - finished_task_num
++            pending_task_num = max(0, pending_task_num)
++            pending_sum_count += pending_task_num
++            if pending_task_num > 0:
++                pending_nonzero_count += 1
++            pending_max_count = max(pending_max_count, pending_task_num)
+ 
+             if self.is_master_in_dp and req_obj.infer_aborted and req_obj.nixl_pd_task_num != 0:
+                 self.info_queue.put(NIXLAbortReq(request_id=req_obj.req_id, device_id=req_obj.nixl_trans_device_id))
++                abort_notify_count += 1
++
++            # Only block requests that still need normal decode work.
++            # Finished/failed/aborted requests should be handled immediately,
++            # otherwise they can be trapped behind unrelated pending transfer tasks.
++            req_need_gate_block = (
++                pending_task_num > 0
++                and not req_obj.finish_status.is_finished()
++                and not req_obj.infer_aborted
++                and req_obj.nixl_pd_task_failed_num == 0
++            )
+ 
+-            if req_obj.nixl_pd_task_num != (req_obj.nixl_pd_task_failed_num + req_obj.nixl_pd_task_sunccess_num):
++            if req_need_gate_block and self._gate_stall_timeout_s > 0:
++                finished_num = finished_task_num
++                last_finished_num = getattr(req_obj, "_nixl_gate_last_finished_num", -1)
++                last_progress_ts = getattr(req_obj, "_nixl_gate_last_progress_ts", now)
++                if finished_num != last_finished_num:
++                    req_obj._nixl_gate_last_finished_num = finished_num
++                    req_obj._nixl_gate_last_progress_ts = now
++                else:
++                    stall_s = now - last_progress_ts
++                    if stall_s >= self._gate_stall_timeout_s:
++                        req_obj.nixl_pd_task_failed_num = max(req_obj.nixl_pd_task_failed_num, req_obj.nixl_pd_task_num)
++                        gate_stall_timeout_count += 1
++                        logger.warning(
++                            f"req_id: {req_obj.req_id} gate stall timeout {stall_s:.3f}s >= {self._gate_stall_timeout_s:.3f}s, "
++                            f"task_num={req_obj.nixl_pd_task_num}, success={req_obj.nixl_pd_task_sunccess_num}, failed={req_obj.nixl_pd_task_failed_num}"
++                        )
++                        if self.is_master_in_dp and req_obj.nixl_pd_task_num != 0:
++                            self.info_queue.put(
++                                NIXLAbortReq(request_id=req_obj.req_id, device_id=req_obj.nixl_trans_device_id)
++                            )
++                        req_need_gate_block = False
++
++            if req_need_gate_block:
++                gate_continue_count += 1
++                self._record_last_continue_snapshot(
++                    req_id=req_obj.req_id,
++                    task_num=req_obj.nixl_pd_task_num,
++                    success_num=req_obj.nixl_pd_task_sunccess_num,
++                    failed_num=req_obj.nixl_pd_task_failed_num,
++                    gap=pending_task_num,
++                )
+                 continue
+ 
++            if hasattr(req_obj, "_nixl_gate_last_finished_num"):
++                req_obj._nixl_gate_last_finished_num = -1
++            if hasattr(req_obj, "_nixl_gate_last_progress_ts"):
++                req_obj._nixl_gate_last_progress_ts = now
++
+             if req_obj.nixl_pd_task_failed_num > 0:
+                 # 强制停止
+                 if not req_obj.finish_status.is_finished():
+@@ -103,6 +282,7 @@ class NIXLDecodeNode(ChunkedPrefillBackend):
+                         req_obj.shm_req.candetoken_out_len = req_obj.cur_output_len
+ 
+                         logger.error(f"req_id: {req_obj.req_id} forced to finished, it exits kv transfer error")
++                    req_forced_finish_count += 1
+ 
+                 # 提前释放有问题的 mem_index
+                 old_prefix_len = 0 if req_obj.shared_kv_node is None else req_obj.shared_kv_node.node_prefix_total_len
+@@ -121,9 +301,34 @@ class NIXLDecodeNode(ChunkedPrefillBackend):
+                     if self.is_master_in_dp:
+                         req_obj.shm_req.shm_cur_kv_len = req_obj.cur_kv_len
+ 
++            if (
++                req_obj.req_id > 0
++                and not req_obj.infer_aborted
++                and req_obj.nixl_pd_task_failed_num == 0
++                and req_obj.finish_status.is_finished()
++                and self._mark_normal_finish_counted(req_obj)
++            ):
++                req_normal_finish_count += 1
++
+             ans_list.append(req_obj)
++            gate_pass_count += 1
+ 
+         g_infer_state_lock.release()
++        self._add_stats(
++            {
++                "req_seen": req_seen_count,
++                "abort_notify": abort_notify_count,
++                "gate_continue": gate_continue_count,
++                "gate_pass": gate_pass_count,
++                "req_normal_finish": req_normal_finish_count,
++                "req_forced_finish": req_forced_finish_count,
++                "gate_stall_timeout": gate_stall_timeout_count,
++                "pending_sum": pending_sum_count,
++                "pending_nonzero": pending_nonzero_count,
++                "pending_max": pending_max_count,
++            }
++        )
++        self._maybe_log_stats()
+         return ans_list
+ 
+     def _decode_node_gen_trans_tasks(self, req_obj: InferReq):
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_kv_move_manager.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_kv_move_manager.py
+index 877c5c12..42923458 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_kv_move_manager.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_kv_move_manager.py
+@@ -2,6 +2,7 @@ import inspect
+ import pickle
+ import torch.multiprocessing as mp
+ import time
++import os
+ from typing import List, Dict, Optional, Tuple, Union, Callable
+ from lightllm.utils.log_utils import init_logger
+ from lightllm.server.pd_io_struct import NIXLChunckedTransTaskGroup, NIXLAbortReq
+@@ -64,8 +65,24 @@ class DecodeKVMoveManager(BaseKVMoveManager):
+             start_trans_process_func=start_trans_process_func,
+             up_status_in_queue=up_status_in_queue,
+         )
++        self._dispatch_q_max = int(os.getenv("LIGHTLLM_NIXL_DECODE_DISPATCH_Q_MAX", "512"))
++        self._dispatch_q_drop = int(os.getenv("LIGHTLLM_NIXL_DECODE_DISPATCH_Q_DROP", "1024"))
++        self._dispatch_q_warn_interval_s = 2.0
++        self._last_dispatch_q_warn_ts = 0.0
++        self._last_drop_warn_ts = 0.0
+         return
+ 
++    def _get_qsize(self, q: mp.Queue) -> int:
++        try:
++            return q.qsize()
++        except BaseException:
++            return -1
++
++    def _drop_group_with_error(self, task_group: NIXLChunckedTransTaskGroup, reason: str):
++        for task in task_group.task_list:
++            task.error_info = reason
++            self.ret_obj_queue.put(task.createRetObj())
++
+     # ==================================================================================
+     # 主任务循环，接收需要进行kv传输的请求, 转发给 KV_TRANS_PROCESS
+     # ==================================================================================
+@@ -84,6 +101,36 @@ class DecodeKVMoveManager(BaseKVMoveManager):
+ 
+             try:
+                 trans_process: KVTransProcess = self.kv_trans_processes[device_id]
++
++                if isinstance(task_group, NIXLChunckedTransTaskGroup):
++                    qsize = self._get_qsize(trans_process.task_in_queue)
++                    if qsize >= self._dispatch_q_drop > 0:
++                        now = time.time()
++                        if now - self._last_drop_warn_ts >= self._dispatch_q_warn_interval_s:
++                            self._last_drop_warn_ts = now
++                            logger.warning(
++                                f"decode dispatch overload drop device={device_id} qsize={qsize} "
++                                f"drop_limit={self._dispatch_q_drop} group_reqs={len(task_group.task_list)}"
++                            )
++                        self._drop_group_with_error(
++                            task_group,
++                            reason=f"decode dispatch overload drop qsize={qsize} limit={self._dispatch_q_drop}",
++                        )
++                        continue
++
++                # Backpressure: prevent unbounded queue growth under burst load.
++                while isinstance(task_group, NIXLChunckedTransTaskGroup):
++                    qsize = self._get_qsize(trans_process.task_in_queue)
++                    if qsize < 0 or qsize < self._dispatch_q_max:
++                        break
++                    now = time.time()
++                    if now - self._last_dispatch_q_warn_ts >= self._dispatch_q_warn_interval_s:
++                        self._last_dispatch_q_warn_ts = now
++                        logger.warning(
++                            f"decode dispatch backpressure device={device_id} qsize={qsize} limit={self._dispatch_q_max}"
++                        )
++                    time.sleep(0.001)
++
+                 trans_process.task_in_queue.put(task_group)
+                 if isinstance(task_group, NIXLChunckedTransTaskGroup):
+                     logger.info(
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_trans_process.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_trans_process.py
+index b04cbb90..67750784 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_trans_process.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/decode_trans_process.py
+@@ -116,6 +116,47 @@ class _DecodeTransModule:
+         self.success_queue = queue.Queue()
+         self.failed_queue = queue.Queue()
+ 
++        self._stats_lock = threading.Lock()
++        self._stats_last_log_time = time.time()
++        self._stats_log_interval_s = 5.0
++        self._stats_window = {
++            "recv_task_group": 0,
++            "recv_abort": 0,
++            "dispatch_task": 0,
++            "up_status_put": 0,
++            "up_status_put_slow": 0,
++            "up_status_put_ms_sum": 0.0,
++            "up_status_put_ms_max": 0.0,
++            "peer_task_recv": 0,
++            "peer_task_not_find": 0,
++            "timeout_accept": 0,
++            "timeout_read_peer": 0,
++            "timeout_update_status": 0,
++            "status_done": 0,
++            "status_err": 0,
++            "ret_success": 0,
++            "ret_fail": 0,
++        }
++        self._stats_total = {
++            "recv_task_group": 0,
++            "recv_abort": 0,
++            "dispatch_task": 0,
++            "up_status_put": 0,
++            "up_status_put_slow": 0,
++            "up_status_put_ms_sum": 0.0,
++            "up_status_put_ms_max": 0.0,
++            "peer_task_recv": 0,
++            "peer_task_not_find": 0,
++            "timeout_accept": 0,
++            "timeout_read_peer": 0,
++            "timeout_update_status": 0,
++            "status_done": 0,
++            "status_err": 0,
++            "ret_success": 0,
++            "ret_fail": 0,
++        }
++        self._last_timeout_req_id = -1
++
+         self.page_index_queue = queue.Queue()
+         for page_index in range(self.args.nixl_pd_kv_page_num):
+             self.page_index_queue.put(page_index)
+@@ -133,16 +174,95 @@ class _DecodeTransModule:
+             threading.Thread(target=func, daemon=True).start()
+         return
+ 
++    def _add_stats(self, delta: dict, timeout_req_id: int = -1):
++        with self._stats_lock:
++            for key, value in delta.items():
++                if key in ["up_status_put_ms_max"]:
++                    self._stats_window[key] = max(self._stats_window[key], value)
++                    self._stats_total[key] = max(self._stats_total[key], value)
++                else:
++                    self._stats_window[key] += value
++                    self._stats_total[key] += value
++            if timeout_req_id >= 0:
++                self._last_timeout_req_id = timeout_req_id
++
++    def _safe_qsize(self, q: queue.Queue) -> int:
++        try:
++            return q.qsize()
++        except BaseException:
++            return -1
++
++    def _maybe_log_stats(self):
++        now = time.time()
++        with self._stats_lock:
++            if now - self._stats_last_log_time < self._stats_log_interval_s:
++                return
++            window = self._stats_window.copy()
++            total = self._stats_total.copy()
++            last_timeout_req_id = self._last_timeout_req_id
++            self._stats_window = {
++                "recv_task_group": 0,
++                "recv_abort": 0,
++                "dispatch_task": 0,
++                "up_status_put": 0,
++                "up_status_put_slow": 0,
++                "up_status_put_ms_sum": 0.0,
++                "up_status_put_ms_max": 0.0,
++                "peer_task_recv": 0,
++                "peer_task_not_find": 0,
++                "timeout_accept": 0,
++                "timeout_read_peer": 0,
++                "timeout_update_status": 0,
++                "status_done": 0,
++                "status_err": 0,
++                "ret_success": 0,
++                "ret_fail": 0,
++            }
++            self._stats_last_log_time = now
++
++        with self.waiting_dict_lock:
++            waiting_len = len(self.waiting_dict)
++
++        logger.warning(
++            "nixl_decode_trans_stats "
++            f"\nwindow_s={self._stats_log_interval_s:.0f} "
++            f"\nrecv_task_group_w={window['recv_task_group']} recv_task_group_t={total['recv_task_group']} "
++            f"\nrecv_abort_w={window['recv_abort']} recv_abort_t={total['recv_abort']} "
++            f"\ndispatch_task_w={window['dispatch_task']} dispatch_task_t={total['dispatch_task']} "
++            f"\nup_status_put_slow_w={window['up_status_put_slow']} up_status_put_slow_t={total['up_status_put_slow']} "
++            f"\nup_status_put_ms_sum_w={window['up_status_put_ms_sum']:.3f} up_status_put_ms_sum_t={total['up_status_put_ms_sum']:.3f} "
++            f"\nup_status_put_ms_max_w={window['up_status_put_ms_max']:.3f} up_status_put_ms_max_t={total['up_status_put_ms_max']:.3f} "
++            f"\npeer_task_recv_w={window['peer_task_recv']} peer_task_recv_t={total['peer_task_recv']} "
++            f"\npeer_task_not_find_w={window['peer_task_not_find']} peer_task_not_find_t={total['peer_task_not_find']} "
++            f"\ntimeout_accept_w={window['timeout_accept']} timeout_accept_t={total['timeout_accept']} "
++            f"\nstatus_done_w={window['status_done']} status_done_t={total['status_done']} "
++            f"\nstatus_err_w={window['status_err']} status_err_t={total['status_err']} "
++            f"\nret_success_w={window['ret_success']} ret_success_t={total['ret_success']} "
++            f"\nret_fail_w={window['ret_fail']} ret_fail_t={total['ret_fail']} "
++            f"\nwaiting_dict_len={waiting_len} "
++            f"\nrecv_task_group_queue_len={self._safe_qsize(self.recv_task_group_queue)} "
++            f"\nread_peer_kv_queue_len={self._safe_qsize(self.read_peer_kv_queue)} "
++            f"\nupdate_status_task_queue_len={self._safe_qsize(self.update_status_task_queue)} "
++            f"\nready_page_task_queue_len={self._safe_qsize(self.ready_page_task_queue)} "
++            f"\nsuccess_queue_len={self._safe_qsize(self.success_queue)} "
++            f"\nfailed_queue_len={self._safe_qsize(self.failed_queue)} "
++            f"\nup_status_in_queue_len={self._safe_qsize(self.up_status_in_queue)} "
++            f"\nlast_timeout_req_id={last_timeout_req_id}"
++        )
++
+     @log_exception
+     def recv_task_loop(self):
+         while True:
+             obj: Union[NIXLChunckedTransTaskGroup, NIXLAbortReq] = self.task_in_queue.get()
+             if isinstance(obj, NIXLChunckedTransTaskGroup):
+                 self.recv_task_group_queue.put(obj)
++                self._add_stats({"recv_task_group": 1})
+             elif isinstance(obj, NIXLAbortReq):
+                 self._abort(cmd=obj)
++                self._add_stats({"recv_abort": 1})
+             else:
+                 assert False, f"recv error obj {obj}"
++            self._maybe_log_stats()
+ 
+     def _abort(self, cmd: NIXLAbortReq):
+         # check time_out update
+@@ -167,11 +287,13 @@ class _DecodeTransModule:
+     def dispatch_task_loop(self):
+         while True:
+             trans_task_group: NIXLChunckedTransTaskGroup = self.recv_task_group_queue.get()
++            dispatch_cnt = 0
+ 
+             with self.waiting_dict_lock:
+                 for task in trans_task_group.task_list:
+                     if task.transfer_kv_num() != 0:
+                         self.waiting_dict[task.get_key()] = task
++                        dispatch_cnt += 1
+                     else:
+                         task.start_trans_time = time.time()
+                         self.success_queue.put((None, task))
+@@ -196,7 +318,19 @@ class _DecodeTransModule:
+                 nixl_params=pickle.dumps(decode_node_info),
+             )
+ 
++            put_start = time.perf_counter()
+             self.up_status_in_queue.put(up_status)
++            put_ms = (time.perf_counter() - put_start) * 1000.0
++            self._add_stats(
++                {
++                    "dispatch_task": dispatch_cnt,
++                    "up_status_put": 1,
++                    "up_status_put_slow": 1 if put_ms >= 5.0 else 0,
++                    "up_status_put_ms_sum": put_ms,
++                    "up_status_put_ms_max": put_ms,
++                }
++            )
++            self._maybe_log_stats()
+ 
+     @log_exception
+     def accept_peer_task_loop(
+@@ -226,12 +360,14 @@ class _DecodeTransModule:
+ 
+                         if isinstance(notify_obj, NIXLChunckedTransTask):
+                             remote_trans_task = notify_obj
++                            self._add_stats({"peer_task_recv": 1})
+                             key = remote_trans_task.get_key()
+                             logger.info(f"recv peer trans task {remote_trans_task.to_str()}")
+                             with self.waiting_dict_lock:
+                                 local_trans_task: NIXLChunckedTransTask = self.waiting_dict.pop(key, None)
+ 
+                             if local_trans_task is None:
++                                self._add_stats({"peer_task_not_find": 1})
+                                 remote_trans_task.error_info = "peer not find"
+                                 try:
+                                     self.transporter.send_notify_to_prefill_node(
+@@ -254,6 +390,7 @@ class _DecodeTransModule:
+                                 local_trans_task.first_gen_token_logprob = remote_trans_task.first_gen_token_logprob
+ 
+                                 self.read_peer_kv_queue.put(local_trans_task)
++                self._maybe_log_stats()
+ 
+             self._check_tasks_time_out()
+ 
+@@ -269,8 +406,10 @@ class _DecodeTransModule:
+             if trans_task is not None and trans_task.time_out():
+                 trans_task.error_info = "time out in accept_peer_task_loop"
+                 self.failed_queue.put(trans_task)
++                self._add_stats({"timeout_accept": 1}, timeout_req_id=trans_task.request_id)
+                 continue
+ 
++
+             if trans_task is not None:
+                 with self.waiting_dict_lock:
+                     self.waiting_dict[trans_task.get_key()] = trans_task
+@@ -288,6 +427,7 @@ class _DecodeTransModule:
+             if local_trans_task.time_out():
+                 local_trans_task.error_info = "time out in read_peer_kv_loop"
+                 self.failed_queue.put(local_trans_task)
++                self._add_stats({"timeout_read_peer": 1}, timeout_req_id=local_trans_task.request_id)
+                 continue
+ 
+             try:
+@@ -301,7 +441,9 @@ class _DecodeTransModule:
+                 self.transporter.remove_remote_agent(peer_name=local_trans_task.prefill_agent_name)
+                 local_trans_task.error_info = f"read_blocks_paged failed: {str(e)}"
+                 self.failed_queue.put(local_trans_task)
++                self._add_stats({"timeout_read_peer": 1}, timeout_req_id=local_trans_task.request_id)
+                 continue
++            self._maybe_log_stats()
+ 
+     @log_exception
+     def update_task_status_loop(
+@@ -314,17 +456,21 @@ class _DecodeTransModule:
+                 ret = self.transporter.check_task_status(trans_task=trans_task)
+                 if ret == "DONE":
+                     self.ready_page_task_queue.put(trans_task)
++                    self._add_stats({"status_done": 1})
+                     break
+                 elif ret == "ERR":
+                     trans_task.error_info = "xfer error"
+                     self.failed_queue.put(trans_task)
++                    self._add_stats({"status_err": 1}, timeout_req_id=trans_task.request_id)
+                     break
+                 elif trans_task.time_out():
+                     trans_task.error_info = "time out in update_task_status_loop"
+                     self.failed_queue.put(trans_task)
++                    self._add_stats({"timeout_update_status": 1}, timeout_req_id=trans_task.request_id)
+                     break
+ 
+                 time.sleep(0.001)
++            self._maybe_log_stats()
+ 
+     @log_exception
+     def read_page_to_mems_loop(self):
+@@ -366,6 +512,8 @@ class _DecodeTransModule:
+ 
+             ret = trans_task.createRetObj()
+             self.task_out_queue.put(ret)
++            self._add_stats({"ret_success": 1})
++            self._maybe_log_stats()
+             logger.info(f"trans task ret success:{ret} cost time: {trans_task.transfer_time()} s")
+ 
+     @log_exception
+@@ -381,4 +529,6 @@ class _DecodeTransModule:
+                 self.transporter.release_xfer_handle(trans_task.xfer_handle)
+             ret = trans_task.createRetObj()
+             self.task_out_queue.put(ret)
++            self._add_stats({"ret_fail": 1}, timeout_req_id=trans_task.request_id)
++            self._maybe_log_stats()
+             logger.info(f"trans task ret fail:{ret}")
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/up_status.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/up_status.py
+index f79fb4ea..9876c38f 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/up_status.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/decode_node_impl/up_status.py
+@@ -21,9 +21,87 @@ class UpStatusManager:
+     def __init__(self, args, task_in_queue: mp.SimpleQueue):
+         self.args = args
+         self.task_queue: mp.SimpleQueue[Union[UpKVStatus, NixlUpKVStatus]] = task_in_queue
++        self._stats_lock = threading.Lock()
++        self._stats_last_log_time = time.time()
++        self._stats_log_interval_s = 5.0
++        self._stats_window = {
++            "dispatch_get": 0,
++            "dispatch_put": 0,
++            "dispatch_drop": 0,
++            "send_ok": 0,
++            "send_fail": 0,
++            "send_ms_sum": 0.0,
++            "send_ms_max": 0.0,
++            "send_ms_slow": 0,
++        }
++        self._stats_total = {
++            "dispatch_get": 0,
++            "dispatch_put": 0,
++            "dispatch_drop": 0,
++            "send_ok": 0,
++            "send_fail": 0,
++            "send_ms_sum": 0.0,
++            "send_ms_max": 0.0,
++            "send_ms_slow": 0,
++        }
+         self.daemon_thread = threading.Thread(target=self.thread_loop, daemon=True)
+         self.daemon_thread.start()
+ 
++    def _add_stats(self, delta: dict):
++        with self._stats_lock:
++            for key, value in delta.items():
++                if key in ["send_ms_max"]:
++                    self._stats_window[key] = max(self._stats_window[key], value)
++                    self._stats_total[key] = max(self._stats_total[key], value)
++                else:
++                    self._stats_window[key] += value
++                    self._stats_total[key] += value
++
++    def _safe_qsize(self, q) -> int:
++        try:
++            return q.qsize()
++        except BaseException:
++            return -1
++
++    def _maybe_log_stats(self):
++        now = time.time()
++        with self._stats_lock:
++            if now - self._stats_last_log_time < self._stats_log_interval_s:
++                return
++            window = self._stats_window.copy()
++            total = self._stats_total.copy()
++            self._stats_window = {
++                "dispatch_get": 0,
++                "dispatch_put": 0,
++                "dispatch_drop": 0,
++                "send_ok": 0,
++                "send_fail": 0,
++                "send_ms_sum": 0.0,
++                "send_ms_max": 0.0,
++                "send_ms_slow": 0,
++            }
++            self._stats_last_log_time = now
++
++        node_queue_lens = []
++        for node_id, q in self.id_to_handle_queue.items():
++            node_queue_lens.append(f"{node_id}:{self._safe_qsize(q)}")
++        node_queue_lens_str = ",".join(node_queue_lens)
++
++        logger.warning(
++            "nixl_up_status_stats "
++            f"\nwindow_s={self._stats_log_interval_s:.0f} "
++            f"\ndispatch_get_w={window['dispatch_get']} dispatch_get_t={total['dispatch_get']} "
++            f"\ndispatch_put_w={window['dispatch_put']} dispatch_put_t={total['dispatch_put']} "
++            f"\ndispatch_drop_w={window['dispatch_drop']} dispatch_drop_t={total['dispatch_drop']} "
++            f"\nsend_ok_w={window['send_ok']} send_ok_t={total['send_ok']} "
++            f"\nsend_fail_w={window['send_fail']} send_fail_t={total['send_fail']} "
++            f"\nsend_ms_sum_w={window['send_ms_sum']:.3f} send_ms_sum_t={total['send_ms_sum']:.3f} "
++            f"\nsend_ms_max_w={window['send_ms_max']:.3f} send_ms_max_t={total['send_ms_max']:.3f} "
++            f"\nsend_ms_slow_w={window['send_ms_slow']} send_ms_slow_t={total['send_ms_slow']} "
++            f"\ninput_queue_len={self._safe_qsize(self.task_queue)} "
++            f"\nper_node_queue_len={node_queue_lens_str}"
++        )
++
+     def thread_loop(self):
+         asyncio.run(self.task_loop())
+ 
+@@ -65,10 +143,14 @@ class UpStatusManager:
+             try:
+                 loop = asyncio.get_event_loop()
+                 upkv_status: UpKVStatus = await loop.run_in_executor(None, self.task_queue.get)
++                self._add_stats({"dispatch_get": 1})
+                 if upkv_status.pd_master_node_id in self.id_to_handle_queue:
+                     await self.id_to_handle_queue[upkv_status.pd_master_node_id].put(upkv_status)
++                    self._add_stats({"dispatch_put": 1})
+                 else:
+                     logger.warning(f"upstatus {upkv_status} no connection to pd_master, drop it")
++                    self._add_stats({"dispatch_drop": 1})
++                self._maybe_log_stats()
+             except BaseException as e:
+                 logger.exception(str(e))
+                 await asyncio.sleep(10)
+@@ -88,11 +170,24 @@ class UpStatusManager:
+                             if pd_master_obj.node_id in self.id_to_handle_queue:
+                                 task_queue = self.id_to_handle_queue[pd_master_obj.node_id]
+                                 upkv_status: Union[UpKVStatus, NixlUpKVStatus] = await task_queue.get()
++                                send_start = time.perf_counter()
+                                 await websocket.send(pickle.dumps(upkv_status))
++                                send_ms = (time.perf_counter() - send_start) * 1000.0
++                                self._add_stats(
++                                    {
++                                        "send_ok": 1,
++                                        "send_ms_sum": send_ms,
++                                        "send_ms_max": send_ms,
++                                        "send_ms_slow": 1 if send_ms >= 5.0 else 0,
++                                    }
++                                )
++                                self._maybe_log_stats()
+                                 logger.info(f"up kv status: {upkv_status}")
+                             else:
+                                 await asyncio.sleep(3)
+                         except BaseException as e:
++                            self._add_stats({"send_fail": 1})
++                            self._maybe_log_stats()
+                             logger.error(str(e))
+                             raise e
+             except asyncio.CancelledError:
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_kv_move_manager.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_kv_move_manager.py
+index ac8026e5..a5010348 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_kv_move_manager.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_kv_move_manager.py
+@@ -1,6 +1,7 @@
+ import inspect
+ import torch.multiprocessing as mp
+ import time
++import os
+ from typing import List, Dict, Union, Callable
+ from lightllm.utils.log_utils import init_logger
+ from lightllm.server.pd_io_struct import NIXLChunckedTransTask
+@@ -44,8 +45,19 @@ def _init_env(args, info_queue: mp.Queue, event: mp.Event):
+ class PrefillKVMoveManager(BaseKVMoveManager):
+     def __init__(self, args: StartArgs, info_queue: mp.Queue, start_trans_process_func: Callable):
+         super().__init__(args=args, info_queue=info_queue, start_trans_process_func=start_trans_process_func)
++        self._dispatch_q_max = int(os.getenv("LIGHTLLM_NIXL_PREFILL_DISPATCH_Q_MAX", "512"))
++        self._dispatch_q_drop = int(os.getenv("LIGHTLLM_NIXL_PREFILL_DISPATCH_Q_DROP", "1024"))
++        self._dispatch_q_warn_interval_s = 2.0
++        self._last_dispatch_q_warn_ts = 0.0
++        self._last_drop_warn_ts = 0.0
+         return
+ 
++    def _get_qsize(self, q: mp.Queue) -> int:
++        try:
++            return q.qsize()
++        except BaseException:
++            return -1
++
+     # ==================================================================================
+     # 主任务循环，接收需要进行kv传输的请求, 转发给 KV_TRANS_PROCESS
+     # ==================================================================================
+@@ -58,6 +70,31 @@ class PrefillKVMoveManager(BaseKVMoveManager):
+             device_id = task.src_device_id
+             try:
+                 trans_process: KVTransProcess = self.kv_trans_processes[device_id]
++
++                qsize = self._get_qsize(trans_process.task_in_queue)
++                if qsize >= self._dispatch_q_drop > 0:
++                    now = time.time()
++                    if now - self._last_drop_warn_ts >= self._dispatch_q_warn_interval_s:
++                        self._last_drop_warn_ts = now
++                        logger.warning(
++                            f"prefill dispatch overload drop device={device_id} qsize={qsize} "
++                            f"drop_limit={self._dispatch_q_drop} req={task.request_id}"
++                        )
++                    task.error_info = f"prefill dispatch overload drop qsize={qsize} limit={self._dispatch_q_drop}"
++                    self.ret_obj_queue.put(task.createRetObj())
++                    continue
++
++                while qsize >= self._dispatch_q_max > 0:
++                    now = time.time()
++                    if now - self._last_dispatch_q_warn_ts >= self._dispatch_q_warn_interval_s:
++                        self._last_dispatch_q_warn_ts = now
++                        logger.warning(
++                            f"prefill dispatch backpressure device={device_id} qsize={qsize} "
++                            f"limit={self._dispatch_q_max} req={task.request_id}"
++                        )
++                    time.sleep(0.001)
++                    qsize = self._get_qsize(trans_process.task_in_queue)
++
+                 trans_process.task_in_queue.put(task)
+                 logger.info(f"kv move manager dispatch task {task.to_str()} to device {device_id}")
+             except BaseException as e:
+diff --git a/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_trans_process.py b/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_trans_process.py
+index 063ce5c6..893f18d7 100644
+--- a/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_trans_process.py
++++ b/lightllm/server/router/model_infer/mode_backend/pd_nixl/prefill_node_impl/prefill_trans_process.py
+@@ -105,6 +105,31 @@ class _PrefillTransModule:
+         self.success_queue = queue.Queue()
+         self.failed_queue = queue.Queue()
+ 
++        self._stats_lock = threading.Lock()
++        self._stats_last_log_time = time.time()
++        self._stats_log_interval_s = 5.0
++        self._stats_window = {
++            "recv_task": 0,
++            "send_readtask_ok": 0,
++            "send_readtask_fail": 0,
++            "ret_recv": 0,
++            "ret_not_find": 0,
++            "timeout_update": 0,
++            "ret_success": 0,
++            "ret_fail": 0,
++        }
++        self._stats_total = {
++            "recv_task": 0,
++            "send_readtask_ok": 0,
++            "send_readtask_fail": 0,
++            "ret_recv": 0,
++            "ret_not_find": 0,
++            "timeout_update": 0,
++            "ret_success": 0,
++            "ret_fail": 0,
++        }
++        self._last_timeout_req_id = -1
++
+         self.page_index_queue = queue.Queue()
+         for page_index in range(self.args.nixl_pd_kv_page_num):
+             self.page_index_queue.put(page_index)
+@@ -120,6 +145,63 @@ class _PrefillTransModule:
+             threading.Thread(target=func, daemon=True).start()
+         return
+ 
++    def _add_stats(self, delta: dict, timeout_req_id: int = -1):
++        with self._stats_lock:
++            for key, value in delta.items():
++                self._stats_window[key] += value
++                self._stats_total[key] += value
++            if timeout_req_id >= 0:
++                self._last_timeout_req_id = timeout_req_id
++
++    def _safe_qsize(self, q: queue.Queue) -> int:
++        try:
++            return q.qsize()
++        except BaseException:
++            return -1
++
++    def _maybe_log_stats(self):
++        now = time.time()
++        with self._stats_lock:
++            if now - self._stats_last_log_time < self._stats_log_interval_s:
++                return
++            window = self._stats_window.copy()
++            total = self._stats_total.copy()
++            last_timeout_req_id = self._last_timeout_req_id
++            self._stats_window = {
++                "recv_task": 0,
++                "send_readtask_ok": 0,
++                "send_readtask_fail": 0,
++                "ret_recv": 0,
++                "ret_not_find": 0,
++                "timeout_update": 0,
++                "ret_success": 0,
++                "ret_fail": 0,
++            }
++            self._stats_last_log_time = now
++
++        with self.waiting_dict_lock:
++            waiting_len = len(self.waiting_dict)
++
++        logger.warning(
++            "nixl_prefill_trans_stats "
++            f"\nwindow_s={self._stats_log_interval_s:.0f} "
++            f"\nrecv_task_w={window['recv_task']} recv_task_t={total['recv_task']} "
++            f"\nsend_readtask_ok_w={window['send_readtask_ok']} send_readtask_ok_t={total['send_readtask_ok']} "
++            f"\nsend_readtask_fail_w={window['send_readtask_fail']} send_readtask_fail_t={total['send_readtask_fail']} "
++            f"\nret_recv_w={window['ret_recv']} ret_recv_t={total['ret_recv']} "
++            f"\nret_not_find_w={window['ret_not_find']} ret_not_find_t={total['ret_not_find']} "
++            f"\ntimeout_update_w={window['timeout_update']} timeout_update_t={total['timeout_update']} "
++            f"\nret_success_w={window['ret_success']} ret_success_t={total['ret_success']} "
++            f"\nret_fail_w={window['ret_fail']} ret_fail_t={total['ret_fail']} "
++            f"\nwaiting_dict_len={waiting_len} "
++            f"\nlocal_copy_kv_queue_len={self._safe_qsize(self.local_copy_kv_queue)} "
++            f"\nnotify_peer_read_kv_queue_len={self._safe_qsize(self.notify_peer_read_kv_queue)} "
++            f"\nsuccess_queue_len={self._safe_qsize(self.success_queue)} "
++            f"\nfailed_queue_len={self._safe_qsize(self.failed_queue)} "
++            f"\npage_index_queue_len={self._safe_qsize(self.page_index_queue)} "
++            f"\nlast_timeout_req_id={last_timeout_req_id}"
++        )
++
+     @log_exception
+     def recv_task_loop(self):
+         torch.cuda.set_device(self.device_id)
+@@ -127,6 +209,7 @@ class _PrefillTransModule:
+         while True:
+             page_index = self.page_index_queue.get()
+             trans_task: NIXLChunckedTransTask = self.task_in_queue.get()
++            self._add_stats({"recv_task": 1})
+             trans_task.nixl_src_page_index = page_index
+ 
+             # 初次校验 time out
+@@ -135,6 +218,7 @@ class _PrefillTransModule:
+                 self.failed_queue.put(trans_task)
+             else:
+                 self.local_copy_kv_queue.put(trans_task)
++            self._maybe_log_stats()
+ 
+     @log_exception
+     def local_copy_kv_loop(self):
+@@ -174,6 +258,7 @@ class _PrefillTransModule:
+ 
+             try:
+                 self.transporter.send_readtask_to_decode_node(trans_task=trans_task)
++                self._add_stats({"send_readtask_ok": 1})
+             except BaseException as e:
+                 logger.error(f"send readtask to decode node failed: {trans_task.to_str()}")
+                 logger.exception(str(e))
+@@ -185,9 +270,12 @@ class _PrefillTransModule:
+                 if trans_task is not None:
+                     trans_task.error_info = f"send readtask to decode node failed: {str(e)}"
+                     self.failed_queue.put(trans_task)
++                self._add_stats({"send_readtask_fail": 1}, timeout_req_id=trans_task.request_id if trans_task else -1)
++                self._maybe_log_stats()
+                 continue
+ 
+             logger.info(f"send readtask to decode: {trans_task.to_str()}")
++            self._maybe_log_stats()
+         return
+ 
+     @log_exception
+@@ -216,6 +304,7 @@ class _PrefillTransModule:
+                             notify_obj = None
+ 
+                         if isinstance(notify_obj, NIXLChunckedTransTaskRet):
++                            self._add_stats({"ret_recv": 1})
+                             key = notify_obj.get_key()
+                             with self.waiting_dict_lock:
+                                 trans_task = self.waiting_dict.pop(key, None)
+@@ -228,6 +317,8 @@ class _PrefillTransModule:
+                                     self.success_queue.put(trans_task)
+                             else:
+                                 logger.warning(f"can not find trans task for ret: {notify_obj}")
++                                self._add_stats({"ret_not_find": 1})
++                self._maybe_log_stats()
+ 
+             # check time_out update
+             self._check_tasks_time_out()
+@@ -243,6 +334,7 @@ class _PrefillTransModule:
+             if trans_task is not None and trans_task.time_out():
+                 trans_task.error_info = "time out in update_task_status_loop"
+                 self.failed_queue.put(trans_task)
++                self._add_stats({"timeout_update": 1}, timeout_req_id=trans_task.request_id)
+                 continue
+ 
+             if trans_task is not None:
+@@ -263,6 +355,8 @@ class _PrefillTransModule:
+             ret.first_gen_token_id = None
+             ret.first_gen_token_logprob = None
+             self.task_out_queue.put(ret)
++            self._add_stats({"ret_success": 1})
++            self._maybe_log_stats()
+             logger.info(f"trans task ret success:{ret} cost time: {trans_task.transfer_time()}s")
+ 
+     @log_exception
+@@ -277,4 +371,6 @@ class _PrefillTransModule:
+ 
+             ret = trans_task.createRetObj()
+             self.task_out_queue.put(ret)
++            self._add_stats({"ret_fail": 1}, timeout_req_id=trans_task.request_id)
++            self._maybe_log_stats()
+             logger.info(f"trans task ret fail:{ret}")
+diff --git a/tools/analyze_nixl_stats.py b/tools/analyze_nixl_stats.py
+new file mode 100644
+index 00000000..4b4cdef6
+--- /dev/null
++++ b/tools/analyze_nixl_stats.py
+@@ -0,0 +1,295 @@
++#!/usr/bin/env python3
++import argparse
++import datetime as dt
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Dict, List, Optional, Tuple
++
++
++HEADER_RE = re.compile(
++    r"^(?P<level>[A-Z]+)\s+"
++    r"(?P<mon>\d{2})-(?P<day>\d{2})\s+"
++    r"(?P<time>\d{2}:\d{2}:\d{2})\s+"
++    r"\[(?P<src>[^\]]+)\]\s+"
++    r"(?P<msg>.*)$"
++)
++
++KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
++
++
++@dataclass
++class StatsRecord:
++    kind: str
++    ts: dt.datetime
++    src: str
++    fields: Dict[str, str] = field(default_factory=dict)
++
++    def get_int(self, key: str) -> Optional[int]:
++        val = self.fields.get(key)
++        if val is None:
++            return None
++        try:
++            return int(float(val))
++        except Exception:
++            return None
++
++
++def parse_ts(year: int, mon: str, day: str, hhmmss: str) -> dt.datetime:
++    hh, mm, ss = hhmmss.split(":")
++    return dt.datetime(year, int(mon), int(day), int(hh), int(mm), int(ss))
++
++
++def parse_records(log_path: Path, year: int) -> Dict[str, List[StatsRecord]]:
++    target_kinds = {
++        "nixl_decode_gate_stats",
++        "nixl_trans_ret_stats",
++        "nixl_decode_trans_stats",
++        "nixl_up_status_stats",
++        "nixl_prefill_trans_stats",
++    }
++
++    out: Dict[str, List[StatsRecord]] = {k: [] for k in target_kinds}
++    current: Optional[StatsRecord] = None
++
++    with log_path.open("r", encoding="utf-8", errors="ignore") as f:
++        for raw in f:
++            line = raw.rstrip("\n")
++            m = HEADER_RE.match(line)
++            if not m:
++                continue
++
++            ts = parse_ts(year, m.group("mon"), m.group("day"), m.group("time"))
++            src = m.group("src")
++            msg = m.group("msg").strip()
++
++            matched_kind: Optional[str] = None
++            for kind in target_kinds:
++                if msg == kind or msg.startswith(kind + " "):
++                    matched_kind = kind
++                    break
++
++            if matched_kind is not None:
++                if current is not None:
++                    out[current.kind].append(current)
++
++                current = StatsRecord(kind=matched_kind, ts=ts, src=src, fields={})
++
++                # Some logs keep all fields on the same line as the stats kind.
++                rest = msg[len(matched_kind) :].strip()
++                if rest:
++                    for k, v in KV_RE.findall(rest):
++                        current.fields[k] = v
++                continue
++
++            if current is None:
++                continue
++
++            if ts != current.ts or src != current.src:
++                out[current.kind].append(current)
++                current = None
++                continue
++
++            for k, v in KV_RE.findall(msg):
++                current.fields[k] = v
++
++    if current is not None:
++        out[current.kind].append(current)
++
++    return out
++
++
++def nearest_record(records: List[StatsRecord], ts: dt.datetime, max_gap_s: int) -> Optional[StatsRecord]:
++    if not records:
++        return None
++    best: Optional[Tuple[int, StatsRecord]] = None
++    for rec in records:
++        gap = abs(int((rec.ts - ts).total_seconds()))
++        if gap <= max_gap_s and (best is None or gap < best[0]):
++            best = (gap, rec)
++    return None if best is None else best[1]
++
++
++def diagnose(
++    gate: Optional[StatsRecord],
++    ret: Optional[StatsRecord],
++    trans: Optional[StatsRecord],
++    up: Optional[StatsRecord],
++    prefill: Optional[StatsRecord],
++) -> str:
++    if gate is None:
++        return "no_gate_stats"
++
++    gc = gate.get_int("gate_continue_w") or 0
++    gp = gate.get_int("gate_pass_w") or 0
++
++    if gc > 0 and gp == 0:
++        if ret is not None:
++            ret_seen = ret.get_int("ret_seen_w") or 0
++            if ret_seen == 0:
++                return "gate_all_blocked_and_no_ret_flow"
++            if ret_seen < 10:
++                return "gate_blocked_ret_flow_very_low"
++
++        if trans is not None:
++            peer_recv = trans.get_int("peer_task_recv_w") or 0
++            dispatch = trans.get_int("dispatch_task_w") or 0
++            waiting = trans.get_int("waiting_dict_len") or 0
++            if peer_recv == 0 and waiting > 0:
++                if prefill is not None:
++                    send_ok = prefill.get_int("send_readtask_ok_w") or 0
++                    send_fail = prefill.get_int("send_readtask_fail_w") or 0
++                    pre_waiting = prefill.get_int("waiting_dict_len") or 0
++                    if send_ok == 0 and send_fail > 0:
++                        return "prefill_send_readtask_failed"
++                    if send_ok == 0 and pre_waiting > 0:
++                        return "prefill_readtask_not_sent"
++                return "decode_waiting_peer_tasks"
++            if dispatch == 0 and waiting > 0:
++                return "decode_dispatch_stalled"
++
++        if up is not None:
++            send_fail = up.get_int("send_fail_w") or 0
++            send_slow = up.get_int("send_ms_slow_w") or 0
++            if send_fail > 0:
++                return "up_status_send_failed"
++            if send_slow > 0:
++                return "up_status_send_slow"
++
++        return "gate_blocked_unknown"
++
++    return "not_fully_blocked"
++
++
++def diagnose_prefill(
++    prefill: Optional[StatsRecord],
++    ret: Optional[StatsRecord],
++    trans: Optional[StatsRecord],
++    up: Optional[StatsRecord],
++) -> str:
++    if prefill is None:
++        return "no_prefill_stats"
++
++    recv_task = prefill.get_int("recv_task_w") or 0
++    send_ok = prefill.get_int("send_readtask_ok_w") or 0
++    send_fail = prefill.get_int("send_readtask_fail_w") or 0
++    ret_recv = prefill.get_int("ret_recv_w") or 0
++    waiting = prefill.get_int("waiting_dict_len") or 0
++    timeout_update = prefill.get_int("timeout_update_w") or 0
++
++    if send_fail > 0:
++        return "prefill_send_readtask_failed"
++    if timeout_update > 0:
++        return "prefill_timeout_update"
++    if recv_task > 0 and send_ok == 0 and send_fail == 0:
++        return "prefill_readtask_not_sent_yet"
++    if send_ok > 0 and ret_recv == 0 and waiting > 0:
++        return "prefill_waiting_decode_ret"
++
++    if ret is not None:
++        ret_seen = ret.get_int("ret_seen_w") or 0
++        if send_ok > 0 and ret_seen == 0:
++            return "prefill_readtask_sent_but_no_ret"
++
++    if trans is not None:
++        peer_recv = trans.get_int("peer_task_recv_w") or 0
++        if send_ok > 0 and peer_recv == 0:
++            return "prefill_sent_decode_peer_recv_low"
++
++    if up is not None:
++        send_fail_up = up.get_int("send_fail_w") or 0
++        if send_fail_up > 0:
++            return "up_status_send_failed"
++
++    return "prefill_flowing"
++
++
++def print_aligned(records: Dict[str, List[StatsRecord]], max_gap_s: int, limit: int) -> None:
++    gate_list = sorted(records["nixl_decode_gate_stats"], key=lambda r: r.ts)
++    ret_list = sorted(records["nixl_trans_ret_stats"], key=lambda r: r.ts)
++    trans_list = sorted(records["nixl_decode_trans_stats"], key=lambda r: r.ts)
++    up_list = sorted(records["nixl_up_status_stats"], key=lambda r: r.ts)
++    prefill_list = sorted(records["nixl_prefill_trans_stats"], key=lambda r: r.ts)
++
++    if gate_list:
++        rows = gate_list[-limit:] if limit > 0 else gate_list
++        print(
++            "ts | gate_continue_w | gate_pass_w | ret_seen_w | trans_peer_recv_w | trans_waiting_len | "
++            "prefill_send_readtask_ok_w | prefill_ret_recv_w | prefill_waiting_len | up_send_fail_w | diagnosis"
++        )
++        print("-" * 200)
++
++        for gate in rows:
++            ret = nearest_record(ret_list, gate.ts, max_gap_s)
++            trans = nearest_record(trans_list, gate.ts, max_gap_s)
++            up = nearest_record(up_list, gate.ts, max_gap_s)
++            prefill = nearest_record(prefill_list, gate.ts, max_gap_s)
++
++            diag = diagnose(gate, ret, trans, up, prefill)
++
++            gc = gate.get_int("gate_continue_w")
++            gp = gate.get_int("gate_pass_w")
++            rs = None if ret is None else ret.get_int("ret_seen_w")
++            pr = None if trans is None else trans.get_int("peer_task_recv_w")
++            wl = None if trans is None else trans.get_int("waiting_dict_len")
++            ps = None if prefill is None else prefill.get_int("send_readtask_ok_w")
++            prr = None if prefill is None else prefill.get_int("ret_recv_w")
++            pwl = None if prefill is None else prefill.get_int("waiting_dict_len")
++            sf = None if up is None else up.get_int("send_fail_w")
++
++            print(
++                f"{gate.ts.strftime('%m-%d %H:%M:%S')} | "
++                f"{gc} | {gp} | {rs} | {pr} | {wl} | {ps} | {prr} | {pwl} | {sf} | {diag}"
++            )
++        return
++
++    if prefill_list:
++        rows = prefill_list[-limit:] if limit > 0 else prefill_list
++        print(
++            "ts | prefill_recv_task_w | prefill_send_readtask_ok_w | prefill_send_readtask_fail_w | "
++            "prefill_ret_recv_w | prefill_waiting_len | ret_seen_w | trans_peer_recv_w | diagnosis"
++        )
++        print("-" * 180)
++
++        for prefill in rows:
++            ret = nearest_record(ret_list, prefill.ts, max_gap_s)
++            trans = nearest_record(trans_list, prefill.ts, max_gap_s)
++            up = nearest_record(up_list, prefill.ts, max_gap_s)
++
++            diag = diagnose_prefill(prefill, ret, trans, up)
++
++            rt = prefill.get_int("recv_task_w")
++            so = prefill.get_int("send_readtask_ok_w")
++            sf = prefill.get_int("send_readtask_fail_w")
++            rr = prefill.get_int("ret_recv_w")
++            wl = prefill.get_int("waiting_dict_len")
++            rs = None if ret is None else ret.get_int("ret_seen_w")
++            pr = None if trans is None else trans.get_int("peer_task_recv_w")
++
++            print(
++                f"{prefill.ts.strftime('%m-%d %H:%M:%S')} | "
++                f"{rt} | {so} | {sf} | {rr} | {wl} | {rs} | {pr} | {diag}"
++            )
++        return
++
++    print("No stats records found for: nixl_decode_gate_stats / nixl_prefill_trans_stats.")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Align NIXL PD stats windows and print bottleneck diagnosis.")
++    parser.add_argument("--log", required=True, help="Path to log file, e.g. _/server_log_p2d2/d23.log")
++    parser.add_argument("--year", type=int, default=dt.datetime.now().year, help="Year used to parse timestamps")
++    parser.add_argument("--max-gap", type=int, default=3, help="Max seconds for nearest-window alignment")
++    parser.add_argument("--limit", type=int, default=20, help="Print last N gate windows (0 for all)")
++    args = parser.parse_args()
++
++    log_path = Path(args.log)
++    if not log_path.exists():
++        raise SystemExit(f"Log file not found: {log_path}")
++
++    records = parse_records(log_path, year=args.year)
++    print_aligned(records, max_gap_s=args.max_gap, limit=args.limit)
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
